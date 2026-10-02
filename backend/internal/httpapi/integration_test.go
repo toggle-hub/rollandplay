@@ -48,7 +48,7 @@ func newTestApp(t *testing.T) *testApp {
 	if err := db.ApplyMigrations(ctx, pool, migrations.Files); err != nil {
 		t.Fatal(err)
 	}
-	_, err = pool.Exec(ctx, `truncate chat_message_recipients, chat_messages, room_tokens, npcs, room_maps, map_structures, map_editors, maps, assets, room_members, rooms, sheets, rule_book_editors, rule_books, friends, sessions, auth_magic_links, users cascade`)
+	_, err = pool.Exec(ctx, `truncate room_check_targets, room_checks, chat_message_recipients, chat_messages, room_tokens, npcs, room_maps, map_structures, map_editors, maps, assets, room_members, rooms, sheets, rule_book_editors, rule_books, friends, sessions, auth_magic_links, users cascade`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -866,6 +866,155 @@ func TestOneShotRoomStartsMapsOnTheFly(t *testing.T) {
 	if active := activeMap(); active["map_id"] != started["map_id"] || active["structure_count"] != 1 {
 		t.Fatalf("switching back should restore the first map and its placed wall: %+v", active)
 	}
+}
+
+func TestRoomCheckPrompts(t *testing.T) {
+	a := newTestApp(t)
+	const dndID = "00000000-0000-4000-8000-000000000005"
+	dm, _ := login(t, a, "checks-dm@example.com")
+	alice, au := login(t, a, "checks-alice@example.com")
+	bob, bu := login(t, a, "checks-bob@example.com")
+	carol, cu := login(t, a, "checks-carol@example.com")
+	aliceID, bobID, carolID := au["id"].(string), bu["id"].(string), cu["id"].(string)
+	// Shadow: dexterity 16 (+3) with stealth proficiency (+2); wisdom 8 (-1), no save proficiency.
+	character := func(c *http.Client, name string, data map[string]any) map[string]any {
+		t.Helper()
+		creation := map[string]any{"class_id": "fighter", "scores": map[string]any{"strength": 15, "dexterity": 14, "constitution": 13, "intelligence": 12, "wisdom": 10, "charisma": 8}, "choices": map[string]any{"skill_proficiencies": []string{"athletics", "perception"}}}
+		sheet := post[map[string]any](t, c, a.server.URL, "/api/sheets", map[string]any{"rule_book_id": dndID, "name": name, "creation": creation})
+		return patch[map[string]any](t, c, a.server.URL, "/api/sheets/"+sheet["id"].(string), map[string]any{"data": data})
+	}
+	shadow := character(alice, "Shadow", map[string]any{"dexterity": 16, "wisdom": 8, "proficiency_bonus": 2, "skill_proficiencies": map[string]any{"stealth": true}})
+	brute := character(bob, "Brute", map[string]any{"dexterity": 10})
+	room := post[map[string]any](t, dm, a.server.URL, "/api/rooms", map[string]any{"name": "Checks", "rule_book_id": dndID})
+	roomID := room["id"].(string)
+	post[map[string]any](t, alice, a.server.URL, "/api/rooms/join", map[string]any{"invite_code": room["invite_code"], "sheet_id": shadow["id"]})
+	post[map[string]any](t, bob, a.server.URL, "/api/rooms/join", map[string]any{"invite_code": room["invite_code"], "sheet_id": brute["id"]})
+	post[map[string]any](t, carol, a.server.URL, "/api/rooms/join", map[string]any{"invite_code": room["invite_code"]})
+	dmWS, aWS, bWS, cWS := dialWS(t, a, dm, roomID), dialWS(t, a, alice, roomID), dialWS(t, a, bob, roomID), dialWS(t, a, carol, roomID)
+	for _, conn := range []*websocket.Conn{dmWS, aWS, bWS, cWS} {
+		defer conn.Close()
+		readType(t, conn, "state.snapshot")
+	}
+	expectError := func(conn *websocket.Conn, id, code string, body map[string]any, typ string) {
+		t.Helper()
+		sendWS(t, conn, typ, id, body)
+		if ev := readType(t, conn, "error"); ev["requestId"] != id || ev["body"].(map[string]any)["code"] != code {
+			t.Fatalf("%s: expected %s, got %s", id, code, fmtBody(ev))
+		}
+	}
+	checksFor := func(c *http.Client) []any {
+		t.Helper()
+		return get[map[string]any](t, c, a.server.URL, "/api/rooms/"+roomID+"/state")["checks"].([]any)
+	}
+	chatFor := func(c *http.Client) string {
+		t.Helper()
+		b, _ := json.Marshal(get[map[string]any](t, c, a.server.URL, "/api/rooms/"+roomID+"/state")["chatHistory"])
+		return string(b)
+	}
+	// Sockets keep earlier events queued, so wait for the event caused by a given request.
+	readReply := func(conn *websocket.Conn, typ, requestID string) map[string]any {
+		t.Helper()
+		for {
+			if ev := readType(t, conn, typ); ev["requestId"] == requestID {
+				return ev
+			}
+		}
+	}
+	both := []string{aliceID, bobID}
+	expectError(aWS, "player-prompt", "forbidden", map[string]any{"kind": "skill", "key": "stealth", "dc": 10, "targetUserIds": both}, "check.prompt")
+	expectError(dmWS, "no-character", "invalid_target", map[string]any{"kind": "skill", "key": "stealth", "dc": 10, "targetUserIds": []string{aliceID, carolID}}, "check.prompt")
+	expectError(dmWS, "bad-skill", "invalid_check", map[string]any{"kind": "skill", "key": "dexterity", "dc": 10, "targetUserIds": both}, "check.prompt")
+	expectError(dmWS, "bad-dc", "invalid_check", map[string]any{"kind": "ability", "key": "dexterity", "dc": 0, "targetUserIds": both}, "check.prompt")
+
+	// Public encounter: everyone sees the prompt and every result.
+	sendWS(t, dmWS, "check.prompt", "ambush", map[string]any{"title": "Goblin ambush", "kind": "skill", "key": "stealth", "dc": 1, "targetUserIds": both})
+	if ev := readReply(cWS, "chat.message", "ambush"); ev["body"].(map[string]any)["body"] != "Goblin ambush: Stealth check (DC 1) for Brute, Shadow" {
+		t.Fatalf("unexpected announcement: %s", fmtBody(ev))
+	}
+	readReply(cWS, "check.changed", "ambush")
+	ambush := checksFor(carol)[0].(map[string]any)
+	if ambush["label"] != "Stealth check" || ambush["title"] != "Goblin ambush" || len(ambush["targets"].([]any)) != 2 || ambush["closed_at"] != nil {
+		t.Fatalf("bystander should see the open public check: %+v", ambush)
+	}
+	ambushID := ambush["id"].(string)
+	expectError(cWS, "not-asked", "not_found", map[string]any{"checkId": ambushID}, "check.roll")
+	expectError(aWS, "roll-for-bob", "forbidden", map[string]any{"checkId": ambushID, "userId": bobID}, "check.roll")
+	sendWS(t, aWS, "check.roll", "alice-stealth", map[string]any{"checkId": ambushID})
+	ev := readReply(cWS, "roll.result", "alice-stealth")
+	result := ev["body"].(map[string]any)
+	roll := result["roll"].(map[string]any)
+	outcome := roll["check"].(map[string]any)
+	if result["body"] != "Shadow: Stealth check (DC 1), success" || roll["expression"] != "1d20+5" || outcome["success"] != true || outcome["dc"] != float64(1) || outcome["user_id"] != aliceID || outcome["check_id"] != ambushID {
+		t.Fatalf("unexpected public check result: %s", fmtBody(ev))
+	}
+	expectError(aWS, "alice-again", "already_rolled", map[string]any{"checkId": ambushID}, "check.roll")
+	sendWS(t, dmWS, "check.roll", "dm-rolls-bob", map[string]any{"checkId": ambushID, "userId": bobID})
+	if ev := readReply(aWS, "roll.result", "dm-rolls-bob"); ev["body"].(map[string]any)["roll"].(map[string]any)["check"].(map[string]any)["user_id"] != bobID {
+		t.Fatalf("DM roll should be for Bob: %s", fmtBody(ev))
+	}
+	if ambush := checksFor(carol)[0].(map[string]any); ambush["closed_at"] == nil {
+		t.Fatalf("check should close once every target rolled: %+v", ambush)
+	}
+	expectError(bWS, "bob-after-dm", "already_rolled", map[string]any{"checkId": ambushID}, "check.roll")
+
+	// Private check: only targets and the DM see it, and each target only their own result.
+	sendWS(t, dmWS, "check.prompt", "will", map[string]any{"kind": "save", "key": "wisdom", "dc": 100, "targetUserIds": both, "isPrivate": true})
+	if ev := readReply(aWS, "chat.message", "will"); ev["body"].(map[string]any)["body"] != "Wisdom saving throw (DC 100), privately" {
+		t.Fatalf("private announcement should not name the other targets: %s", fmtBody(ev))
+	}
+	// Events arrive in publish order: everything the bystander gets before this public marker
+	// would have come from the private prompt.
+	sendWS(t, dmWS, "chat.send", "public-marker", map[string]any{"text": "after the private prompt"})
+	for {
+		var ev map[string]any
+		_ = cWS.SetReadDeadline(time.Now().Add(5 * time.Second))
+		if err := cWS.ReadJSON(&ev); err != nil {
+			t.Fatalf("bystander did not receive the public marker: %v", err)
+		}
+		if ev["requestId"] == "will" {
+			t.Fatalf("bystander received the private prompt: %s %s", ev["type"], fmtBody(ev))
+		}
+		if ev["requestId"] == "public-marker" {
+			break
+		}
+	}
+	if checks := checksFor(carol); len(checks) != 1 {
+		t.Fatalf("bystander should only see the public check, got %d", len(checks))
+	}
+	var willID string
+	for _, item := range checksFor(alice) {
+		if check := item.(map[string]any); check["is_private"] == true {
+			willID = check["id"].(string)
+			if targets := check["targets"].([]any); len(targets) != 1 || targets[0].(map[string]any)["user_id"] != aliceID {
+				t.Fatalf("private target should only see their own row: %+v", targets)
+			}
+		}
+	}
+	sendWS(t, aWS, "check.roll", "alice-will", map[string]any{"checkId": willID})
+	ev = readReply(dmWS, "roll.result", "alice-will")
+	roll = ev["body"].(map[string]any)["roll"].(map[string]any)
+	if roll["expression"] != "1d20-1" || roll["check"].(map[string]any)["success"] != false || ev["body"].(map[string]any)["recipient_user_ids"].([]any)[0] != aliceID {
+		t.Fatalf("unexpected private check result: %s", fmtBody(ev))
+	}
+	readReply(aWS, "roll.result", "alice-will")
+	if history := chatFor(bob); strings.Contains(history, "Shadow: Wisdom saving throw") {
+		t.Fatalf("another target saw a private result: %s", history)
+	}
+	if history := chatFor(carol); strings.Contains(history, "Wisdom saving throw") {
+		t.Fatalf("bystander saw the private check in chat: %s", history)
+	}
+	if !strings.Contains(chatFor(dm), "Shadow: Wisdom saving throw (DC 100), failure") {
+		t.Fatal("DM should see the private result")
+	}
+	for _, item := range checksFor(dm) {
+		if check := item.(map[string]any); check["id"] == willID && len(check["targets"].([]any)) != 2 {
+			t.Fatalf("DM should see every target of a private check: %+v", check)
+		}
+	}
+	expectError(aWS, "player-close", "forbidden", map[string]any{"checkId": willID}, "check.close")
+	sendWS(t, dmWS, "check.close", "close-will", map[string]any{"checkId": willID})
+	readReply(bWS, "check.changed", "close-will")
+	expectError(bWS, "bob-late", "check_closed", map[string]any{"checkId": willID}, "check.roll")
 }
 
 func dialWS(t *testing.T, a *testApp, c *http.Client, roomID string) *websocket.Conn {

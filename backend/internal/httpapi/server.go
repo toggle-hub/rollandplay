@@ -1219,7 +1219,36 @@ func (s *Server) visibleState(ctx context.Context, roomID, userID string) (map[s
 	if err != nil {
 		return nil, err
 	}
-	return map[string]any{"room": json.RawMessage(room), "activeMap": json.RawMessage(active), "structures": structRows, "visibleTokens": tokRows, "ownTokens": own, "chatHistory": chat, "metersPerGrid": gridFromRaw(active), "visibility": vis}, nil
+	checks, err := s.visibleChecks(ctx, roomID, userID, isDM)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{"room": json.RawMessage(room), "activeMap": json.RawMessage(active), "structures": structRows, "visibleTokens": tokRows, "ownTokens": own, "chatHistory": chat, "checks": checks, "metersPerGrid": gridFromRaw(active), "visibility": vis}, nil
+}
+
+// visibleChecks lists open checks and the most recent closed ones, newest first. Game masters
+// see every check and result. Others see public checks in full, and of a private check only
+// the ones they were asked to roll, with only their own result.
+func (s *Server) visibleChecks(ctx context.Context, roomID, userID string, isDM bool) ([]map[string]any, error) {
+	raw, err := s.queryJSON(ctx, `select jsonb_build_object('id',c.id::text,'title',c.title,'kind',c.check_kind,'key',c.check_key,'dc',c.dc,'is_private',c.is_private,'created_by',c.created_by::text,'created_at',c.created_at,'closed_at',c.closed_at,
+		'targets',coalesce((select jsonb_agg(jsonb_build_object('user_id',t.user_id::text,'roll',t.roll,'success',t.success,'rolled_at',t.rolled_at) order by u.username) from room_check_targets t join users u on u.id=t.user_id where t.check_id=c.id and ($3 or not c.is_private or t.user_id=$2)),'[]'::jsonb))
+		from room_checks c where c.room_id=$1 and ($3 or not c.is_private or exists(select 1 from room_check_targets t where t.check_id=c.id and t.user_id=$2))
+		order by c.closed_at is null desc, coalesce(c.closed_at,c.created_at) desc limit 20`, roomID, userID, isDM)
+	if err != nil {
+		return nil, err
+	}
+	checks := []map[string]any{}
+	for _, item := range raw {
+		var check map[string]any
+		if err := json.Unmarshal(item, &check); err != nil {
+			return nil, err
+		}
+		kind, _ := check["kind"].(string)
+		key, _ := check["key"].(string)
+		check["label"] = game.Check{Kind: kind, Key: key}.Label()
+		checks = append(checks, check)
+	}
+	return checks, nil
 }
 
 func (s *Server) loadStructures(ctx context.Context, roomID string) ([]game.Structure, error) {

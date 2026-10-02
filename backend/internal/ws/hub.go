@@ -157,7 +157,7 @@ func (c *client) canReceive(ev envelope) bool {
 	if room, ok := m["roomId"].(string); ok && room != "" && room != c.roomID {
 		return false
 	}
-	if ev.Type == "chat.message" || ev.Type == "roll.result" {
+	if ev.Type == "chat.message" || ev.Type == "roll.result" || ev.Type == "check.changed" {
 		rec, _ := m["recipient_user_ids"].([]any)
 		sender, _ := m["sender_user_id"].(string)
 		if len(rec) == 0 {
@@ -251,6 +251,12 @@ func (c *client) handle(msg clientEnvelope) {
 		c.structureRemove(msg)
 	case "attack.resolve":
 		c.attackResolve(msg)
+	case "check.prompt":
+		c.checkPrompt(msg)
+	case "check.roll":
+		c.checkRoll(msg)
+	case "check.close":
+		c.checkClose(msg)
 	case "ruler.measure":
 		var req struct {
 			From game.Point `json:"from"`

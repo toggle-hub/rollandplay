@@ -38,6 +38,29 @@ Rooms don't need a map prepared in advance. If no map is active, the first struc
 
 Tokens carry attacks. A sheet-backed token stores them in the sheet's `data.attacks` and only the sheet owner can edit them; a token without a sheet stores them in `room_tokens.attributes.attacks` and only the game master can edit them (`PATCH /api/rooms/{roomID}/tokens/{tokenID}/attacks`, or **Edit attacks** in the room sidebar). Clicking a token you control without dragging (players: their own tokens; game masters: every token) opens its attack menu and draws the attack's range; picking an attack and clicking a highlighted target sends the `attack.resolve` websocket action. The server checks ownership, center-to-center range, and attack-blocking structures (unless `pass_rules.attacks` is set), then rolls D&D-style — to hit `1d20 + ability modifier + proficiency bonus (if proficient) + attack bonus`, damage `dice + ability modifier + damage bonus` — and posts one chat roll containing both. Attack lists for other players' and NPC tokens are never sent to players.
 
+Game masters can prompt checks with **Prompt a check** in the room sidebar. Optionally name it as an encounter (for example "Goblin ambush"). Then pick the check, a DC from 1 to 100, the players who roll (only members with a character assigned at this table can be chosen), and whether results are public or private.
+
+- **Rolling:** each targeted player gets a **Roll** button in the **Checks** panel next to chat. The server rolls `1d20 + modifier` from the player's currently assigned character, and the result succeeds when the total meets or beats the DC. Game masters can **Roll for them** on any pending target, and can **Close check** to stop further rolls (pending players show "Did not roll"). A check closes by itself once everyone has rolled.
+- **Modifiers:**
+  - Ability check: ability modifier.
+  - Saving throw: ability modifier, plus `proficiency_bonus` when `saving_throw_proficiencies.<ability>` is true.
+  - Skill check: modifier of the skill's 5e ability, plus `proficiency_bonus` when `skill_proficiencies.<skill>` is true.
+  - Other attribute: any top-level numeric sheet key (`[a-z][a-z0-9_]*`), added as-is. Use this for rule books other than the built-in D&D book.
+  
+  Missing values count as 0. Natural 1s and 20s get no special treatment, matching 5e ability checks and saves.
+- **Visibility:**
+  - Public: the whole table sees the prompt, every result, and every outcome in chat.
+  - Private: only the targets see the prompt, and its chat announcement doesn't name the other targets. Each target sees only their own roll, in the panel and in chat. Game masters see everything.
+- **Websocket actions:**
+  - `check.prompt` with `{title?, kind: "ability"|"save"|"skill"|"attribute", key, dc, targetUserIds, isPrivate}`.
+  - `check.roll` with `{checkId, userId?}`; `userId` is for game masters only.
+  - `check.close` with `{checkId}`.
+- **Events and storage:**
+  - Prompts post a chat announcement.
+  - Results post a `roll.result` chat roll whose `roll.check` holds `{check_id, title, label, dc, success, user_id, character_name}`.
+  - Every change sends `check.changed`, and clients reload the room state.
+  - The state's `checks` lists open checks first, then recent closed ones, filtered per viewer. Checks are stored in `room_checks` and `room_check_targets` (migration `008_room_checks.sql`).
+
 Frontend checks:
 
 ```bash

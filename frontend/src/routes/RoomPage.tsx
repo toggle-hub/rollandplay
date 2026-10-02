@@ -6,6 +6,8 @@ import type { ChatMessage, GameMap, RoomMember, ServerEnvelope, Sheet, VisibleRo
 import { useSession } from "../auth/SessionContext";
 import { MapCanvas, type MapSelection } from "../components/MapCanvas";
 import { ChatPanel } from "../components/ChatPanel";
+import { CheckPromptForm } from "../components/CheckPromptForm";
+import { RoomChecks } from "../components/RoomChecks";
 import { PlayerName } from "../components/PlayerName";
 import { TokenAttacksEditor } from "../components/TokenAttacksEditor";
 import { defaultBlocksForKind, structureTypes, type StructureBlocks } from "../lib/structures";
@@ -98,7 +100,7 @@ export function RoomPage() {
         const message = event.body;
         setState((current) => current ? { ...current, chatHistory: [...(current.chatHistory ?? []), message] } : current);
       }
-      if (event.type === "token.moved" || event.type === "token.updated" || event.type === "structure.moved" || event.type === "structure.updated" || event.type === "structure.created" || event.type === "structure.removed" || event.type === "map.activated" || event.type === "vision.update" || event.type === "state.snapshot") void load();
+      if (event.type === "token.moved" || event.type === "token.updated" || event.type === "structure.moved" || event.type === "structure.updated" || event.type === "structure.created" || event.type === "structure.removed" || event.type === "map.activated" || event.type === "vision.update" || event.type === "check.changed" || event.type === "state.snapshot") void load();
       if (event.type === "ruler.result" && isMetersBody(event.body)) setRuler(Number(event.body.meters));
       if (event.type === "error" && isErrorBody(event.body)) {
         setError(event.body.message);
@@ -293,6 +295,8 @@ export function RoomPage() {
           }}>{placingStructure ? "Stop placing" : "Place on map"}</button>
         </div>}
 
+        {isDM && <CheckPromptForm members={members} onPrompt={(request) => sendMap("check.prompt", request)} />}
+
         {attackEditorToken && <TokenAttacksEditor key={attackEditorToken.id} token={attackEditorToken} busy={busy}
           onSave={(attacks) => void update(() => patchJSON(`/api/rooms/${roomId}/tokens/${attackEditorToken.id}/attacks`, { attacks }))}
           onClose={() => setAttackEditorTokenId(null)} />}
@@ -350,6 +354,9 @@ export function RoomPage() {
           <h2 className="flex items-center gap-2 text-xl"><UsersThree size={22} className="text-[var(--accent)]" aria-hidden="true" />At the table</h2>
           <div className="mt-5 space-y-4">{members.length === 0 ? <p className="text-muted text-sm">No members to display.</p> : members.map((member) => <div className="space-y-2 border-t border-[var(--paper)]/10 pt-3" key={member.user_id}><div className="flex items-start justify-between gap-3"><span className="min-w-0 break-words text-sm"><PlayerName player={{ id: member.user_id, username: member.username, pronouns: member.pronouns }} />{member.user_id === user?.id ? " (you)" : ""}</span><span className="shrink-0 text-xs text-[var(--muted)]">{member.is_dm ? "Game master" : "Player"}</span></div>{(isDM || member.user_id === user?.id) && <label className="block text-xs text-[var(--muted)]">{isDM ? "Assigned character" : "Your character"}<select className="mt-2 w-full text-sm" value={member.sheet_id ?? ""} disabled={busy} onChange={(e) => { const sheetId = e.target.value || null; void update(() => patchJSON(`/api/rooms/${roomId}/members/${member.user_id}`, { sheet_id: sheetId })); }}><option value="">No sheet</option>{roomSheets.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label>}</div>)}</div>
         </section>
+        <RoomChecks checks={state.checks ?? []} members={members} currentUserId={user?.id} isDM={isDM}
+          onRoll={(checkId, userId) => sendMap("check.roll", userId ? { checkId, userId } : { checkId })}
+          onClose={(checkId) => sendMap("check.close", { checkId })} />
         <ChatPanel messages={state.chatHistory ?? []} members={members} isDM={isDM} onSend={(text, recipientUserIds, rollExpression) => send("chat.send", { text, recipientUserIds, rollExpression })} />
       </aside>
     </div>

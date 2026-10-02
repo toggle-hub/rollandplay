@@ -149,6 +149,38 @@ export type RollResult = {
   modifier: number;
   total: number;
   damage?: RollResult;
+  /** Present when the roll answers a check prompted by the game master. */
+  check?: CheckOutcome;
+};
+export type CheckKind = "ability" | "save" | "skill" | "attribute";
+export type CheckOutcome = {
+  check_id: string;
+  title: string;
+  label: string;
+  dc: number;
+  success: boolean;
+  user_id: string;
+  character_name: string;
+};
+export type RoomCheckTarget = {
+  user_id: string;
+  roll: RollResult | null;
+  success: boolean | null;
+  rolled_at: string | null;
+};
+/** A check prompted by the game master. Private checks list only the viewer's own target unless they are a game master. */
+export type RoomCheck = {
+  id: string;
+  title: string;
+  kind: CheckKind;
+  key: string;
+  label: string;
+  dc: number;
+  is_private: boolean;
+  created_by: string | null;
+  created_at: string;
+  closed_at: string | null;
+  targets: RoomCheckTarget[];
 };
 export type ChatMessage = {
   id: string;
@@ -167,6 +199,8 @@ export type VisibleRoomState = {
   visibleTokens: RoomToken[];
   ownTokens: RoomToken[];
   chatHistory: ChatMessage[];
+  /** Open checks first, then the most recent closed ones. */
+  checks?: RoomCheck[];
   metersPerGrid: number | string;
   visibility?: {
     fogPolygon: { x: number; y: number }[];

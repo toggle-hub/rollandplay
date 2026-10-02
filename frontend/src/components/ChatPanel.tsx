@@ -1,5 +1,5 @@
 import { FormEvent, useLayoutEffect, useRef, useState } from "react";
-import { ChatCircle, DiceFive, LockSimple, PaperPlaneTilt } from "@phosphor-icons/react";
+import { ChatCircle, CheckCircle, DiceFive, LockSimple, PaperPlaneTilt, XCircle } from "@phosphor-icons/react";
 import { PlayerName } from "./PlayerName";
 import type { ChatMessage, RoomMember } from "../api/types";
 
@@ -54,6 +54,12 @@ export function ChatPanel({ messages, members, isDM, onSend }: Props) {
           <div className={message.kind === "system" ? "border-l-2 border-[var(--line)] pl-3 text-xs leading-relaxed text-[var(--muted)]" : `rounded-xl rounded-tl-sm border p-3 leading-relaxed ${privateMessage ? "border-[var(--lavender)]/20 bg-[var(--lavender)]/5" : "border-[var(--paper)]/5 bg-[var(--input)]/60"}`}>
             {message.body && <p className="mb-0 whitespace-pre-wrap">{message.body}</p>}
             {message.kind === "roll" && message.roll && <div className={message.body ? "mt-3" : ""}>
+              {message.roll.check && <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+                <span className="text-xs text-[var(--muted)]">{message.roll.check.title ? `${message.roll.check.title} · ` : ""}{message.roll.check.label} · DC {message.roll.check.dc}</span>
+                {message.roll.check.success
+                  ? <strong className="inline-flex items-center gap-1 rounded-md bg-[var(--green)]/10 px-2 py-1 text-xs text-[var(--green)]"><CheckCircle size={14} weight="fill" aria-hidden="true" />Success</strong>
+                  : <strong className="inline-flex items-center gap-1 rounded-md bg-[var(--pink)]/10 px-2 py-1 text-xs text-[var(--pink)]"><XCircle size={14} weight="fill" aria-hidden="true" />Failure</strong>}
+              </div>}
               <div className="flex flex-wrap items-center justify-between gap-2 text-[var(--peach)]">
                 <span className="inline-flex items-center gap-1.5 font-medium"><DiceFive size={18} aria-hidden="true" />{message.roll.damage ? `Attack · ${message.roll.expression}` : message.roll.expression}</span>
                 <strong className="rounded-md bg-[var(--peach)]/10 px-2 py-1 tabular-nums">total {message.roll.total}</strong>
