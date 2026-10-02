@@ -150,6 +150,44 @@ https://your-domain.example/api/.../ws -> current backend websocket route
 
 The frontend uses relative `/api` requests and cookie auth, so same-origin hosting avoids CORS and cookie issues. Put a reverse proxy or platform router in front of the Go backend and route `/api/*` to it.
 
+### Continuous deployment (GitHub Actions → VPS)
+
+`.github/workflows/backend.yml` and `.github/workflows/frontend.yml` run tests on pull requests and on pushes to `main`. A push to `main` that touches `backend/**` or `frontend/**` also deploys that part. You can start either workflow by hand with **Run workflow**.
+
+- **Backend:** runs `go test ./...` against Postgres 16 and Redis 7 service containers. It builds static `linux/amd64` `server` and `migrate` binaries, rsyncs them to `/opt/rollandplay/backend/releases/<sha>/`, and switches the `current` symlink. Then it restarts `rollandplay-backend`. That systemd unit runs `migrate` before every start (applied migrations are skipped). If the restart fails, or the server doesn't answer HTTP within 30 s, the deploy prints the unit journal and switches back to the previous release.
+- **Frontend:** runs `npm ci`, `vitest run` and `npm run build`. The build uses no `VITE_*` variables (same-origin), rsyncs `dist/` to `/opt/rollandplay/frontend/releases/<sha>/` and switches `current`. nginx serves that folder.
+- The 5 newest releases of each part are kept. To roll back by hand, point `/opt/rollandplay/<part>/current` at an older release (as `deploy`). For the backend, then run `sudo systemctl restart rollandplay-backend`.
+
+Server layout, created by `deploy/provision.sh` (idempotent, run as root on Ubuntu 22.04):
+
+| Path / unit | Purpose |
+| --- | --- |
+| `/etc/rollandplay/backend.env` | Backend environment (root-only). Generated once with a random DB password and `ROOM_PASSWORD_SALT`. **Set `SMTP_*` here**, then `systemctl restart rollandplay-backend`. |
+| `rollandplay-backend.service` | Runs as the `rollandplay` user and listens on `127.0.0.1:8080` (`deploy/systemd/`). |
+| nginx `rollandplay.conf` | Port 80 answers ACME challenges and redirects to HTTPS. Port 443 serves the frontend with an SPA fallback and proxies `/api/` (including websockets) to the backend (`deploy/nginx/`). |
+| `/etc/letsencrypt/live/rollandplay/` | Let's Encrypt certificate from certbot (snap, webroot `/var/www/letsencrypt`). `snap.certbot.renew.timer` renews it and reloads nginx. |
+| `/var/lib/rollandplay/assets` | Uploaded assets. |
+| `deploy` user | CI login. The key is installed with `restrict`; sudo is limited to `systemctl restart rollandplay-backend`. |
+
+Provisioning a server:
+
+```bash
+scp -P 22022 -r deploy root@SERVER:/root/rollandplay-deploy
+ssh -p 22022 root@SERVER "DEPLOY_PUBKEY='ssh-ed25519 AAAA… github-actions' PUBLIC_BASE_URL='https://SERVER' bash /root/rollandplay-deploy/provision.sh"
+```
+
+Repository secrets (**Settings → Secrets and variables → Actions**):
+
+| Secret | Value |
+| --- | --- |
+| `DEPLOY_HOST` | VPS IP or hostname |
+| `DEPLOY_PORT` | SSH port (`22022`) |
+| `DEPLOY_USER` | `deploy` |
+| `DEPLOY_SSH_KEY` | Private key matching `DEPLOY_PUBKEY` |
+| `DEPLOY_KNOWN_HOSTS` | Output of `ssh-keyscan -p 22022 SERVER` |
+
+HTTPS: `PUBLIC_BASE_URL` must be `https://`. Its host gets the certificate. A bare IP gets a 6-day certificate (Let's Encrypt `shortlived` profile, renewed automatically). A domain gets a normal 90-day one. To switch from the IP to a domain, point the domain's A record at the VPS. Then re-run `provision.sh` with `PUBLIC_BASE_URL='https://your-domain'`. That reissues the certificate under the same name and updates the URLs in `backend.env`. Ports 80 and 443 must stay reachable.
+
 ### Required production services
 
 - Postgres 16+

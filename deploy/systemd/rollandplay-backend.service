@@ -1,0 +1,23 @@
+[Unit]
+Description=Rollandplay backend
+Wants=network-online.target postgresql.service redis-server.service
+After=network-online.target postgresql.service redis-server.service
+
+[Service]
+User=rollandplay
+Group=rollandplay
+EnvironmentFile=/etc/rollandplay/backend.env
+WorkingDirectory=/var/lib/rollandplay
+# Migrations are tracked in schema_migrations, so running them on every start is a no-op once applied.
+ExecStartPre=/opt/rollandplay/backend/current/migrate
+ExecStart=/opt/rollandplay/backend/current/server
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/rollandplay
+
+[Install]
+WantedBy=multi-user.target
