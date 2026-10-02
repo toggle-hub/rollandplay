@@ -10,7 +10,22 @@ import (
 	"time"
 
 	"github.com/redis/go-redis/v9"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
 	"go.uber.org/zap"
+)
+
+// sends counts delivery attempts by result ("sent" or "failed"). Instruments from the global
+// meter are forwarded to the provider installed later by telemetry.Setup.
+var sends, _ = otel.Meter("rollandplay/backend/internal/email").Int64Counter("rollandplay.email.sends",
+	metric.WithDescription("Email delivery attempts by result."),
+	metric.WithUnit("{email}"),
+)
+
+var (
+	sentAttr   = metric.WithAttributes(attribute.String("result", "sent"))
+	failedAttr = metric.WithAttributes(attribute.String("result", "failed"))
 )
 
 type Sender struct {
@@ -32,6 +47,9 @@ func (s Sender) Run(ctx context.Context) {
 		logger = zap.NewNop()
 	}
 	logger.Info("email worker started", zap.String("smtp_addr", s.SMTPAddr))
+	// Export both series from startup so increase()/rate() also count the first event.
+	sends.Add(ctx, 0, sentAttr)
+	sends.Add(ctx, 0, failedAttr)
 	defer logger.Info("email worker stopped")
 	last := "$"
 	for {
@@ -52,9 +70,11 @@ func (s Sender) Run(ctx context.Context) {
 				to := fmt.Sprint(msg.Values["to"])
 				subject := fmt.Sprint(msg.Values["subject"])
 				if err := s.Send(to, subject, fmt.Sprint(msg.Values["url"])); err != nil {
+					sends.Add(ctx, 1, failedAttr)
 					logger.Error("email send failed", zap.String("job_id", msg.ID), zap.String("to_domain", domain(to)), zap.Error(err))
 					continue
 				}
+				sends.Add(ctx, 1, sentAttr)
 				logger.Info("email sent", zap.String("job_id", msg.ID), zap.String("to_domain", domain(to)), zap.String("subject", subject))
 			}
 		}

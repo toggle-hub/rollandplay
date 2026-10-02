@@ -11,6 +11,7 @@ import (
 
 type Config struct {
 	HTTPAddr          string
+	MetricsAddr       string
 	PublicBaseURL     string
 	APIBaseURL        string
 	DatabaseURL       string
@@ -33,6 +34,7 @@ func Load() (Config, error) {
 	_ = loadDotEnv(".env")
 	c := Config{
 		HTTPAddr:          env("HTTP_ADDR", ":8080"),
+		MetricsAddr:       env("METRICS_ADDR", "127.0.0.1:9464"),
 		PublicBaseURL:     env("PUBLIC_BASE_URL", "http://localhost:5173"),
 		APIBaseURL:        env("API_BASE_URL", "http://localhost:8080"),
 		DatabaseURL:       env("DATABASE_URL", "postgres://rollandplay:rollandplay@localhost:5432/rollandplay?sslmode=disable"),

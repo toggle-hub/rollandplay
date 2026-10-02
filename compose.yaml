@@ -30,6 +30,39 @@ services:
     ports:
       - "1025:1025"
       - "8025:8025"
+  # Observability. Host networking lets Prometheus reach the local backend (127.0.0.1:9464)
+  # and the production tunnel (127.0.0.1:19464); both UIs bind to loopback only.
+  prometheus:
+    image: docker.io/prom/prometheus:v3.15.0
+    network_mode: host
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=30d
+      - --web.listen-address=127.0.0.1:9090
+    volumes:
+      - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro,z
+      - prometheus_data:/prometheus
+  grafana:
+    image: docker.io/grafana/grafana:13.2.3
+    network_mode: host
+    environment:
+      GF_SERVER_HTTP_ADDR: 127.0.0.1
+      GF_SERVER_HTTP_PORT: "3030"
+      # Local-only instance: no login.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro,z
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro,z
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - prometheus
 volumes:
   postgres_data:
   redis_data:
+  prometheus_data:
+  grafana_data:

@@ -16,6 +16,8 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/metric"
 	"go.uber.org/zap"
 
 	"rollandplay/backend/internal/auth"
@@ -58,6 +60,19 @@ func NewHubWithLogger(pool *pgxpool.Pool, rdb *redis.Client, logger *zap.Logger)
 		logger = zap.NewNop()
 	}
 	h := &Hub{pool: pool, redis: rdb, logger: logger, clients: map[*client]bool{}, upgrader: websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}}
+	if _, err := otel.Meter("rollandplay/backend/internal/ws").Int64ObservableGauge("rollandplay.websocket.connections",
+		metric.WithDescription("Open websocket connections on this backend instance."),
+		metric.WithUnit("{connection}"),
+		metric.WithInt64Callback(func(_ context.Context, o metric.Int64Observer) error {
+			h.mu.Lock()
+			n := len(h.clients)
+			h.mu.Unlock()
+			o.Observe(int64(n))
+			return nil
+		}),
+	); err != nil {
+		logger.Warn("websocket connections metric unavailable", zap.Error(err))
+	}
 	if rdb != nil {
 		go h.subscribe(context.Background())
 	}

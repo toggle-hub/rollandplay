@@ -1,0 +1,17 @@
+global:
+  scrape_interval: 15s
+  scrape_timeout: 10s
+
+scrape_configs:
+  - job_name: rollandplay-backend
+    static_configs:
+      # Backend running on this machine (METRICS_ADDR default).
+      - targets: ["127.0.0.1:9464"]
+        labels:
+          env: local
+      # Production backend through the SSH tunnel:
+      #   ssh -N -L 19464:127.0.0.1:9464 -p 22022 metrics@143.95.169.22
+      # Shows as down while the tunnel is closed; no data is collected for that time.
+      - targets: ["127.0.0.1:19464"]
+        labels:
+          env: production

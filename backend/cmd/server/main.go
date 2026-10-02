@@ -17,6 +17,7 @@ import (
 	"rollandplay/backend/internal/email"
 	"rollandplay/backend/internal/httpapi"
 	"rollandplay/backend/internal/logging"
+	"rollandplay/backend/internal/telemetry"
 )
 
 func main() {
@@ -36,6 +37,24 @@ func main() {
 		baseLogger.Fatal("logger configuration failed", zap.Error(err))
 	}
 	defer logger.Sync()
+	metricsHandler, shutdownMetrics, err := telemetry.Setup()
+	if err != nil {
+		logger.Fatal("telemetry setup failed", zap.Error(err))
+	}
+	defer func() {
+		if err := shutdownMetrics(context.Background()); err != nil {
+			logger.Warn("telemetry shutdown failed", zap.Error(err))
+		}
+	}()
+	metricsMux := http.NewServeMux()
+	metricsMux.Handle("GET /metrics", metricsHandler)
+	metricsSrv := &http.Server{Addr: cfg.MetricsAddr, Handler: metricsMux, ReadHeaderTimeout: 5 * time.Second}
+	go func() {
+		logger.Info("metrics listening", zap.String("metrics_addr", cfg.MetricsAddr))
+		if err := metricsSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			logger.Error("metrics server failed", zap.Error(err))
+		}
+	}()
 	pool, err := db.Connect(ctx, cfg.DatabaseURL)
 	if err != nil {
 		logger.Fatal("database connection failed", zap.Error(err))
@@ -59,6 +78,7 @@ func main() {
 		if err := srv.Shutdown(shutdownCtx); err != nil {
 			logger.Error("server shutdown failed", zap.Error(err))
 		}
+		_ = metricsSrv.Shutdown(shutdownCtx)
 	}()
 	logger.Info("rollandplay backend listening", zap.String("http_addr", cfg.HTTPAddr), zap.String("public_base_url", cfg.PublicBaseURL), zap.String("api_base_url", cfg.APIBaseURL), zap.String("asset_storage_dir", cfg.AssetStorageDir))
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {

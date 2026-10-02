@@ -5,6 +5,8 @@
 #                               pass either variable again to change it)
 # PUBLIC_BASE_URL must be https://<IP or domain>; its host gets a Let's Encrypt certificate (IPs use the
 # 6-day `shortlived` profile). Optional ACME_EMAIL registers the ACME account with an address.
+# Optional METRICS_PUBKEY (your own SSH public key) lets `metrics` open a tunnel to the backend's
+# 127.0.0.1:9464 metrics port and nothing else; omitted on re-runs keeps the installed key.
 # Existing secrets in /etc/rollandplay/backend.env are always kept.
 set -euo pipefail
 
@@ -57,6 +59,15 @@ if [ -n "${DEPLOY_PUBKEY:-}" ]; then
   printf 'restrict %s\n' "$DEPLOY_PUBKEY" >"$authorized_keys"
   chown deploy:deploy "$authorized_keys"
   chmod 600 "$authorized_keys"
+fi
+
+# `metrics` can only forward to the backend's loopback metrics port (ssh -N -L ...): no shell, pty or other targets.
+id metrics >/dev/null 2>&1 || useradd --create-home --shell /usr/sbin/nologin metrics
+install -d -m 700 -o metrics -g metrics /home/metrics/.ssh
+if [ -n "${METRICS_PUBKEY:-}" ]; then
+  printf 'restrict,port-forwarding,permitopen="127.0.0.1:9464",command="/bin/false" %s\n' "$METRICS_PUBKEY" >/home/metrics/.ssh/authorized_keys
+  chown metrics:metrics /home/metrics/.ssh/authorized_keys
+  chmod 600 /home/metrics/.ssh/authorized_keys
 fi
 
 install -d -m 755 -o deploy -g deploy /opt/rollandplay /opt/rollandplay/backend /opt/rollandplay/backend/releases /opt/rollandplay/frontend /opt/rollandplay/frontend/releases
@@ -144,4 +155,7 @@ nginx -t
 systemctl reload nginx
 systemctl try-restart rollandplay-backend
 
-echo "provisioned; edit SMTP_* in $env_file before users can log in"
+echo "provisioned"
+if grep -q '^SMTP_.*CHANGE_ME' "$env_file"; then
+  echo "edit SMTP_* in $env_file before users can log in"
+fi

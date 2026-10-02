@@ -27,6 +27,7 @@ import (
 	"rollandplay/backend/internal/auth"
 	"rollandplay/backend/internal/config"
 	"rollandplay/backend/internal/game"
+	"rollandplay/backend/internal/telemetry"
 	"rollandplay/backend/internal/ws"
 )
 
@@ -96,7 +97,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/rooms/{roomID}/tokens", s.handleTokenCreate)
 	mux.HandleFunc("PATCH /api/rooms/{roomID}/tokens/{tokenID}/attacks", s.handleTokenAttacksPatch)
 	mux.HandleFunc("GET /api/rooms/{roomID}/ws", s.Hub.Handle)
-	return requestLogger(cors(mux), s.Logger.Named("http"))
+	return telemetry.HTTPHandler(requestLogger(cors(mux), s.Logger.Named("http")))
 }
 
 type responseRecorder struct {
