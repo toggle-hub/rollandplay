@@ -1,13 +1,26 @@
 #!/usr/bin/env bash
-# One-time (idempotent) setup for an Ubuntu 22.04+ VPS. Run as root:
-#   DEPLOY_PUBKEY='ssh-ed25519 AAAA... github-actions' PUBLIC_BASE_URL='https://143.95.169.22' bash provision.sh
+# Idempotent setup for an Ubuntu 22.04+ VPS. Run as root on the server.
+# First run:  DEPLOY_PUBKEY='ssh-ed25519 AAAA... github-actions' PUBLIC_BASE_URL='https://143.95.169.22' ./provision.sh
+# Re-runs:    ./provision.sh   (reuses the installed deploy key and the URL in /etc/rollandplay/backend.env;
+#                               pass either variable again to change it)
 # PUBLIC_BASE_URL must be https://<IP or domain>; its host gets a Let's Encrypt certificate (IPs use the
 # 6-day `shortlived` profile). Optional ACME_EMAIL registers the ACME account with an address.
-# Re-running is safe: existing secrets in /etc/rollandplay/backend.env are kept; its URLs follow PUBLIC_BASE_URL.
+# Existing secrets in /etc/rollandplay/backend.env are always kept.
 set -euo pipefail
 
-: "${DEPLOY_PUBKEY:?set DEPLOY_PUBKEY to the public half of the GitHub Actions deploy key}"
-: "${PUBLIC_BASE_URL:?set PUBLIC_BASE_URL, e.g. https://your-domain.example}"
+[ "$(id -u)" = 0 ] || { echo "run as root on the server" >&2; exit 1; }
+[ "$(. /etc/os-release && echo "$ID")" = ubuntu ] || { echo "this script targets the Ubuntu VPS, not this machine" >&2; exit 1; }
+
+env_file=/etc/rollandplay/backend.env
+authorized_keys=/home/deploy/.ssh/authorized_keys
+if [ -z "${PUBLIC_BASE_URL:-}" ] && [ -f "$env_file" ]; then
+  PUBLIC_BASE_URL="$(sed -n 's/^PUBLIC_BASE_URL=//p' "$env_file")"
+fi
+: "${PUBLIC_BASE_URL:?first run: set PUBLIC_BASE_URL, e.g. https://your-domain.example}"
+if [ -z "${DEPLOY_PUBKEY:-}" ] && [ ! -s "$authorized_keys" ]; then
+  echo "first run: set DEPLOY_PUBKEY to the public half of the GitHub Actions deploy key" >&2
+  exit 1
+fi
 case "$PUBLIC_BASE_URL" in https://*) ;; *) echo "PUBLIC_BASE_URL must start with https://" >&2; exit 1 ;; esac
 tls_host="${PUBLIC_BASE_URL#https://}"
 tls_host="${tls_host%%/*}"
@@ -40,16 +53,17 @@ id rollandplay >/dev/null 2>&1 || useradd --system --home-dir /var/lib/rollandpl
 id deploy >/dev/null 2>&1 || useradd --create-home --shell /bin/bash deploy
 usermod -aG systemd-journal deploy
 install -d -m 700 -o deploy -g deploy /home/deploy/.ssh
-printf 'restrict %s\n' "$DEPLOY_PUBKEY" >/home/deploy/.ssh/authorized_keys
-chown deploy:deploy /home/deploy/.ssh/authorized_keys
-chmod 600 /home/deploy/.ssh/authorized_keys
+if [ -n "${DEPLOY_PUBKEY:-}" ]; then
+  printf 'restrict %s\n' "$DEPLOY_PUBKEY" >"$authorized_keys"
+  chown deploy:deploy "$authorized_keys"
+  chmod 600 "$authorized_keys"
+fi
 
 install -d -m 755 -o deploy -g deploy /opt/rollandplay /opt/rollandplay/backend /opt/rollandplay/backend/releases /opt/rollandplay/frontend /opt/rollandplay/frontend/releases
 install -d -m 750 -o rollandplay -g rollandplay /var/lib/rollandplay /var/lib/rollandplay/assets
 
 # Database and backend environment (generated once).
 install -d -m 755 /etc/rollandplay
-env_file=/etc/rollandplay/backend.env
 if [ ! -f "$env_file" ]; then
   db_password="$(openssl rand -hex 24)"
   salt="$(openssl rand -hex 32)"

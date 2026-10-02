@@ -169,14 +169,21 @@ Server layout, created by `deploy/provision.sh` (idempotent, run as root on Ubun
 | `/var/lib/rollandplay/assets` | Uploaded assets. |
 | `deploy` user | CI login. The key is installed with `restrict`; sudo is limited to `systemctl restart rollandplay-backend`. |
 
-Provisioning or updating a server: run this from the repository root on your machine. It doesn't need git on the server; your local `deploy/` folder is streamed over SSH and replaces the previous copy every time:
+Provisioning or updating a server: run these from the repository root on your machine. The server doesn't need git; your local `deploy/` folder is streamed over SSH and replaces the previous copy each time. The script must run as root on the Ubuntu server, and it refuses to run anywhere else.
+
+First run (installs the CI key and sets the public URL):
 
 ```bash
 tar czf - deploy | ssh -p 22022 root@SERVER "rm -rf /root/rollandplay-deploy && mkdir /root/rollandplay-deploy && tar xzf - -C /root/rollandplay-deploy && \
-  DEPLOY_PUBKEY='$(cat ~/.ssh/rollandplay/deploy_key.pub)' PUBLIC_BASE_URL='https://SERVER' bash /root/rollandplay-deploy/deploy/provision.sh"
+  DEPLOY_PUBKEY='$(cat ~/.ssh/rollandplay/deploy_key.pub)' PUBLIC_BASE_URL='https://SERVER' /root/rollandplay-deploy/deploy/provision.sh"
 ```
 
-Re-run it after changing anything under `deploy/` except `release.sh`, which CI sends with every deploy. `DEPLOY_PUBKEY` is required on each run because the script rewrites the `deploy` user's `authorized_keys`.
+Re-runs, after changing anything under `deploy/` except `release.sh` (CI sends that with every deploy). Re-runs reuse the installed key and the URL from `/etc/rollandplay/backend.env`. Pass `DEPLOY_PUBKEY` or `PUBLIC_BASE_URL` again only to change them (for example, when moving to a domain):
+
+```bash
+tar czf - deploy | ssh -p 22022 root@SERVER "rm -rf /root/rollandplay-deploy && mkdir /root/rollandplay-deploy && tar xzf - -C /root/rollandplay-deploy && \
+  /root/rollandplay-deploy/deploy/provision.sh"
+```
 
 Repository secrets (**Settings → Secrets and variables → Actions**):
 
