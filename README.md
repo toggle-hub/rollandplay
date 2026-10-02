@@ -169,7 +169,7 @@ Server layout, created by `deploy/provision.sh` (idempotent, run as root on Ubun
 | `/var/lib/rollandplay/assets` | Uploaded assets. |
 | `deploy` user | CI login. The key is installed with `restrict`; sudo is limited to `systemctl restart rollandplay-backend`. |
 
-Provisioning or updating a server: run these from the repository root on your machine. The server doesn't need git; your local `deploy/` folder is streamed over SSH and replaces the previous copy each time. The script must run as root on the Ubuntu server, and it refuses to run anywhere else.
+Provisioning or updating a server: run these from the repository root on your machine (the folder that contains `deploy/`). Replace `SERVER` with the VPS address, e.g. `143.95.169.22`. SSH asks for the root password; never put it in the command. The server doesn't need git; your local `deploy/` folder is streamed over SSH and replaces the previous copy each time. The script must run as root on the Ubuntu server, and it refuses to run anywhere else.
 
 First run (installs the CI key and sets the public URL):
 
