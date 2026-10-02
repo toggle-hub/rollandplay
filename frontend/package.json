@@ -1,0 +1,37 @@
+{
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "build": "tsc -b && vite build",
+    "preview": "vite preview",
+    "test": "vitest",
+    "lint": "tsc -b --noEmit"
+  },
+  "dependencies": {
+    "@fontsource/outfit": "^5.3.0",
+    "@gsap/react": "^2.1.2",
+    "@phosphor-icons/react": "^2.1.10",
+    "@tailwindcss/vite": "latest",
+    "@vitejs/plugin-react": "latest",
+    "gsap": "^3.15.0",
+    "react": "latest",
+    "react-dom": "latest",
+    "react-router-dom": "latest",
+    "tailwindcss": "latest",
+    "typescript": "latest",
+    "vite": "latest"
+  },
+  "devDependencies": {
+    "@testing-library/jest-dom": "latest",
+    "@testing-library/react": "latest",
+    "@testing-library/user-event": "latest",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "jsdom": "^26.1.0",
+    "vitest": "latest"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "private": true,
+  "type": "module"
+}

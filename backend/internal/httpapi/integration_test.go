@@ -1,0 +1,922 @@
+package httpapi_test
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/cookiejar"
+	"net/http/httptest"
+	"net/url"
+	"os"
+	"reflect"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/gorilla/websocket"
+	"github.com/redis/go-redis/v9"
+
+	"rollandplay/backend/internal/auth"
+	"rollandplay/backend/internal/config"
+	"rollandplay/backend/internal/db"
+	"rollandplay/backend/internal/httpapi"
+	"rollandplay/backend/migrations"
+)
+
+type testApp struct {
+	server  *httptest.Server
+	poolURL string
+	redis   *redis.Client
+	cfg     config.Config
+}
+
+func newTestApp(t *testing.T) *testApp {
+	t.Helper()
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if os.Getenv("DATABASE_URL") == "" || os.Getenv("REDIS_ADDR") == "" {
+		t.Skip("DATABASE_URL and REDIS_ADDR required")
+	}
+	ctx := context.Background()
+	pool, err := db.Connect(ctx, cfg.DatabaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.ApplyMigrations(ctx, pool, migrations.Files); err != nil {
+		t.Fatal(err)
+	}
+	_, err = pool.Exec(ctx, `truncate chat_message_recipients, chat_messages, room_tokens, npcs, room_maps, map_structures, map_editors, maps, assets, room_members, rooms, sheets, rule_book_editors, rule_books, friends, sessions, auth_magic_links, users cascade`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"004_default_dnd_rule_book.sql", "005_character_creation_rules.sql"} {
+		seed, err := migrations.Files.ReadFile(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := pool.Exec(ctx, string(seed)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rdb := redis.NewClient(&redis.Options{Addr: cfg.RedisAddr, Password: cfg.RedisPassword})
+	if err := rdb.Ping(ctx).Err(); err != nil {
+		t.Fatal(err)
+	}
+	if err := rdb.FlushDB(ctx).Err(); err != nil {
+		t.Fatal(err)
+	}
+	auth.Init(pool, rdb, cfg)
+	srv := httptest.NewServer(httpapi.New(pool, rdb, cfg).Handler())
+	t.Cleanup(func() { srv.Close(); rdb.Close(); pool.Close() })
+	return &testApp{server: srv, redis: rdb, cfg: cfg}
+}
+func (a *testApp) client(t *testing.T) *http.Client {
+	jar, _ := cookiejar.New(nil)
+	return &http.Client{Jar: jar}
+}
+func post[T any](t *testing.T, c *http.Client, base, path string, body any) T {
+	t.Helper()
+	b, _ := json.Marshal(body)
+	req, _ := http.NewRequest("POST", base+path, bytes.NewReader(b))
+	req.Header.Set("Content-Type", "application/json")
+	res, err := c.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode < 200 || res.StatusCode >= 300 {
+		t.Fatalf("POST %s status %d", path, res.StatusCode)
+	}
+	var out T
+	if res.StatusCode != 204 {
+		_ = json.NewDecoder(res.Body).Decode(&out)
+	}
+	return out
+}
+func patch[T any](t *testing.T, c *http.Client, base, path string, body any) T {
+	t.Helper()
+	b, _ := json.Marshal(body)
+	req, _ := http.NewRequest("PATCH", base+path, bytes.NewReader(b))
+	req.Header.Set("Content-Type", "application/json")
+	res, err := c.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode < 200 || res.StatusCode >= 300 {
+		t.Fatalf("PATCH %s status %d", path, res.StatusCode)
+	}
+	var out T
+	_ = json.NewDecoder(res.Body).Decode(&out)
+	return out
+}
+func get[T any](t *testing.T, c *http.Client, base, path string) T {
+	t.Helper()
+	res, err := c.Get(base + path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode < 200 || res.StatusCode >= 300 {
+		t.Fatalf("GET %s status %d", path, res.StatusCode)
+	}
+	var out T
+	_ = json.NewDecoder(res.Body).Decode(&out)
+	return out
+}
+func login(t *testing.T, a *testApp, email string) (*http.Client, map[string]any) {
+	t.Helper()
+	c := a.client(t)
+	post[any](t, c, a.server.URL, "/api/auth/magic-link", map[string]string{"email": email})
+	msgs, err := a.redis.XRevRangeN(context.Background(), "email_jobs", "+", "-", 1).Result()
+	if err != nil || len(msgs) == 0 {
+		t.Fatalf("email job: %v len=%d", err, len(msgs))
+	}
+	rawURL := msgs[0].Values["url"].(string)
+	u, _ := url.Parse(rawURL)
+	token := u.Query().Get("token")
+	got := post[map[string]any](t, c, a.server.URL, "/api/auth/consume", map[string]string{"token": token})
+	return c, got["user"].(map[string]any)
+}
+
+func TestDefaultRuleBookSharedImmutableAndIdempotent(t *testing.T) {
+	a := newTestApp(t)
+	first, firstUser := login(t, a, "default-first@example.com")
+	second, secondUser := login(t, a, "default-second@example.com")
+	const defaultID = "00000000-0000-4000-8000-000000000005"
+	custom := post[map[string]any](t, first, a.server.URL, "/api/rule-books", map[string]any{"name": "Custom", "is_public": true})
+
+	ctx := context.Background()
+	pool, err := db.Connect(ctx, a.cfg.DatabaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	seed, err := migrations.Files.ReadFile("004_default_dnd_rule_book.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		if err := db.ApplyMigrations(ctx, pool, migrations.Files); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := pool.Exec(ctx, string(seed)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	for _, client := range []*http.Client{first, second} {
+		books := get[[]map[string]any](t, client, a.server.URL, "/api/rule-books")
+		if len(books) != 2 || books[0]["id"] != defaultID || books[1]["id"] != custom["id"] {
+			t.Fatalf("expected one default before custom book, got %#v", books)
+		}
+		book := get[map[string]any](t, client, a.server.URL, "/api/rule-books/"+defaultID)
+		if book["name"] != "D&D 5e (2014)" || book["owner_id"] != nil || book["is_public"] != true {
+			t.Fatalf("unexpected default rule book: %#v", book)
+		}
+		for _, attempt := range []struct {
+			method string
+			path   string
+			body   map[string]any
+		}{
+			{http.MethodPatch, "/api/rule-books/" + defaultID, map[string]any{"name": "Changed", "is_public": false, "attributes": map[string]any{}}},
+			{http.MethodPost, "/api/rule-books/" + defaultID + "/editors", map[string]any{"user_id": firstUser["id"]}},
+			{http.MethodPost, "/api/rule-books/" + defaultID + "/editors", map[string]any{"user_id": secondUser["id"]}},
+		} {
+			body, err := json.Marshal(attempt.body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			req, err := http.NewRequest(attempt.method, a.server.URL+attempt.path, bytes.NewReader(body))
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.Header.Set("Content-Type", "application/json")
+			res, err := client.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			res.Body.Close()
+			if res.StatusCode != http.StatusForbidden {
+				t.Fatalf("%s %s: expected forbidden, got %d", attempt.method, attempt.path, res.StatusCode)
+			}
+		}
+		unchanged := get[map[string]any](t, client, a.server.URL, "/api/rule-books/"+defaultID)
+		if !reflect.DeepEqual(unchanged, book) {
+			t.Fatalf("default changed after denied edits: %#v", unchanged)
+		}
+	}
+	storedCustom := get[map[string]any](t, first, a.server.URL, "/api/rule-books/"+custom["id"].(string))
+	if !reflect.DeepEqual(storedCustom, custom) {
+		t.Fatalf("migration changed custom rule book: %#v", storedCustom)
+	}
+	updated := patch[map[string]any](t, first, a.server.URL, "/api/rule-books/"+custom["id"].(string), map[string]any{"name": "Updated custom"})
+	if updated["name"] != "Updated custom" || updated["owner_id"] != firstUser["id"] {
+		t.Fatalf("custom owner could not edit their book: %#v", updated)
+	}
+}
+
+func TestDefaultRuleBookCharacterCreation(t *testing.T) {
+	a := newTestApp(t)
+	client, _ := login(t, a, "default-sheets@example.com")
+	const defaultID = "00000000-0000-4000-8000-000000000005"
+	book := get[map[string]any](t, client, a.server.URL, "/api/rule-books/"+defaultID)
+	creation := map[string]any{
+		"class_id": "fighter",
+		"scores":   map[string]any{"strength": 15, "dexterity": 14, "constitution": 13, "intelligence": 12, "wisdom": 10, "charisma": 8},
+		"choices":  map[string]any{"skill_proficiencies": []string{"athletics", "perception"}},
+	}
+	sheet := post[map[string]any](t, client, a.server.URL, "/api/sheets", map[string]any{"rule_book_id": defaultID, "creation": creation, "data": map[string]any{"speed_m": 0, "inspiration": false, "notes": "Custom hero"}})
+	data := sheet["data"].(map[string]any)
+	skills := data["skill_proficiencies"].(map[string]any)
+	saves := data["saving_throw_proficiencies"].(map[string]any)
+	if data["class"] != "Fighter" || data["hit_die"] != float64(10) || data["strength"] != float64(15) || data["speed_m"] != float64(0) || data["inspiration"] != false || data["notes"] != "Custom hero" || skills["athletics"] != true || skills["arcana"] != false || saves["constitution"] != true || saves["wisdom"] != false {
+		t.Fatalf("class/point defaults were not applied: %#v", data)
+	}
+	stored := get[map[string]any](t, client, a.server.URL, "/api/sheets/"+sheet["id"].(string))
+	if !reflect.DeepEqual(stored, sheet) {
+		t.Fatalf("created character did not round trip: %#v", stored)
+	}
+	if !reflect.DeepEqual(get[map[string]any](t, client, a.server.URL, "/api/rule-books/"+defaultID), book) {
+		t.Fatal("creating a character changed the source rule book")
+	}
+	// Progression remains possible; initial allocation is a creation-time contract.
+	updated := patch[map[string]any](t, client, a.server.URL, "/api/sheets/"+sheet["id"].(string), map[string]any{"data": map[string]any{"strength": 20}})
+	if updated["data"].(map[string]any)["strength"] != float64(20) || !reflect.DeepEqual(updated["creation"], stored["creation"]) {
+		t.Fatal("progression changed creation provenance")
+	}
+}
+
+func TestCustomRuleBookSheetDefaults(t *testing.T) {
+	a := newTestApp(t)
+	client, _ := login(t, a, "custom-sheets@example.com")
+	for _, tc := range []struct {
+		name       string
+		attributes map[string]any
+		data       map[string]any
+		expected   map[string]any
+	}{
+		{"empty defaults", map[string]any{}, map[string]any{"score": 7, "active": false}, map[string]any{"score": float64(7), "active": false}},
+		{"custom defaults", map[string]any{"score": 8, "active": true, "label": "Hero", "details": map[string]any{"a": 1, "b": 2}}, map[string]any{"score": 0, "active": false, "details": map[string]any{"c": 3}}, map[string]any{"score": float64(0), "active": false, "label": "Hero", "details": map[string]any{"c": float64(3)}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			book := post[map[string]any](t, client, a.server.URL, "/api/rule-books", map[string]any{"name": tc.name, "attributes": tc.attributes})
+			sheet := post[map[string]any](t, client, a.server.URL, "/api/sheets", map[string]any{"rule_book_id": book["id"], "data": tc.data})
+			if !reflect.DeepEqual(sheet["data"], tc.expected) {
+				t.Fatalf("custom sheet data: got %#v, want %#v", sheet["data"], tc.expected)
+			}
+			stored := get[map[string]any](t, client, a.server.URL, "/api/sheets/"+sheet["id"].(string))
+			if !reflect.DeepEqual(stored["data"], tc.expected) {
+				t.Fatalf("stored custom sheet data: got %#v, want %#v", stored["data"], tc.expected)
+			}
+		})
+	}
+}
+
+func TestAuthMagicLinkCookieAndReuse(t *testing.T) {
+	a := newTestApp(t)
+	c, u := login(t, a, "auth-"+time.Now().Format("150405.000")+"@example.com")
+	if u["email"] == "" {
+		t.Fatal("missing user")
+	}
+	me := get[map[string]any](t, c, a.server.URL, "/api/me")
+	if me["email"] != u["email"] {
+		t.Fatalf("me mismatch: %+v %+v", me, u)
+	}
+	if u["profile_complete"] != false {
+		t.Fatalf("new user should require profile: %+v", u)
+	}
+	updated := patch[map[string]any](t, c, a.server.URL, "/api/me", map[string]string{"username": "Aria", "pronouns": "she/her"})
+	if updated["username"] != "Aria" || updated["pronouns"] != "she/her" || updated["profile_complete"] != true {
+		t.Fatalf("profile update mismatch: %+v", updated)
+	}
+	me = get[map[string]any](t, c, a.server.URL, "/api/me")
+	if me["username"] != "Aria" || me["pronouns"] != "she/her" || me["profile_complete"] != true {
+		t.Fatalf("profile me mismatch: %+v", me)
+	}
+	msgs, _ := a.redis.XRevRangeN(context.Background(), "email_jobs", "+", "-", 1).Result()
+	rawURL := msgs[0].Values["url"].(string)
+	parsed, _ := url.Parse(rawURL)
+	reqBody := map[string]string{"token": parsed.Query().Get("token")}
+	b, _ := json.Marshal(reqBody)
+	res, err := c.Post(a.server.URL+"/api/auth/consume", "application/json", bytes.NewReader(b))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != 401 {
+		t.Fatalf("reused token status=%d", res.StatusCode)
+	}
+}
+
+func TestFriendsLifecycle(t *testing.T) {
+	a := newTestApp(t)
+	ca, ua := login(t, a, "a@example.com")
+	cb, ub := login(t, a, "b@example.com")
+	_ = ua
+	_ = ub
+	fr := post[map[string]any](t, ca, a.server.URL, "/api/friends", map[string]string{"email": "b@example.com"})
+	buckets := get[map[string][]map[string]any](t, cb, a.server.URL, "/api/friends")
+	if len(buckets["pending_inbound"]) != 1 {
+		t.Fatalf("expected inbound: %+v", buckets)
+	}
+	patch[map[string]any](t, cb, a.server.URL, "/api/friends/"+fr["id"].(string), map[string]string{"status": "accepted"})
+	aBuckets := get[map[string][]map[string]any](t, ca, a.server.URL, "/api/friends")
+	bBuckets := get[map[string][]map[string]any](t, cb, a.server.URL, "/api/friends")
+	if len(aBuckets["accepted"]) != 1 || len(bBuckets["accepted"]) != 1 {
+		t.Fatalf("accepted missing: %+v %+v", aBuckets, bBuckets)
+	}
+	req, _ := http.NewRequest("DELETE", a.server.URL+"/api/friends/"+fr["id"].(string), nil)
+	res, err := ca.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.StatusCode != 204 {
+		t.Fatalf("delete status=%d", res.StatusCode)
+	}
+}
+
+func TestRoomCreatorIsDMAndCanUseMapWithoutSheet(t *testing.T) {
+	a := newTestApp(t)
+	dm, u := login(t, a, "dm-nosheet@example.com")
+	room := post[map[string]any](t, dm, a.server.URL, "/api/rooms", map[string]any{"name": "Sheetless Table"})
+	members := get[[]map[string]any](t, dm, a.server.URL, "/api/rooms/"+room["id"].(string)+"/members")
+	if len(members) != 1 || members[0]["user_id"] != u["id"] || members[0]["is_dm"] != true {
+		t.Fatalf("creator should be the room DM: %+v user=%+v", members, u)
+	}
+	gm := post[map[string]any](t, dm, a.server.URL, "/api/maps", map[string]any{"name": "Arena", "width_m": 10, "height_m": 10})
+	post[map[string]any](t, dm, a.server.URL, "/api/rooms/"+room["id"].(string)+"/maps", map[string]any{"map_id": gm["id"], "is_active": true})
+	tok := post[map[string]any](t, dm, a.server.URL, "/api/rooms/"+room["id"].(string)+"/tokens", map[string]any{"name": "Goblin", "x_m": 2, "y_m": 2})
+	if tok["sheet_id"] != nil || tok["owner_user_id"] != u["id"] || tok["name"] != "Goblin" {
+		t.Fatalf("DM token should not require a sheet: %+v", tok)
+	}
+}
+
+func TestRoomInviteCarriesRuleBookAndPlayerChoosesMatchingSheet(t *testing.T) {
+	a := newTestApp(t)
+	dm, _ := login(t, a, "invite-dm@example.com")
+	player, pu := login(t, a, "invite-player@example.com")
+	outsider, _ := login(t, a, "invite-outsider@example.com")
+	const defaultID = "00000000-0000-4000-8000-000000000005"
+	private := post[map[string]any](t, dm, a.server.URL, "/api/rule-books", map[string]any{"name": "House Rules", "attributes": map[string]any{"grit": 1}})
+	if status := statusOf(t, player, "POST", a.server.URL+"/api/rooms", map[string]any{"name": "Stolen", "rule_book_id": private["id"]}); status != 400 {
+		t.Fatalf("room creation with an unreadable rule book: status %d", status)
+	}
+	if defaulted := post[map[string]any](t, player, a.server.URL, "/api/rooms", map[string]any{"name": "Default"}); defaulted["rule_book"].(map[string]any)["id"] != defaultID {
+		t.Fatalf("rooms without a rule book should use the built-in book: %+v", defaulted)
+	}
+	room := post[map[string]any](t, dm, a.server.URL, "/api/rooms", map[string]any{"name": "House Table", "rule_book_id": private["id"]})
+	roomID := room["id"].(string)
+	if book := room["rule_book"].(map[string]any); book["id"] != private["id"] || book["name"] != "House Rules" {
+		t.Fatalf("created room should carry its rule book: %+v", room)
+	}
+	if status := statusOf(t, player, "GET", a.server.URL+"/api/rule-books/"+private["id"].(string), nil); status != 404 {
+		t.Fatalf("private rule book visible before joining: status %d", status)
+	}
+	other := post[map[string]any](t, player, a.server.URL, "/api/rule-books", map[string]any{"name": "Other System", "attributes": map[string]any{}})
+	otherSheet := post[map[string]any](t, player, a.server.URL, "/api/sheets", map[string]any{"rule_book_id": other["id"], "name": "Wrong System", "data": map[string]any{}})
+
+	invitePath := "/api/invites/" + room["invite_code"].(string)
+	preview := get[map[string]any](t, player, a.server.URL, invitePath)
+	if book := preview["rule_book"].(map[string]any); preview["room_id"] != roomID || preview["name"] != "House Table" || book["id"] != private["id"] || book["name"] != "House Rules" || preview["requires_password"] != false || preview["member"] != nil {
+		t.Fatalf("invite preview should show the room and rule book before joining: %+v", preview)
+	}
+	if status := statusOf(t, player, "GET", a.server.URL+"/api/invites/NOPE", nil); status != 404 {
+		t.Fatalf("unknown invite: status %d", status)
+	}
+	if status := statusOf(t, player, "POST", a.server.URL+"/api/rooms/join", map[string]any{"invite_code": room["invite_code"], "sheet_id": otherSheet["id"]}); status != 400 {
+		t.Fatalf("joined with a character from another rule book: status %d", status)
+	}
+	if member := get[map[string]any](t, player, a.server.URL, invitePath)["member"]; member != nil {
+		t.Fatalf("a rejected join must not create membership: %+v", member)
+	}
+	joined := post[map[string]any](t, player, a.server.URL, "/api/rooms/join", map[string]any{"invite_code": room["invite_code"]})
+	if book := joined["rule_book"].(map[string]any); joined["room_id"] != roomID || book["id"] != private["id"] || book["name"] != "House Rules" || joined["is_dm"] != false || joined["sheet_id"] != nil {
+		t.Fatalf("invite should carry the room rule book: %+v", joined)
+	}
+	// Joining grants use of the room's rule book for character creation, but not to outsiders.
+	get[map[string]any](t, player, a.server.URL, "/api/rule-books/"+private["id"].(string))
+	if status := statusOf(t, outsider, "GET", a.server.URL+"/api/rule-books/"+private["id"].(string), nil); status != 404 {
+		t.Fatalf("private rule book leaked to a non-member: status %d", status)
+	}
+	sheet := post[map[string]any](t, player, a.server.URL, "/api/sheets", map[string]any{"rule_book_id": private["id"], "name": "Housed", "data": map[string]any{}})
+
+	memberPath := "/api/rooms/" + roomID + "/members/" + pu["id"].(string)
+	if status := statusOf(t, player, "PATCH", a.server.URL+memberPath, map[string]any{"sheet_id": otherSheet["id"]}); status != 400 {
+		t.Fatalf("sheet from another rule book accepted: status %d", status)
+	}
+	if status := statusOf(t, player, "PATCH", a.server.URL+memberPath, map[string]any{"is_dm": true}); status != 403 {
+		t.Fatalf("player promoted themselves: status %d", status)
+	}
+	dmMembers := get[[]map[string]any](t, dm, a.server.URL, "/api/rooms/"+roomID+"/members")
+	if status := statusOf(t, player, "PATCH", a.server.URL+"/api/rooms/"+roomID+"/members/"+dmMembers[0]["user_id"].(string), map[string]any{"sheet_id": sheet["id"]}); status != 403 {
+		t.Fatalf("player chose another member's character: status %d", status)
+	}
+	chosen := patch[map[string]any](t, player, a.server.URL, memberPath, map[string]any{"sheet_id": sheet["id"]})
+	if chosen["sheet_id"] != sheet["id"] || chosen["is_dm"] != false {
+		t.Fatalf("player should choose their own matching character: %+v", chosen)
+	}
+	cleared := patch[map[string]any](t, player, a.server.URL, memberPath, map[string]any{"sheet_id": nil})
+	if cleared["sheet_id"] != nil {
+		t.Fatalf("choosing no sheet should clear the character: %+v", cleared)
+	}
+	rejoined := post[map[string]any](t, player, a.server.URL, "/api/rooms/join", map[string]any{"invite_code": room["invite_code"], "sheet_id": sheet["id"]})
+	if rejoined["sheet_id"] != sheet["id"] {
+		t.Fatalf("joining with a character should choose it: %+v", rejoined)
+	}
+	if again := post[map[string]any](t, player, a.server.URL, "/api/rooms/join", map[string]any{"invite_code": room["invite_code"]}); again["sheet_id"] != sheet["id"] {
+		t.Fatalf("rejoining without a character should keep the chosen one: %+v", again)
+	}
+	if member := get[map[string]any](t, player, a.server.URL, invitePath)["member"].(map[string]any); member["sheet_id"] != sheet["id"] || member["is_dm"] != false {
+		t.Fatalf("invite preview should report existing membership: %+v", member)
+	}
+
+	gm := post[map[string]any](t, dm, a.server.URL, "/api/maps", map[string]any{"name": "Hall", "width_m": 10, "height_m": 10})
+	post[map[string]any](t, dm, a.server.URL, "/api/rooms/"+roomID+"/maps", map[string]any{"map_id": gm["id"], "is_active": true})
+	if status := statusOf(t, player, "POST", a.server.URL+"/api/rooms/"+roomID+"/tokens", map[string]any{"sheet_id": otherSheet["id"], "name": "Wrong"}); status != 403 {
+		t.Fatalf("token from another rule book accepted: status %d", status)
+	}
+	post[map[string]any](t, player, a.server.URL, "/api/rooms/"+roomID+"/tokens", map[string]any{"sheet_id": sheet["id"], "name": "Housed"})
+}
+
+func TestRoomListHidesRoomsYouHaveNotJoined(t *testing.T) {
+	a := newTestApp(t)
+	owner, _ := login(t, a, "list-owner@example.com")
+	outsider, _ := login(t, a, "list-outsider@example.com")
+	private := post[map[string]any](t, owner, a.server.URL, "/api/rooms", map[string]any{"name": "Secret Table", "is_public": false, "password": "hunter2"})
+	public := post[map[string]any](t, owner, a.server.URL, "/api/rooms", map[string]any{"name": "Open Table", "is_public": true})
+	names := func(c *http.Client, path string) map[string]bool {
+		t.Helper()
+		out := map[string]bool{}
+		for _, row := range get[[]map[string]any](t, c, a.server.URL, path) {
+			out[row["name"].(string)] = true
+		}
+		return out
+	}
+	if got := names(owner, "/api/rooms"); !got["Secret Table"] || !got["Open Table"] {
+		t.Fatalf("owner should list both rooms: %v", got)
+	}
+	if got := names(outsider, "/api/rooms"); len(got) != 0 {
+		t.Fatalf("outsider should not list rooms they have not joined: %v", got)
+	}
+	if got := names(outsider, "/api/rooms?public=true"); got["Secret Table"] || !got["Open Table"] {
+		t.Fatalf("public listing should include only public rooms: %v", got)
+	}
+	if status := statusOf(t, outsider, "POST", a.server.URL+"/api/rooms/join", map[string]any{"invite_code": private["invite_code"]}); status != 403 {
+		t.Fatalf("private room joined without its password: %d", status)
+	}
+	post[map[string]any](t, outsider, a.server.URL, "/api/rooms/join", map[string]any{"invite_code": public["invite_code"]})
+	if got := names(outsider, "/api/rooms"); got["Secret Table"] || !got["Open Table"] {
+		t.Fatalf("outsider should list only the room they joined: %v", got)
+	}
+}
+
+func statusOf(t *testing.T, c *http.Client, method, url string, body any) int {
+	t.Helper()
+	b, _ := json.Marshal(body)
+	req, _ := http.NewRequest(method, url, bytes.NewReader(b))
+	req.Header.Set("Content-Type", "application/json")
+	res, err := c.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res.Body.Close()
+	return res.StatusCode
+}
+
+func TestRoomWebsocketMovementAndChat(t *testing.T) {
+	a := newTestApp(t)
+	dm, du := login(t, a, "dm@example.com")
+	player, pu := login(t, a, "player@example.com")
+	third, _ := login(t, a, "third@example.com")
+	_ = third
+	rb := post[map[string]any](t, dm, a.server.URL, "/api/rule-books", map[string]any{"name": "Rules", "attributes": map[string]any{}, "is_public": true})
+	sheet := post[map[string]any](t, player, a.server.URL, "/api/sheets", map[string]any{"rule_book_id": rb["id"], "name": "Hero", "data": map[string]any{}})
+	room := post[map[string]any](t, dm, a.server.URL, "/api/rooms", map[string]any{"name": "Table", "rule_book_id": rb["id"]})
+	post[map[string]any](t, player, a.server.URL, "/api/rooms/join", map[string]any{"invite_code": room["invite_code"]})
+	post[map[string]any](t, third, a.server.URL, "/api/rooms/join", map[string]any{"invite_code": room["invite_code"]})
+	gm := post[map[string]any](t, dm, a.server.URL, "/api/maps", map[string]any{"name": "Arena", "width_m": 10, "height_m": 10})
+	wall := post[map[string]any](t, dm, a.server.URL, "/api/maps/"+gm["id"].(string)+"/structures", map[string]any{"kind": "wall", "geometry": []map[string]float64{{"x": 5, "y": 0}, {"x": 5, "y": 10}}, "blocks_vision": true, "blocks_movement": true, "blocks_attacks": true, "cover_bonus": 0, "pass_rules": map[string]bool{}})
+	post[map[string]any](t, dm, a.server.URL, "/api/rooms/"+room["id"].(string)+"/maps", map[string]any{"map_id": gm["id"], "is_active": true})
+	tok := post[map[string]any](t, player, a.server.URL, "/api/rooms/"+room["id"].(string)+"/tokens", map[string]any{"sheet_id": sheet["id"], "name": "Hero", "x_m": 1, "y_m": 1})
+	enemy := post[map[string]any](t, dm, a.server.URL, "/api/rooms/"+room["id"].(string)+"/tokens", map[string]any{"name": "Goblin", "x_m": 3, "y_m": 2})
+	dmWS := dialWS(t, a, dm, room["id"].(string))
+	defer dmWS.Close()
+	pWS := dialWS(t, a, player, room["id"].(string))
+	defer pWS.Close()
+	readType(t, dmWS, "state.snapshot")
+	readType(t, pWS, "state.snapshot")
+	sendWS(t, pWS, "token.move", "move-block", map[string]any{"tokenId": tok["id"], "to": map[string]float64{"x": 6, "y": 1}, "path": []map[string]float64{{"x": 1, "y": 1}, {"x": 6, "y": 1}}})
+	if ev := readType(t, pWS, "error"); ev["requestId"] != "move-block" {
+		t.Fatalf("wrong error: %+v", ev)
+	}
+	sendWS(t, pWS, "token.move", "move-ok", map[string]any{"tokenId": tok["id"], "to": map[string]float64{"x": 2, "y": 1}, "path": []map[string]float64{{"x": 1, "y": 1}, {"x": 2, "y": 1}}})
+	readType(t, dmWS, "token.moved")
+
+	sendWS(t, pWS, "token.move", "move-enemy", map[string]any{"tokenId": enemy["id"], "to": map[string]float64{"x": 4, "y": 2}})
+	if ev := readType(t, pWS, "error"); ev["requestId"] != "move-enemy" {
+		t.Fatalf("player should not move the DM token: %+v", ev)
+	}
+	sendWS(t, dmWS, "token.move", "dm-move-enemy", map[string]any{"tokenId": enemy["id"], "to": map[string]float64{"x": 3, "y": 3}})
+	readType(t, pWS, "token.moved")
+
+	sendWS(t, pWS, "token.visibility", "hide-enemy-player", map[string]any{"tokenId": enemy["id"], "isHidden": true})
+	if ev := readType(t, pWS, "error"); ev["requestId"] != "hide-enemy-player" {
+		t.Fatalf("player should not hide the DM token: %+v", ev)
+	}
+	sendWS(t, dmWS, "token.visibility", "hide-enemy", map[string]any{"tokenId": enemy["id"], "isHidden": true})
+	readType(t, pWS, "token.updated")
+	dmState := get[map[string]any](t, dm, a.server.URL, "/api/rooms/"+room["id"].(string)+"/state")
+	if hiddenEnemy := entityByID(t, dmState["visibleTokens"], enemy["id"].(string)); hiddenEnemy["is_hidden"] != true {
+		t.Fatalf("DM should see the hidden enemy: %+v", hiddenEnemy)
+	}
+	playerState := get[map[string]any](t, player, a.server.URL, "/api/rooms/"+room["id"].(string)+"/state")
+	if encoded, _ := json.Marshal(playerState); strings.Contains(string(encoded), enemy["id"].(string)) {
+		t.Fatalf("player should not receive the hidden enemy: %s", encoded)
+	}
+
+	movedGeometry := []map[string]float64{{"x": 6, "y": 0}, {"x": 6, "y": 10}}
+	sendWS(t, pWS, "structure.move", "move-wall-player", map[string]any{"structureId": wall["id"], "geometry": movedGeometry})
+	if ev := readType(t, pWS, "error"); ev["requestId"] != "move-wall-player" {
+		t.Fatalf("player should not move structures: %+v", ev)
+	}
+	sendWS(t, dmWS, "structure.move", "move-wall", map[string]any{"structureId": wall["id"], "geometry": movedGeometry})
+	readType(t, pWS, "structure.moved")
+	dmState = get[map[string]any](t, dm, a.server.URL, "/api/rooms/"+room["id"].(string)+"/state")
+	movedWall := entityByID(t, dmState["structures"], wall["id"].(string))
+	firstPoint := movedWall["geometry"].([]any)[0].(map[string]any)
+	if firstPoint["x"] != float64(6) {
+		t.Fatalf("room structure move was not retained: %+v", movedWall)
+	}
+
+	rotatedGeometry := []map[string]float64{{"x": 7.29, "y": 0.17}, {"x": 4.71, "y": 9.83}}
+	sendWS(t, pWS, "structure.move", "rotate-wall-player", map[string]any{"structureId": wall["id"], "geometry": rotatedGeometry})
+	if ev := readType(t, pWS, "error"); ev["requestId"] != "rotate-wall-player" || ev["body"].(map[string]any)["code"] != "forbidden" {
+		t.Fatalf("player should not rotate structures: %+v", ev)
+	}
+	for _, transform := range []struct {
+		id       string
+		geometry []map[string]float64
+	}{
+		{"rotate-wall-rounded", rotatedGeometry},
+		{"rotate-wall-again", []map[string]float64{{"x": 11, "y": 5}, {"x": 1, "y": 5}}},
+		{"move-rotated-wall", []map[string]float64{{"x": 12, "y": 6}, {"x": 2, "y": 6}}},
+	} {
+		sendWS(t, dmWS, "structure.move", transform.id, map[string]any{"structureId": wall["id"], "geometry": transform.geometry})
+		event := readType(t, pWS, "structure.moved")
+		expected, _ := json.Marshal(transform.geometry)
+		broadcast, _ := json.Marshal(event["body"].(map[string]any)["geometry"])
+		if event["requestId"] != transform.id || !bytes.Equal(broadcast, expected) {
+			t.Fatalf("transform was not broadcast: %+v", event)
+		}
+		dmState = get[map[string]any](t, dm, a.server.URL, "/api/rooms/"+room["id"].(string)+"/state")
+		persisted, _ := json.Marshal(entityByID(t, dmState["structures"], wall["id"].(string))["geometry"])
+		if !bytes.Equal(persisted, expected) {
+			t.Fatalf("transform %s was not retained: got %s, want %s", transform.id, persisted, expected)
+		}
+	}
+	sourceMap := get[map[string]any](t, dm, a.server.URL, "/api/maps/"+gm["id"].(string))
+	sourceGeometry, _ := json.Marshal(entityByID(t, sourceMap["structures"], wall["id"].(string))["geometry"])
+	if string(sourceGeometry) != `[{"x":5,"y":0},{"x":5,"y":10}]` {
+		t.Fatalf("room rotation changed the source map: %s", sourceGeometry)
+	}
+	sendWS(t, dmWS, "structure.move", "resize-wall", map[string]any{"structureId": wall["id"], "geometry": []map[string]float64{{"x": 12, "y": 6}, {"x": 0, "y": 6}}})
+	if ev := readType(t, dmWS, "error"); ev["requestId"] != "resize-wall" || ev["body"].(map[string]any)["code"] != "invalid_transform" {
+		t.Fatalf("resizing should still be rejected: %+v", ev)
+	}
+	dmState = get[map[string]any](t, dm, a.server.URL, "/api/rooms/"+room["id"].(string)+"/state")
+	afterRejection, _ := json.Marshal(entityByID(t, dmState["structures"], wall["id"].(string))["geometry"])
+	if string(afterRejection) != `[{"x":12,"y":6},{"x":2,"y":6}]` {
+		t.Fatalf("rejected resize changed the retained rotation: %s", afterRejection)
+	}
+
+	sendWS(t, pWS, "structure.visibility", "hide-wall-player", map[string]any{"structureId": wall["id"], "isHidden": true})
+	if ev := readType(t, pWS, "error"); ev["requestId"] != "hide-wall-player" {
+		t.Fatalf("player should not hide structures: %+v", ev)
+	}
+	sendWS(t, dmWS, "structure.visibility", "hide-wall", map[string]any{"structureId": wall["id"], "isHidden": true})
+	readType(t, pWS, "structure.updated")
+	dmState = get[map[string]any](t, dm, a.server.URL, "/api/rooms/"+room["id"].(string)+"/state")
+	if hiddenWall := entityByID(t, dmState["structures"], wall["id"].(string)); hiddenWall["is_hidden"] != true {
+		t.Fatalf("DM should see the hidden structure: %+v", hiddenWall)
+	}
+	playerState = get[map[string]any](t, player, a.server.URL, "/api/rooms/"+room["id"].(string)+"/state")
+	if encoded, _ := json.Marshal(playerState); strings.Contains(string(encoded), wall["id"].(string)) {
+		t.Fatalf("player should not receive the hidden structure: %s", encoded)
+	}
+	sendWS(t, dmWS, "chat.send", "dm-private", map[string]any{"text": "secret", "recipientUserIds": []string{pu["id"].(string)}})
+	if ev := readType(t, pWS, "chat.message"); !strings.Contains(fmtBody(ev), "secret") {
+		t.Fatalf("missing private chat: %+v", ev)
+	}
+	_ = du
+}
+
+func TestRoomTokenAttacks(t *testing.T) {
+	a := newTestApp(t)
+	dm, _ := login(t, a, "attack-dm@example.com")
+	player, _ := login(t, a, "attack-player@example.com")
+	rb := post[map[string]any](t, dm, a.server.URL, "/api/rule-books", map[string]any{"name": "Attack Rules", "attributes": map[string]any{"strength": 16, "dexterity": 12, "proficiency_bonus": 2}, "is_public": true})
+	sheet := post[map[string]any](t, player, a.server.URL, "/api/sheets", map[string]any{"rule_book_id": rb["id"], "name": "Hero", "data": map[string]any{}})
+	room := post[map[string]any](t, dm, a.server.URL, "/api/rooms", map[string]any{"name": "Battle", "rule_book_id": rb["id"]})
+	roomPath := "/api/rooms/" + room["id"].(string)
+	post[map[string]any](t, player, a.server.URL, "/api/rooms/join", map[string]any{"invite_code": room["invite_code"]})
+	gm := post[map[string]any](t, dm, a.server.URL, "/api/maps", map[string]any{"name": "Arena", "width_m": 10, "height_m": 10})
+	wall := post[map[string]any](t, dm, a.server.URL, "/api/maps/"+gm["id"].(string)+"/structures", map[string]any{"kind": "wall", "geometry": []map[string]float64{{"x": 5, "y": 0}, {"x": 5, "y": 10}}, "blocks_vision": false, "blocks_movement": true, "blocks_attacks": true, "cover_bonus": 0, "pass_rules": map[string]bool{}})
+	post[map[string]any](t, dm, a.server.URL, roomPath+"/maps", map[string]any{"map_id": gm["id"], "is_active": true})
+	hero := post[map[string]any](t, player, a.server.URL, roomPath+"/tokens", map[string]any{"sheet_id": sheet["id"], "name": "Hero", "x_m": 1, "y_m": 1})
+	goblin := post[map[string]any](t, dm, a.server.URL, roomPath+"/tokens", map[string]any{"name": "Goblin", "x_m": 2, "y_m": 1})
+	orc := post[map[string]any](t, dm, a.server.URL, roomPath+"/tokens", map[string]any{"name": "Orc", "x_m": 4, "y_m": 1})
+	troll := post[map[string]any](t, dm, a.server.URL, roomPath+"/tokens", map[string]any{"name": "Troll", "x_m": 6, "y_m": 1})
+	heroAttacks := roomPath + "/tokens/" + hero["id"].(string) + "/attacks"
+	goblinAttacks := roomPath + "/tokens/" + goblin["id"].(string) + "/attacks"
+
+	heroList := []map[string]any{
+		{"id": "sword", "name": "Sword", "range_m": 1.5, "ability": "strength", "proficient": true, "attack_bonus": 0, "damage": "1d8", "damage_bonus": 0},
+		{"id": "bow", "name": "Bow", "range_m": 20, "ability": "dexterity", "proficient": true, "attack_bonus": 0, "damage": "1d6", "damage_bonus": 0},
+	}
+	saved := patch[map[string]any](t, player, a.server.URL, heroAttacks, map[string]any{"attacks": heroList})
+	sword := saved["attacks"].([]any)[0].(map[string]any)
+	if sword["to_hit"] != float64(5) || sword["damage_modifier"] != float64(3) {
+		t.Fatalf("hero sword should resolve to +5 / +3: %+v", sword)
+	}
+	if status := statusOf(t, player, "PATCH", a.server.URL+goblinAttacks, map[string]any{"attacks": []any{}}); status != 403 {
+		t.Fatalf("player edited NPC attacks: %d", status)
+	}
+	if status := statusOf(t, dm, "PATCH", a.server.URL+heroAttacks, map[string]any{"attacks": []any{}}); status != 403 {
+		t.Fatalf("DM edited a player's sheet attacks: %d", status)
+	}
+	banana := []map[string]any{{"id": "x", "name": "Fruit", "range_m": 1, "damage": "banana"}}
+	if status := statusOf(t, player, "PATCH", a.server.URL+heroAttacks, map[string]any{"attacks": banana}); status != 400 {
+		t.Fatalf("invalid damage accepted: %d", status)
+	}
+	scimitar := []map[string]any{{"id": "scimitar", "name": "Scimitar", "range_m": 1.5, "ability": "", "proficient": false, "attack_bonus": 4, "damage": "1d6", "damage_bonus": 2}}
+	patch[map[string]any](t, dm, a.server.URL, goblinAttacks, map[string]any{"attacks": scimitar})
+
+	playerState := get[map[string]any](t, player, a.server.URL, roomPath+"/state")
+	if h := entityByID(t, playerState["visibleTokens"], hero["id"].(string)); len(h["attacks"].([]any)) != 2 || h["attacks_editable"] != true {
+		t.Fatalf("player should see and edit hero attacks: %+v", h)
+	}
+	g := entityByID(t, playerState["visibleTokens"], goblin["id"].(string))
+	if _, leaked := g["attacks"]; leaked {
+		t.Fatalf("player received NPC attacks: %+v", g)
+	}
+	if _, leaked := g["attributes"].(map[string]any)["attacks"]; leaked {
+		t.Fatalf("player received raw NPC attacks: %+v", g)
+	}
+	dmState := get[map[string]any](t, dm, a.server.URL, roomPath+"/state")
+	if g := entityByID(t, dmState["visibleTokens"], goblin["id"].(string)); len(g["attacks"].([]any)) != 1 || g["attacks_editable"] != true {
+		t.Fatalf("DM should see and edit goblin attacks: %+v", g)
+	}
+	if h := entityByID(t, dmState["visibleTokens"], hero["id"].(string)); len(h["attacks"].([]any)) != 2 || h["attacks_editable"] != nil {
+		t.Fatalf("DM should see but not edit hero attacks: %+v", h)
+	}
+
+	dmWS := dialWS(t, a, dm, room["id"].(string))
+	defer dmWS.Close()
+	pWS := dialWS(t, a, player, room["id"].(string))
+	defer pWS.Close()
+	readType(t, dmWS, "state.snapshot")
+	readType(t, pWS, "state.snapshot")
+	expectError := func(id, code string, body map[string]any) {
+		t.Helper()
+		sendWS(t, pWS, "attack.resolve", id, body)
+		ev := readType(t, pWS, "error")
+		if ev["requestId"] != id || ev["body"].(map[string]any)["code"] != code {
+			t.Fatalf("%s: want %s, got %+v", id, code, ev)
+		}
+	}
+	expectError("orc-out-of-range", "out_of_range", map[string]any{"sourceTokenId": hero["id"], "targetTokenId": orc["id"], "attackId": "sword"})
+	expectError("troll-behind-wall", "blocked_target", map[string]any{"sourceTokenId": hero["id"], "targetTokenId": troll["id"], "attackId": "bow"})
+	expectError("goblin-not-yours", "forbidden", map[string]any{"sourceTokenId": goblin["id"], "targetTokenId": hero["id"], "attackId": "scimitar"})
+	expectError("unknown-attack", "unknown_attack", map[string]any{"sourceTokenId": hero["id"], "targetTokenId": goblin["id"], "attackId": "axe"})
+
+	// Every roll is broadcast, so drain it from both sockets to keep them in step.
+	expectRoll := func(body, attackExpr, damageExpr string, minTotal, maxTotal, minDamage, maxDamage float64) {
+		t.Helper()
+		for _, conn := range []*websocket.Conn{dmWS, pWS} {
+			ev := readType(t, conn, "roll.result")
+			b := ev["body"].(map[string]any)
+			roll := b["roll"].(map[string]any)
+			damage := roll["damage"].(map[string]any)
+			total, damageTotal := roll["total"].(float64), damage["total"].(float64)
+			if b["body"] != body || roll["expression"] != attackExpr || damage["expression"] != damageExpr || b["created_at"] == nil ||
+				total < minTotal || total > maxTotal || damageTotal < minDamage || damageTotal > maxDamage {
+				t.Fatalf("unexpected attack roll: %s", fmtBody(ev))
+			}
+		}
+	}
+	sendWS(t, pWS, "attack.resolve", "hero-sword", map[string]any{"sourceTokenId": hero["id"], "targetTokenId": goblin["id"], "attackId": "sword"})
+	expectRoll("Hero attacks Goblin with Sword", "1d20+5", "1d8+3", 6, 25, 4, 11)
+	sendWS(t, dmWS, "attack.resolve", "goblin-scimitar", map[string]any{"sourceTokenId": goblin["id"], "targetTokenId": hero["id"], "attackId": "scimitar"})
+	expectRoll("Goblin attacks Hero with Scimitar", "1d20+4", "1d6+2", 5, 24, 3, 8)
+
+	patch[map[string]any](t, dm, a.server.URL, "/api/maps/"+gm["id"].(string)+"/structures/"+wall["id"].(string), map[string]any{"pass_rules": map[string]bool{"attacks": true}})
+	sendWS(t, pWS, "attack.resolve", "troll-through-wall", map[string]any{"sourceTokenId": hero["id"], "targetTokenId": troll["id"], "attackId": "bow"})
+	expectRoll("Hero attacks Troll with Bow", "1d20+3", "1d6+1", 4, 23, 2, 7)
+}
+
+func TestRoomStructurePlacementAndRemovalStayInRoom(t *testing.T) {
+	a := newTestApp(t)
+	dm, _ := login(t, a, "build-dm@example.com")
+	player, _ := login(t, a, "build-player@example.com")
+	rb := post[map[string]any](t, dm, a.server.URL, "/api/rule-books", map[string]any{"name": "Build Rules", "attributes": map[string]any{}, "is_public": true})
+	sheet := post[map[string]any](t, player, a.server.URL, "/api/sheets", map[string]any{"rule_book_id": rb["id"], "name": "Hero", "data": map[string]any{}})
+	room := post[map[string]any](t, dm, a.server.URL, "/api/rooms", map[string]any{"name": "Build Table", "rule_book_id": rb["id"]})
+	other := post[map[string]any](t, dm, a.server.URL, "/api/rooms", map[string]any{"name": "Other Table", "rule_book_id": rb["id"]})
+	roomPath, otherPath := "/api/rooms/"+room["id"].(string), "/api/rooms/"+other["id"].(string)
+	post[map[string]any](t, player, a.server.URL, "/api/rooms/join", map[string]any{"invite_code": room["invite_code"]})
+	gm := post[map[string]any](t, dm, a.server.URL, "/api/maps", map[string]any{"name": "Shared Arena", "width_m": 10, "height_m": 10})
+	mapPath := "/api/maps/" + gm["id"].(string)
+	wall := post[map[string]any](t, dm, a.server.URL, mapPath+"/structures", map[string]any{"kind": "wall", "geometry": []map[string]float64{{"x": 8, "y": 0}, {"x": 8, "y": 10}}, "blocks_vision": false, "blocks_movement": true, "blocks_attacks": true, "cover_bonus": 0, "pass_rules": map[string]bool{}})
+	post[map[string]any](t, dm, a.server.URL, roomPath+"/maps", map[string]any{"map_id": gm["id"], "is_active": true})
+	post[map[string]any](t, dm, a.server.URL, otherPath+"/maps", map[string]any{"map_id": gm["id"], "is_active": true})
+	hero := post[map[string]any](t, player, a.server.URL, roomPath+"/tokens", map[string]any{"sheet_id": sheet["id"], "name": "Hero", "x_m": 1, "y_m": 1})
+
+	dmWS := dialWS(t, a, dm, room["id"].(string))
+	defer dmWS.Close()
+	pWS := dialWS(t, a, player, room["id"].(string))
+	defer pWS.Close()
+	readType(t, dmWS, "state.snapshot")
+	readType(t, pWS, "state.snapshot")
+	expectError := func(conn *websocket.Conn, typ, id, code string, body any) {
+		t.Helper()
+		sendWS(t, conn, typ, id, body)
+		ev := readType(t, conn, "error")
+		if ev["requestId"] != id || ev["body"].(map[string]any)["code"] != code {
+			t.Fatalf("%s: want %s, got %+v", id, code, ev)
+		}
+	}
+	structureIDs := func(c *http.Client, path string) map[string]bool {
+		t.Helper()
+		state := get[map[string]any](t, c, a.server.URL, path)
+		ids := map[string]bool{}
+		for _, row := range state["structures"].([]any) {
+			ids[row.(map[string]any)["id"].(string)] = true
+		}
+		return ids
+	}
+	barrier := map[string]any{"kind": "wall", "geometry": []map[string]float64{{"x": 2, "y": 0}, {"x": 2, "y": 3}}, "blocks_vision": true, "blocks_movement": true, "blocks_attacks": true}
+
+	expectError(pWS, "structure.create", "player-build", "forbidden", barrier)
+	expectError(dmWS, "structure.create", "bad-kind", "invalid_structure", map[string]any{"kind": "lava", "geometry": barrier["geometry"]})
+	expectError(dmWS, "structure.create", "one-point", "invalid_structure", map[string]any{"kind": "wall", "geometry": []map[string]float64{{"x": 2, "y": 0}}})
+	sendWS(t, dmWS, "structure.create", "dm-build", barrier)
+	created := readType(t, pWS, "structure.created")["body"].(map[string]any)["structure"].(map[string]any)
+	placedID := created["id"].(string)
+	readType(t, dmWS, "structure.created")
+	if created["kind"] != "wall" || created["is_hidden"] != false {
+		t.Fatalf("placed structure should be a visible wall: %+v", created)
+	}
+	if ids := structureIDs(player, roomPath+"/state"); !ids[placedID] || !ids[wall["id"].(string)] {
+		t.Fatalf("player should see the placed and the map wall: %v", ids)
+	}
+	if ids := structureIDs(dm, otherPath+"/state"); ids[placedID] || !ids[wall["id"].(string)] {
+		t.Fatalf("placed structure leaked into another room on the same map: %v", ids)
+	}
+	if ids := structureIDs(dm, mapPath); len(ids) != 1 || !ids[wall["id"].(string)] {
+		t.Fatalf("placed structure leaked into the source map: %v", ids)
+	}
+	if status := statusOf(t, dm, "PATCH", a.server.URL+mapPath+"/structures/"+placedID, map[string]any{"kind": "door"}); status != 404 {
+		t.Fatalf("map editor should not reach room-placed structures: %d", status)
+	}
+
+	expectError(pWS, "token.move", "through-placed-wall", "blocked_movement", map[string]any{"tokenId": hero["id"], "to": map[string]float64{"x": 3, "y": 1}, "path": []map[string]float64{{"x": 1, "y": 1}, {"x": 3, "y": 1}}})
+	sendWS(t, dmWS, "structure.move", "move-placed", map[string]any{"structureId": placedID, "geometry": []map[string]float64{{"x": 4, "y": 0}, {"x": 4, "y": 3}}})
+	readType(t, pWS, "structure.moved")
+	sendWS(t, pWS, "token.move", "past-moved-wall", map[string]any{"tokenId": hero["id"], "to": map[string]float64{"x": 3, "y": 1}, "path": []map[string]float64{{"x": 1, "y": 1}, {"x": 3, "y": 1}}})
+	readType(t, pWS, "token.moved")
+
+	expectError(pWS, "structure.remove", "player-remove", "forbidden", map[string]any{"structureId": placedID})
+	sendWS(t, dmWS, "structure.remove", "remove-placed", map[string]any{"structureId": placedID})
+	if body := readType(t, pWS, "structure.removed")["body"].(map[string]any); body["structure_id"] != placedID {
+		t.Fatalf("wrong structure removed: %+v", body)
+	}
+	expectError(dmWS, "structure.remove", "remove-again", "not_found", map[string]any{"structureId": placedID})
+	sendWS(t, dmWS, "structure.remove", "remove-map-wall", map[string]any{"structureId": wall["id"]})
+	readType(t, pWS, "structure.removed")
+	if ids := structureIDs(player, roomPath+"/state"); len(ids) != 0 {
+		t.Fatalf("removed structures still in the room: %v", ids)
+	}
+	if ids := structureIDs(dm, mapPath); !ids[wall["id"].(string)] {
+		t.Fatalf("removing at the table deleted the source map wall: %v", ids)
+	}
+	if ids := structureIDs(dm, otherPath+"/state"); !ids[wall["id"].(string)] {
+		t.Fatalf("removing in one room removed the wall from another room: %v", ids)
+	}
+	sendWS(t, pWS, "token.move", "past-removed-wall", map[string]any{"tokenId": hero["id"], "to": map[string]float64{"x": 9, "y": 1}, "path": []map[string]float64{{"x": 3, "y": 1}, {"x": 9, "y": 1}}})
+	readType(t, pWS, "token.moved")
+}
+
+func TestOneShotRoomStartsMapsOnTheFly(t *testing.T) {
+	a := newTestApp(t)
+	dm, _ := login(t, a, "oneshot-dm@example.com")
+	player, _ := login(t, a, "oneshot-player@example.com")
+	room := post[map[string]any](t, dm, a.server.URL, "/api/rooms", map[string]any{"name": "One Shot"})
+	roomPath := "/api/rooms/" + room["id"].(string)
+	post[map[string]any](t, player, a.server.URL, "/api/rooms/join", map[string]any{"invite_code": room["invite_code"]})
+	dmWS := dialWS(t, a, dm, room["id"].(string))
+	defer dmWS.Close()
+	pWS := dialWS(t, a, player, room["id"].(string))
+	defer pWS.Close()
+	readType(t, dmWS, "state.snapshot")
+	readType(t, pWS, "state.snapshot")
+	// The DM sees every structure; players only see what their tokens can see.
+	activeMap := func() map[string]any {
+		t.Helper()
+		state := get[map[string]any](t, dm, a.server.URL, roomPath+"/state")
+		active, _ := state["activeMap"].(map[string]any)
+		if active == nil {
+			t.Fatalf("room should have an active map: %+v", state["activeMap"])
+		}
+		active["structure_count"] = len(state["structures"].([]any))
+		return active
+	}
+
+	sendWS(t, dmWS, "structure.create", "first-wall", map[string]any{"kind": "wall", "geometry": []map[string]float64{{"x": 1, "y": 5}, {"x": 5, "y": 5}}, "blocks_vision": true, "blocks_movement": true, "blocks_attacks": true})
+	readType(t, pWS, "map.activated")
+	readType(t, pWS, "structure.created")
+	started := activeMap()
+	if started["name"] != "One Shot map" || started["width_m"] != float64(30) || started["height_m"] != float64(30) || started["structure_count"] != 1 {
+		t.Fatalf("placing a structure without a map should start a 30 m map holding it: %+v", started)
+	}
+	library := get[[]map[string]any](t, dm, a.server.URL, "/api/maps")
+	if len(library) != 1 || library[0]["id"] != started["map_id"] {
+		t.Fatalf("the started map should be in the DM's library: %+v", library)
+	}
+
+	if status := statusOf(t, player, "POST", a.server.URL+roomPath+"/maps/new", map[string]any{}); status != 403 {
+		t.Fatalf("player started a room map: %d", status)
+	}
+	for _, bad := range []map[string]any{{"width_m": 0}, {"height_m": 5000}, {"width_m": 4, "height_m": 4, "grid_size_m": 5}} {
+		if status := statusOf(t, dm, "POST", a.server.URL+roomPath+"/maps/new", bad); status != 400 {
+			t.Fatalf("invalid blank map %v accepted: %d", bad, status)
+		}
+	}
+	cave := post[map[string]any](t, dm, a.server.URL, roomPath+"/maps/new", map[string]any{"name": "Cave", "width_m": 12, "height_m": 8})
+	readType(t, pWS, "map.activated")
+	if active := activeMap(); active["map_id"] != cave["id"] || active["name"] != "Cave" || active["width_m"] != float64(12) || active["grid_size_m"] != float64(1) || active["structure_count"] != 0 {
+		t.Fatalf("new blank map should be active and empty: %+v", active)
+	}
+
+	post[map[string]any](t, dm, a.server.URL, roomPath+"/maps", map[string]any{"map_id": started["map_id"], "is_active": true})
+	readType(t, pWS, "map.activated")
+	if active := activeMap(); active["map_id"] != started["map_id"] || active["structure_count"] != 1 {
+		t.Fatalf("switching back should restore the first map and its placed wall: %+v", active)
+	}
+}
+
+func dialWS(t *testing.T, a *testApp, c *http.Client, roomID string) *websocket.Conn {
+	t.Helper()
+	u := "ws" + strings.TrimPrefix(a.server.URL, "http") + "/api/rooms/" + roomID + "/ws"
+	hdr := http.Header{}
+	parsed, _ := url.Parse(a.server.URL)
+	for _, ck := range c.Jar.Cookies(parsed) {
+		hdr.Add("Cookie", ck.String())
+	}
+	conn, _, err := websocket.DefaultDialer.Dial(u, hdr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return conn
+}
+func sendWS(t *testing.T, c *websocket.Conn, typ, id string, body any) {
+	t.Helper()
+	if err := c.WriteJSON(map[string]any{"type": typ, "requestId": id, "body": body}); err != nil {
+		t.Fatal(err)
+	}
+}
+func readType(t *testing.T, c *websocket.Conn, typ string) map[string]any {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		_ = c.SetReadDeadline(time.Now().Add(time.Second))
+		var ev map[string]any
+		if err := c.ReadJSON(&ev); err == nil {
+			if ev["type"] == typ {
+				return ev
+			}
+		}
+	}
+	t.Fatalf("did not read event %s", typ)
+	return nil
+}
+func fmtBody(ev map[string]any) string { b, _ := json.Marshal(ev["body"]); return string(b) }
+
+func entityByID(t *testing.T, value any, id string) map[string]any {
+	t.Helper()
+	rows, ok := value.([]any)
+	if !ok {
+		t.Fatalf("expected entity rows, got %T", value)
+	}
+	for _, value := range rows {
+		row, ok := value.(map[string]any)
+		if ok && row["id"] == id {
+			return row
+		}
+	}
+	t.Fatalf("entity %s not found in %+v", id, rows)
+	return nil
+}

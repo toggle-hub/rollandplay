@@ -1,0 +1,457 @@
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { MapCanvas } from "./MapCanvas";
+import type { VisibleRoomState } from "../api/types";
+
+const state: VisibleRoomState = {
+  room: {
+    id: "r",
+    owner_id: "u",
+    name: "Room",
+    is_public: false,
+    invite_code: "ABC",
+    settings: {},
+    rule_book: { id: "b", name: "Rules" },
+  },
+  activeMap: {
+    id: "rm",
+    name: "Map",
+    width_m: 10,
+    height_m: 10,
+    grid_size_m: 1,
+  },
+  structures: [],
+  visibleTokens: [],
+  ownTokens: [],
+  chatHistory: [],
+  metersPerGrid: 1,
+};
+
+const wall = {
+  id: "wall",
+  kind: "wall",
+  geometry: [{ x: 2, y: 1 }, { x: 2, y: 3 }],
+  blocks_vision: true,
+  blocks_movement: true,
+  blocks_attacks: true,
+  cover_bonus: 0,
+  pass_rules: {},
+};
+
+function dragStructure(canvas: HTMLCanvasElement, from: [number, number], to: [number, number], shiftKey = false) {
+  fireEvent.pointerDown(canvas, { clientX: from[0] * 72, clientY: from[1] * 72, button: 0 });
+  fireEvent.pointerMove(canvas, { clientX: to[0] * 72, clientY: to[1] * 72, shiftKey });
+  fireEvent.pointerUp(canvas, { clientX: to[0] * 72, clientY: to[1] * 72 });
+}
+
+const tokenBase = { size_m: 1, rotation_deg: 0, vision_range_m: 10, vision_angle_deg: 360, is_hidden: false, attributes: {} };
+const attackBase = { ability: "strength", proficient: true, attack_bonus: 0, damage_bonus: 0, to_hit: 5, damage_modifier: 3 };
+const hero = {
+  ...tokenBase, id: "hero", owner_user_id: "player", name: "Hero", x_m: 1, y_m: 1,
+  attacks: [
+    { ...attackBase, id: "sword", name: "Sword", range_m: 1.5, damage: "1d8" },
+    { ...attackBase, id: "bow", name: "Bow", range_m: 20, ability: "dexterity", damage: "1d6" },
+  ],
+};
+const goblin = {
+  ...tokenBase, id: "goblin", owner_user_id: "dm", name: "Goblin", x_m: 2.5, y_m: 1,
+  attacks: [{ ...attackBase, id: "scimitar", name: "Scimitar", range_m: 1.5, damage: "1d6" }],
+};
+const troll = { ...tokenBase, id: "troll", owner_user_id: "dm", name: "Troll", x_m: 4, y_m: 1 };
+const attackWall = { ...wall, id: "attack-wall", geometry: [{ x: 3, y: 0 }, { x: 3, y: 3 }] };
+
+function clickAt(canvas: HTMLCanvasElement, x: number, y: number) {
+  fireEvent.pointerDown(canvas, { clientX: x * 72, clientY: y * 72, button: 0 });
+  fireEvent.pointerUp(canvas, { clientX: x * 72, clientY: y * 72, button: 0 });
+}
+
+function renderAttackMap(onAttack = vi.fn(), onMoveToken = vi.fn()) {
+  const { container } = render(
+    <MapCanvas
+      state={{ ...state, structures: [attackWall], visibleTokens: [hero, goblin, troll], ownTokens: [hero] }}
+      movableTokenIds={new Set(["hero"])}
+      onMoveToken={onMoveToken}
+      onAttack={onAttack}
+    />,
+  );
+  return container.querySelector("canvas")!;
+}
+
+describe("MapCanvas", () => {
+  afterEach(cleanup);
+  beforeEach(() => {
+    vi.stubGlobal("PointerEvent", MouseEvent);
+    globalThis.__canvasContext.fillText.mockClear();
+  });
+  it.each(["release", "pointercancel", "lostcapture", "Escape", "blur", "chorded release"])(
+    "shows the ruler only during a right drag and hides it on %s, including late server results",
+    (end) => {
+      const measure = vi.fn();
+      const { container, rerender } = render(<MapCanvas state={state} onMeasure={measure} />);
+      const canvas = container.querySelector("canvas")!;
+      const ctx = globalThis.__canvasContext;
+      fireEvent.pointerDown(canvas, { clientX: 0, clientY: 0, button: 2, buttons: 2 });
+      fireEvent.pointerMove(canvas, { clientX: 216, clientY: 0, buttons: 2 });
+      expect(measure).toHaveBeenCalledWith({ x: 0, y: 0 }, { x: 3, y: 0 });
+      rerender(<MapCanvas state={state} onMeasure={measure} rulerDistanceMeters={3} />);
+      expect(ctx.fillText).toHaveBeenCalledWith("3.00 m", expect.any(Number), expect.any(Number));
+      ctx.fillText.mockClear();
+      if (end === "release") fireEvent.pointerUp(canvas, { clientX: 216, clientY: 0, button: 2 });
+      else if (end === "pointercancel") fireEvent.pointerCancel(canvas);
+      else if (end === "lostcapture") fireEvent.lostPointerCapture(canvas);
+      else if (end === "Escape") fireEvent.keyDown(canvas, { key: "Escape" });
+      else if (end === "blur") fireEvent(window, new Event("blur"));
+      else fireEvent.mouseUp(canvas, { button: 2, buttons: 1 });
+      expect(ctx.fillText).not.toHaveBeenCalled();
+      measure.mockClear();
+      rerender(<MapCanvas state={state} onMeasure={measure} rulerDistanceMeters={4} />);
+      fireEvent.pointerMove(canvas, { clientX: 288, clientY: 0, buttons: 0 });
+      expect(ctx.fillText).not.toHaveBeenCalled();
+      expect(measure).not.toHaveBeenCalled();
+    },
+  );
+
+  it("does not measure when dragging empty space with the left button", () => {
+    const measure = vi.fn();
+    const { container } = render(<MapCanvas state={state} onMeasure={measure} rulerDistanceMeters={3} />);
+    const canvas = container.querySelector("canvas")!;
+    fireEvent.pointerDown(canvas, { clientX: 0, clientY: 0, button: 0 });
+    fireEvent.pointerMove(canvas, { clientX: 216, clientY: 0, buttons: 1 });
+    fireEvent.pointerUp(canvas, { clientX: 216, clientY: 0, button: 0 });
+    expect(measure).not.toHaveBeenCalled();
+    expect(globalThis.__canvasContext.fillText).not.toHaveBeenCalled();
+  });
+
+  it.each(["press", "release"])("distinguishes right drags from structure clicks when contextmenu fires on %s", (timing) => {
+    const measure = vi.fn();
+    const move = vi.fn();
+    const { container } = render(<MapCanvas state={{ ...state, structures: [wall] }} canMoveStructures onMeasure={measure} onMoveStructure={move} />);
+    const canvas = container.querySelector("canvas")!;
+    const contextMenu = () => fireEvent.contextMenu(canvas, { clientX: 144, clientY: 144, button: 2 });
+    fireEvent.pointerDown(canvas, { clientX: 144, clientY: 72, button: 2, buttons: 2 });
+    if (timing === "press") expect(contextMenu()).toBe(false);
+    expect(screen.queryByRole("menu")).not.toBeInTheDocument();
+    fireEvent.pointerMove(canvas, { clientX: 144, clientY: 144, buttons: 2 });
+    fireEvent.pointerUp(canvas, { clientX: 144, clientY: 144, button: 2 });
+    if (timing === "release") expect(contextMenu()).toBe(false);
+    expect(measure).toHaveBeenCalledWith({ x: 2, y: 1 }, { x: 2, y: 2 });
+    expect(move).not.toHaveBeenCalled();
+    expect(screen.queryByRole("menu")).not.toBeInTheDocument();
+
+    fireEvent.pointerDown(canvas, { clientX: 144, clientY: 144, button: 2, buttons: 2 });
+    if (timing === "press") contextMenu();
+    fireEvent.pointerUp(canvas, { clientX: 144, clientY: 144, button: 2 });
+    if (timing === "release") contextMenu();
+    expect(screen.getByRole("menuitemradio", { name: "Move mode" })).toBeInTheDocument();
+    expect(screen.getByRole("menuitemradio", { name: "Rotate mode" })).toBeInTheDocument();
+  });
+  it("moves tokens using map coordinates when the canvas is displayed at another size", () => {
+    const move = vi.fn();
+    const token = {
+      id: "token", name: "Hero", x_m: 1, y_m: 1, size_m: 1,
+      rotation_deg: 0, vision_range_m: 10, vision_angle_deg: 360,
+      is_hidden: false, attributes: {},
+    };
+    const { container } = render(
+      <MapCanvas state={{ ...state, visibleTokens: [token] }} onMoveToken={move} />,
+    );
+    const canvas = container.querySelector("canvas")!;
+    fireEvent.pointerDown(canvas, { clientX: 72, clientY: 72, button: 0 });
+    fireEvent.pointerMove(canvas, { clientX: 216, clientY: 144 });
+    fireEvent.pointerUp(canvas, { clientX: 216, clientY: 144 });
+    expect(move).toHaveBeenCalledWith(
+      "token", { x: 3, y: 2 }, [{ x: 1, y: 1 }, { x: 3, y: 2 }],
+    );
+  });
+  it("allows players to drag only their own character tokens", () => {
+    const move = vi.fn();
+    const ownToken = {
+      id: "hero", owner_user_id: "player", name: "Hero", x_m: 1, y_m: 1, size_m: 1,
+      rotation_deg: 0, vision_range_m: 10, vision_angle_deg: 360,
+      is_hidden: false, attributes: {},
+    };
+    const enemyToken = {
+      ...ownToken,
+      id: "enemy",
+      owner_user_id: "dm",
+      name: "Enemy",
+      x_m: 3,
+    };
+    const { container } = render(
+      <MapCanvas
+        state={{ ...state, visibleTokens: [ownToken, enemyToken], ownTokens: [ownToken] }}
+        movableTokenIds={new Set(["hero"])}
+        onMoveToken={move}
+      />,
+    );
+    const canvas = container.querySelector("canvas")!;
+
+    fireEvent.pointerDown(canvas, { clientX: 216, clientY: 72, button: 0 });
+    fireEvent.pointerUp(canvas, { clientX: 288, clientY: 72 });
+    expect(move).not.toHaveBeenCalled();
+
+    fireEvent.pointerDown(canvas, { clientX: 72, clientY: 72, button: 0 });
+    fireEvent.pointerMove(canvas, { clientX: 144, clientY: 72 });
+    fireEvent.pointerUp(canvas, { clientX: 144, clientY: 72 });
+    expect(move).toHaveBeenCalledWith(
+      "hero", { x: 2, y: 1 }, [{ x: 1, y: 1 }, { x: 2, y: 1 }],
+    );
+  });
+
+  it("moves structures only when tabletop structure editing is enabled", () => {
+    const moveStructure = vi.fn();
+    const { container, rerender } = render(
+      <MapCanvas state={{ ...state, structures: [wall] }} onMoveStructure={moveStructure} />,
+    );
+    const canvas = container.querySelector("canvas")!;
+
+    fireEvent.contextMenu(canvas, { clientX: 144, clientY: 144 });
+    expect(screen.queryByRole("menu")).not.toBeInTheDocument();
+    fireEvent.pointerDown(canvas, { clientX: 144, clientY: 144, button: 0 });
+    fireEvent.pointerMove(canvas, { clientX: 216, clientY: 216 });
+    fireEvent.pointerUp(canvas, { clientX: 216, clientY: 216 });
+    expect(moveStructure).not.toHaveBeenCalled();
+
+    rerender(<MapCanvas state={{ ...state, structures: [wall] }} canMoveStructures onMoveStructure={moveStructure} />);
+    fireEvent.pointerDown(canvas, { clientX: 144, clientY: 144, button: 0 });
+    fireEvent.pointerMove(canvas, { clientX: 216, clientY: 216 });
+    fireEvent.pointerUp(canvas, { clientX: 216, clientY: 216 });
+    expect(moveStructure).toHaveBeenCalledWith("wall", [{ x: 3, y: 2 }, { x: 3, y: 4 }]);
+  });
+
+  it("keeps Rotate mode through consecutive saves, other structures and empty clicks until Move is chosen", () => {
+    const moveStructure = vi.fn();
+    const secondWall = { ...wall, id: "second-wall", geometry: [{ x: 5, y: 1 }, { x: 5, y: 3 }] };
+    let roomState = { ...state, structures: [wall, secondWall] };
+    const { container, rerender } = render(
+      <MapCanvas state={roomState} canMoveStructures onMoveStructure={moveStructure} />,
+    );
+    const canvas = container.querySelector("canvas")!;
+    fireEvent.contextMenu(canvas, { clientX: 144, clientY: 72 });
+    fireEvent.click(screen.getByRole("menuitemradio", { name: "Rotate mode" }));
+
+    dragStructure(canvas, [2, 1], [3, 2]);
+    expect(moveStructure).toHaveBeenNthCalledWith(1, "wall", [{ x: 3, y: 2 }, { x: 1, y: 2 }]);
+    roomState = { ...roomState, structures: [{ ...wall, geometry: moveStructure.mock.calls[0][1] }, secondWall] };
+    rerender(<MapCanvas state={roomState} selectedStructureId="wall" canMoveStructures onMoveStructure={moveStructure} />);
+
+    dragStructure(canvas, [3, 2], [2, 3]);
+    expect(moveStructure).toHaveBeenNthCalledWith(2, "wall", [{ x: 2, y: 3 }, { x: 2, y: 1 }]);
+    roomState = { ...roomState, structures: [{ ...wall, geometry: moveStructure.mock.calls[1][1] }, secondWall] };
+    rerender(<MapCanvas state={roomState} selectedStructureId="wall" canMoveStructures onMoveStructure={moveStructure} />);
+
+    dragStructure(canvas, [8, 8], [8, 8]);
+    fireEvent.contextMenu(canvas, { clientX: 576, clientY: 576 });
+    dragStructure(canvas, [5, 1], [6, 2]);
+    expect(moveStructure).toHaveBeenNthCalledWith(3, "second-wall", [{ x: 6, y: 2 }, { x: 4, y: 2 }]);
+    roomState = { ...roomState, structures: [roomState.structures[0], { ...secondWall, geometry: moveStructure.mock.calls[2][1] }] };
+    rerender(<MapCanvas state={roomState} selectedStructureId="second-wall" canMoveStructures onMoveStructure={moveStructure} />);
+
+    fireEvent.contextMenu(canvas, { clientX: 432, clientY: 144 });
+    expect(screen.getByRole("menuitemradio", { name: "Rotate mode" })).toHaveAttribute("aria-checked", "true");
+    fireEvent.keyDown(screen.getByRole("menu"), { key: "Escape" });
+    dragStructure(canvas, [6, 2], [5, 3]);
+    expect(moveStructure).toHaveBeenNthCalledWith(4, "second-wall", [{ x: 5, y: 3 }, { x: 5, y: 1 }]);
+    roomState = { ...roomState, structures: [roomState.structures[0], { ...secondWall, geometry: moveStructure.mock.calls[3][1] }] };
+    rerender(<MapCanvas state={roomState} selectedStructureId="second-wall" canMoveStructures onMoveStructure={moveStructure} />);
+
+    fireEvent.contextMenu(canvas, { clientX: 360, clientY: 216 });
+    fireEvent.click(screen.getByRole("menuitemradio", { name: "Move mode" }));
+    dragStructure(canvas, [5, 3], [6, 4]);
+    expect(moveStructure).toHaveBeenNthCalledWith(5, "second-wall", [{ x: 6, y: 4 }, { x: 6, y: 2 }]);
+    roomState = { ...roomState, structures: [roomState.structures[0], { ...secondWall, geometry: moveStructure.mock.calls[4][1] }] };
+    rerender(<MapCanvas state={roomState} canMoveStructures onMoveStructure={moveStructure} />);
+    dragStructure(canvas, [6, 4], [7, 4]);
+    expect(moveStructure).toHaveBeenNthCalledWith(6, "second-wall", [{ x: 7, y: 4 }, { x: 7, y: 2 }]);
+    expect(moveStructure).toHaveBeenCalledTimes(6);
+  });
+
+  it.each(["Escape", "pointercancel"])("cancels rotation with %s without clearing the chosen mode or committing on pointerup", (cancel) => {
+    const moveStructure = vi.fn();
+    const { container } = render(
+      <MapCanvas state={{ ...state, structures: [wall] }} canMoveStructures onMoveStructure={moveStructure} />,
+    );
+    const canvas = container.querySelector("canvas")!;
+    fireEvent.contextMenu(canvas, { clientX: 144, clientY: 72 });
+    fireEvent.click(screen.getByRole("menuitemradio", { name: "Rotate mode" }));
+    fireEvent.pointerDown(canvas, { clientX: 144, clientY: 72, button: 0 });
+    fireEvent.pointerMove(canvas, { clientX: 216, clientY: 144 });
+    if (cancel === "Escape") fireEvent.keyDown(canvas, { key: "Escape" });
+    else fireEvent.pointerCancel(canvas);
+    fireEvent.pointerUp(canvas, { clientX: 216, clientY: 144 });
+    expect(moveStructure).not.toHaveBeenCalled();
+
+    dragStructure(canvas, [2, 1], [3, 2]);
+    expect(moveStructure).toHaveBeenCalledExactlyOnceWith("wall", [{ x: 3, y: 2 }, { x: 1, y: 2 }]);
+  });
+
+  it("snaps rotation to 15-degree increments with Shift", () => {
+    const moveStructure = vi.fn();
+    const { container } = render(
+      <MapCanvas state={{ ...state, structures: [wall] }} canMoveStructures onMoveStructure={moveStructure} />,
+    );
+    const canvas = container.querySelector("canvas")!;
+    fireEvent.contextMenu(canvas, { clientX: 144, clientY: 72 });
+    fireEvent.click(screen.getByRole("menuitemradio", { name: "Rotate mode" }));
+    const angle = 20 * Math.PI / 180;
+    dragStructure(canvas, [2, 1], [2 + Math.sin(angle), 2 - Math.cos(angle)], true);
+    expect(moveStructure).toHaveBeenCalledExactlyOnceWith("wall", [{ x: 2.26, y: 1.03 }, { x: 1.74, y: 2.97 }]);
+  });
+
+  it("waits for a direction when a rotate drag starts at the center", () => {
+    const moveStructure = vi.fn();
+    const { container } = render(
+      <MapCanvas state={{ ...state, structures: [wall] }} canMoveStructures onMoveStructure={moveStructure} />,
+    );
+    const canvas = container.querySelector("canvas")!;
+    fireEvent.contextMenu(canvas, { clientX: 144, clientY: 144 });
+    fireEvent.click(screen.getByRole("menuitemradio", { name: "Rotate mode" }));
+    dragStructure(canvas, [2, 2], [2.05, 2.05]);
+    expect(moveStructure).not.toHaveBeenCalled();
+    dragStructure(canvas, [2, 2], [2, 1]);
+    expect(moveStructure).not.toHaveBeenCalled();
+
+    fireEvent.pointerDown(canvas, { clientX: 144, clientY: 144, button: 0 });
+    fireEvent.pointerMove(canvas, { clientX: 144, clientY: 72 });
+    fireEvent.pointerMove(canvas, { clientX: 216, clientY: 144 });
+    fireEvent.pointerUp(canvas, { clientX: 216, clientY: 144 });
+    expect(moveStructure).toHaveBeenCalledExactlyOnceWith("wall", [{ x: 3, y: 2 }, { x: 1, y: 2 }]);
+  });
+
+  it("denies structure rotation when editing permission is revoked, including a pending drag", () => {
+    const moveStructure = vi.fn();
+    const roomState = { ...state, structures: [wall] };
+    const { container, rerender } = render(
+      <MapCanvas state={roomState} canMoveStructures onMoveStructure={moveStructure} />,
+    );
+    const canvas = container.querySelector("canvas")!;
+    fireEvent.contextMenu(canvas, { clientX: 144, clientY: 72 });
+    fireEvent.click(screen.getByRole("menuitemradio", { name: "Rotate mode" }));
+    fireEvent.pointerDown(canvas, { clientX: 144, clientY: 72, button: 0 });
+    fireEvent.pointerMove(canvas, { clientX: 216, clientY: 144 });
+    rerender(<MapCanvas state={roomState} canMoveStructures={false} onMoveStructure={moveStructure} />);
+    fireEvent.pointerUp(canvas, { clientX: 216, clientY: 144 });
+    dragStructure(canvas, [2, 1], [3, 2]);
+    fireEvent.contextMenu(canvas, { clientX: 144, clientY: 72 });
+    expect(moveStructure).not.toHaveBeenCalled();
+    expect(screen.queryByRole("menu")).not.toBeInTheDocument();
+  });
+
+  it("opens the attack menu on a click without drag and attacks a target in range", () => {
+    const attack = vi.fn();
+    const move = vi.fn();
+    const canvas = renderAttackMap(attack, move);
+
+    clickAt(canvas, 1, 1);
+    expect(move).not.toHaveBeenCalled();
+    const menu = screen.getByRole("menu", { name: "Hero attacks" });
+    expect(menu).toHaveTextContent("+5 to hit · 1d8+3 · 1.5 m");
+    fireEvent.click(screen.getByRole("menuitem", { name: /Sword/ }));
+    expect(screen.queryByRole("menu")).not.toBeInTheDocument();
+    expect(screen.getByRole("status")).toHaveTextContent("Sword · 1.5 m — click a highlighted target");
+
+    clickAt(canvas, 2.5, 1);
+    expect(attack).toHaveBeenCalledWith("hero", "goblin", "sword");
+    expect(move).not.toHaveBeenCalled();
+    expect(screen.queryByRole("status")).not.toBeInTheDocument();
+  });
+
+  it("keeps targeting and explains why a target behind an attack-blocking wall cannot be attacked", () => {
+    const attack = vi.fn();
+    const canvas = renderAttackMap(attack);
+
+    clickAt(canvas, 1, 1);
+    fireEvent.click(screen.getByRole("menuitem", { name: /Bow/ }));
+    clickAt(canvas, 4, 1);
+    expect(attack).not.toHaveBeenCalled();
+    expect(screen.getByRole("status")).toHaveTextContent("Blocked by a structure");
+
+    clickAt(canvas, 2.5, 1);
+    expect(attack).toHaveBeenCalledWith("hero", "goblin", "bow");
+  });
+
+  it("reports targets beyond the attack's range without attacking", () => {
+    const attack = vi.fn();
+    const canvas = renderAttackMap(attack);
+
+    clickAt(canvas, 1, 1);
+    fireEvent.click(screen.getByRole("menuitem", { name: /Sword/ }));
+    clickAt(canvas, 4, 1);
+    expect(attack).not.toHaveBeenCalled();
+    expect(screen.getByRole("status")).toHaveTextContent("Out of range");
+  });
+
+  it("opens no attack menu for tokens the player does not control", () => {
+    const canvas = renderAttackMap();
+
+    clickAt(canvas, 2.5, 1);
+    expect(screen.queryByRole("menu")).not.toBeInTheDocument();
+  });
+
+  it("cancels targeting with Escape so the next click on a target does not attack", () => {
+    const attack = vi.fn();
+    const canvas = renderAttackMap(attack);
+
+    clickAt(canvas, 1, 1);
+    fireEvent.click(screen.getByRole("menuitem", { name: /Sword/ }));
+    fireEvent.keyDown(canvas, { key: "Escape" });
+    expect(screen.queryByRole("status")).not.toBeInTheDocument();
+
+    clickAt(canvas, 2.5, 1);
+    expect(attack).not.toHaveBeenCalled();
+  });
+
+  it("offers attack editing only for tokens whose attacks the viewer can edit", () => {
+    const edit = vi.fn();
+    const { container, rerender } = render(
+      <MapCanvas state={{ ...state, visibleTokens: [hero] }} onAttack={vi.fn()} onEditAttacks={edit} />,
+    );
+    const canvas = container.querySelector("canvas")!;
+    clickAt(canvas, 1, 1);
+    expect(screen.queryByRole("button", { name: "Edit attacks" })).not.toBeInTheDocument();
+
+    fireEvent.keyDown(canvas, { key: "Escape" });
+    rerender(<MapCanvas state={{ ...state, visibleTokens: [{ ...hero, attacks_editable: true }] }} onAttack={vi.fn()} onEditAttacks={edit} />);
+    clickAt(canvas, 1, 1);
+    fireEvent.click(screen.getByRole("button", { name: "Edit attacks" }));
+    expect(edit).toHaveBeenCalledWith("hero");
+    expect(screen.queryByRole("menu")).not.toBeInTheDocument();
+  });
+
+  it("places snapped structure templates instead of selecting or moving what is under the pointer", () => {
+    const place = vi.fn();
+    const select = vi.fn();
+    const moveToken = vi.fn();
+    const attack = vi.fn();
+    const { container } = render(
+      <MapCanvas
+        state={{ ...state, structures: [wall], visibleTokens: [hero, goblin], ownTokens: [] }}
+        canMoveStructures
+        onSelect={select}
+        onMoveToken={moveToken}
+        onAttack={attack}
+        placingStructure={{ kind: "wall" }}
+        onPlaceStructure={place}
+      />,
+    );
+    const canvas = container.querySelector("canvas")!;
+    expect(screen.getByText("Placing Wall — click the map to place it")).toBeInTheDocument();
+
+    clickAt(canvas, 2.4, 1.1);
+    expect(place).toHaveBeenLastCalledWith([{ x: 0, y: 1 }, { x: 4, y: 1 }]);
+    clickAt(canvas, 2, 2);
+    expect(place).toHaveBeenLastCalledWith([{ x: 0, y: 2 }, { x: 4, y: 2 }]);
+    expect(place).toHaveBeenCalledTimes(2);
+    expect(select).not.toHaveBeenCalled();
+    expect(moveToken).not.toHaveBeenCalled();
+    expect(attack).not.toHaveBeenCalled();
+    expect(screen.queryByRole("menu")).not.toBeInTheDocument();
+  });
+
+  it("stops placing structures with Escape", () => {
+    const cancel = vi.fn();
+    const { container } = render(<MapCanvas state={state} placingStructure={{ kind: "door" }} onPlaceStructure={vi.fn()} onCancelPlacement={cancel} />);
+    fireEvent.keyDown(container.querySelector("canvas")!, { key: "Escape" });
+    expect(cancel).toHaveBeenCalledTimes(1);
+  });
+});

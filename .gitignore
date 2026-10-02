@@ -1,0 +1,21 @@
+# Real environment files contain deploy secrets.
+.env
+.env.*
+backend/.env
+backend/.env.*
+frontend/.env
+frontend/.env.*
+
+# Keep templates tracked.
+!.env.example
+!backend/.env.example
+!backend/.env.production.example
+!frontend/.env.example
+!frontend/.env.production.example
+
+# Build/runtime output.
+backend/var/
+frontend/dist/
+frontend/node_modules/
+frontend/*.tsbuildinfo
+.tools/
