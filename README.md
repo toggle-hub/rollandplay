@@ -169,12 +169,14 @@ Server layout, created by `deploy/provision.sh` (idempotent, run as root on Ubun
 | `/var/lib/rollandplay/assets` | Uploaded assets. |
 | `deploy` user | CI login. The key is installed with `restrict`; sudo is limited to `systemctl restart rollandplay-backend`. |
 
-Provisioning a server:
+Provisioning or updating a server: run this from the repository root on your machine. It doesn't need git on the server; your local `deploy/` folder is streamed over SSH and replaces the previous copy every time:
 
 ```bash
-scp -P 22022 -r deploy root@SERVER:/root/rollandplay-deploy
-ssh -p 22022 root@SERVER "DEPLOY_PUBKEY='ssh-ed25519 AAAA… github-actions' PUBLIC_BASE_URL='https://SERVER' bash /root/rollandplay-deploy/provision.sh"
+tar czf - deploy | ssh -p 22022 root@SERVER "rm -rf /root/rollandplay-deploy && mkdir /root/rollandplay-deploy && tar xzf - -C /root/rollandplay-deploy && \
+  DEPLOY_PUBKEY='$(cat ~/.ssh/rollandplay/deploy_key.pub)' PUBLIC_BASE_URL='https://SERVER' bash /root/rollandplay-deploy/deploy/provision.sh"
 ```
+
+Re-run it after changing anything under `deploy/` except `release.sh`, which CI sends with every deploy. `DEPLOY_PUBKEY` is required on each run because the script rewrites the `deploy` user's `authorized_keys`.
 
 Repository secrets (**Settings → Secrets and variables → Actions**):
 
