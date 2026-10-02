@@ -95,6 +95,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("PATCH /api/rooms/{roomID}/maps/{roomMapID}", s.handleRoomMapPatch)
 	mux.HandleFunc("GET /api/rooms/{roomID}/state", s.handleRoomState)
 	mux.HandleFunc("POST /api/rooms/{roomID}/tokens", s.handleTokenCreate)
+	mux.HandleFunc("GET /api/rooms/{roomID}/monsters", s.handleRoomMonsters)
 	mux.HandleFunc("PATCH /api/rooms/{roomID}/tokens/{tokenID}/attacks", s.handleTokenAttacksPatch)
 	mux.HandleFunc("GET /api/rooms/{roomID}/ws", s.Hub.Handle)
 	return telemetry.HTTPHandler(requestLogger(cors(mux), s.Logger.Named("http")))
@@ -610,12 +611,23 @@ func (s *Server) handleFriendDelete(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(204)
 }
 
+const ruleBookJSON = `jsonb_build_object('id',id::text,'owner_id',owner_id::text,'name',name,'is_public',is_public,'attributes',attributes,'creation_rules',creation_rules,'monsters',monsters)`
+
+// requestMonsters validates req["monsters"] (a missing value is an empty list) and returns it as JSON.
+func requestMonsters(req map[string]any) ([]byte, error) {
+	raw, _ := json.Marshal(req["monsters"])
+	monsters, err := game.ParseMonsters(raw)
+	if err != nil {
+		return nil, err
+	}
+	return json.Marshal(monsters)
+}
 func (s *Server) handleRuleBooksList(w http.ResponseWriter, r *http.Request) {
 	u, _, ok := s.requireUser(w, r)
 	if !ok {
 		return
 	}
-	rows, err := s.queryJSON(r.Context(), `select jsonb_build_object('id',id::text,'owner_id',owner_id::text,'name',name,'is_public',is_public,'attributes',attributes,'creation_rules',creation_rules) from rule_books where `+ruleBookReadable("$1")+` order by owner_id is null desc, created_at desc`, u.ID)
+	rows, err := s.queryJSON(r.Context(), `select `+ruleBookJSON+` from rule_books where `+ruleBookReadable("$1")+` order by owner_id is null desc, created_at desc`, u.ID)
 	respondRows(w, rows, err)
 }
 func (s *Server) handleRuleBookCreate(w http.ResponseWriter, r *http.Request) {
@@ -643,7 +655,12 @@ func (s *Server) handleRuleBookCreate(w http.ResponseWriter, r *http.Request) {
 		WriteError(w, 400, "invalid_rules", err.Error())
 		return
 	}
-	row, err := s.oneJSON(r.Context(), `insert into rule_books(id,owner_id,name,is_public,attributes,creation_rules) values($1,$2,$3,$4,$5,$6) returning jsonb_build_object('id',id::text,'owner_id',owner_id::text,'name',name,'is_public',is_public,'attributes',attributes,'creation_rules',creation_rules)`, uuid.New().String(), u.ID, str(req, "name", "Untitled Rule Book"), boolv(req, "is_public", false), jsonRaw(attributes), rulesJSON)
+	monsters, err := requestMonsters(req)
+	if err != nil {
+		WriteError(w, 400, "invalid_monsters", err.Error())
+		return
+	}
+	row, err := s.oneJSON(r.Context(), `insert into rule_books(id,owner_id,name,is_public,attributes,creation_rules,monsters) values($1,$2,$3,$4,$5,$6,$7) returning `+ruleBookJSON, uuid.New().String(), u.ID, str(req, "name", "Untitled Rule Book"), boolv(req, "is_public", false), jsonRaw(attributes), rulesJSON, monsters)
 	respondRawStatus(w, row, err, 201)
 }
 func (s *Server) handleRuleBookGet(w http.ResponseWriter, r *http.Request) {
@@ -652,7 +669,7 @@ func (s *Server) handleRuleBookGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id := r.PathValue("ruleBookID")
-	rows, err := s.queryJSON(r.Context(), `select jsonb_build_object('id',id::text,'owner_id',owner_id::text,'name',name,'is_public',is_public,'attributes',attributes,'creation_rules',creation_rules) from rule_books where id=$1 and `+ruleBookReadable("$2"), id, u.ID)
+	rows, err := s.queryJSON(r.Context(), `select `+ruleBookJSON+` from rule_books where id=$1 and `+ruleBookReadable("$2"), id, u.ID)
 	respondOne(w, rows, err)
 }
 func (s *Server) handleRuleBookPatch(w http.ResponseWriter, r *http.Request) {
@@ -700,8 +717,16 @@ func (s *Server) handleRuleBookPatch(w http.ResponseWriter, r *http.Request) {
 		WriteError(w, 400, "invalid_rules", err.Error())
 		return
 	}
+	// nil keeps the stored monsters.
+	var monsters []byte
+	if _, exists := req["monsters"]; exists {
+		if monsters, err = requestMonsters(req); err != nil {
+			WriteError(w, 400, "invalid_monsters", err.Error())
+			return
+		}
+	}
 	var row json.RawMessage
-	err = tx.QueryRow(r.Context(), `update rule_books set name=coalesce($2,name),is_public=coalesce($3,is_public),attributes=$4,creation_rules=$5,updated_at=now() where id=$1 returning jsonb_build_object('id',id::text,'owner_id',owner_id::text,'name',name,'is_public',is_public,'attributes',attributes,'creation_rules',creation_rules)`, id, nullableString(req, "name"), nullableBool(req, "is_public"), jsonRaw(attributes), rulesJSON).Scan(&row)
+	err = tx.QueryRow(r.Context(), `update rule_books set name=coalesce($2,name),is_public=coalesce($3,is_public),attributes=$4,creation_rules=$5,monsters=coalesce($6,monsters),updated_at=now() where id=$1 returning `+ruleBookJSON, id, nullableString(req, "name"), nullableBool(req, "is_public"), jsonRaw(attributes), rulesJSON, monsters).Scan(&row)
 	if err == nil {
 		err = tx.Commit(r.Context())
 	}
@@ -1081,6 +1106,15 @@ func (s *Server) handleTokenCreate(w http.ResponseWriter, r *http.Request) {
 	_ = ReadJSON(r, &req)
 	isDM := s.isDM(r.Context(), u.ID, roomID)
 	sheet := str(req, "sheet_id", "")
+	monsterID := str(req, "monster_id", "")
+	if monsterID != "" && !isDM {
+		WriteError(w, 403, "forbidden", "only game masters can place monsters")
+		return
+	}
+	if monsterID != "" && sheet != "" {
+		WriteError(w, 400, "invalid_token", "a token uses either a character sheet or a monster, not both")
+		return
+	}
 	if !isDM {
 		if sheet == "" {
 			WriteError(w, 400, "sheet_required", "players must use one of their character sheets")
@@ -1098,9 +1132,79 @@ func (s *Server) handleTokenCreate(w http.ResponseWriter, r *http.Request) {
 		WriteError(w, 400, "no_active_map", "room has no active map")
 		return
 	}
-	row, err := s.oneJSON(r.Context(), `insert into room_tokens(id,room_map_id,sheet_id,owner_user_id,name,x_m,y_m,rotation_deg,size_m,vision_range_m,vision_angle_deg,is_hidden,attributes) values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) returning jsonb_build_object('id',id::text,'room_map_id',room_map_id::text,'sheet_id',sheet_id::text,'owner_user_id',owner_user_id::text,'name',name,'x_m',x_m,'y_m',y_m,'rotation_deg',rotation_deg,'size_m',size_m,'vision_range_m',vision_range_m,'vision_angle_deg',vision_angle_deg,'is_hidden',is_hidden,'attributes',attributes)`, uuid.New().String(), roomMapID, nullableLiteral(sheet), u.ID, str(req, "name", "Token"), floatv(req, "x_m", 1), floatv(req, "y_m", 1), floatv(req, "rotation_deg", 0), floatv(req, "size_m", 1), floatv(req, "vision_range_m", 12), floatv(req, "vision_angle_deg", 90), boolv(req, "is_hidden", false), jsonRaw(req["attributes"]))
+	name := strings.TrimSpace(str(req, "name", ""))
+	sizeM := floatv(req, "size_m", 1)
+	attributes := jsonRaw(req["attributes"])
+	if monsterID != "" {
+		// The token gets its own copy of the stat block: HP and attacks change per token.
+		monster, err := s.roomMonster(r.Context(), roomID, monsterID)
+		if err != nil {
+			WriteError(w, 400, "unknown_monster", "this room's rule book has no such monster")
+			return
+		}
+		attributes, _ = json.Marshal(monster.Stats)
+		if _, set := req["size_m"]; !set {
+			sizeM = monster.SizeM
+		}
+		if name == "" {
+			rows, err := s.Pool.Query(r.Context(), `select name from room_tokens where room_map_id=$1`, roomMapID)
+			if err != nil {
+				respondRaw(w, nil, err)
+				return
+			}
+			taken, err := pgx.CollectRows(rows, pgx.RowTo[string])
+			if err != nil {
+				respondRaw(w, nil, err)
+				return
+			}
+			name = game.NextTokenName(monster.Name, taken)
+		}
+	}
+	if name == "" {
+		name = "Token"
+	}
+	row, err := s.oneJSON(r.Context(), `insert into room_tokens(id,room_map_id,sheet_id,owner_user_id,name,x_m,y_m,rotation_deg,size_m,vision_range_m,vision_angle_deg,is_hidden,attributes) values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) returning jsonb_build_object('id',id::text,'room_map_id',room_map_id::text,'sheet_id',sheet_id::text,'owner_user_id',owner_user_id::text,'name',name,'x_m',x_m,'y_m',y_m,'rotation_deg',rotation_deg,'size_m',size_m,'vision_range_m',vision_range_m,'vision_angle_deg',vision_angle_deg,'is_hidden',is_hidden,'attributes',attributes)`, uuid.New().String(), roomMapID, nullableLiteral(sheet), u.ID, name, floatv(req, "x_m", 1), floatv(req, "y_m", 1), floatv(req, "rotation_deg", 0), sizeM, floatv(req, "vision_range_m", 12), floatv(req, "vision_angle_deg", 90), boolv(req, "is_hidden", false), attributes)
 	respondRawStatus(w, row, err, 201)
 	s.bumpRoom(context.Background(), roomID)
+}
+
+func (s *Server) roomMonsters(ctx context.Context, roomID string) ([]game.Monster, error) {
+	var raw []byte
+	if err := s.Pool.QueryRow(ctx, `select rb.monsters from rooms r join rule_books rb on rb.id=r.rule_book_id where r.id=$1`, roomID).Scan(&raw); err != nil {
+		return nil, err
+	}
+	return game.ParseMonsters(raw)
+}
+
+func (s *Server) roomMonster(ctx context.Context, roomID, monsterID string) (game.Monster, error) {
+	monsters, err := s.roomMonsters(ctx, roomID)
+	if err != nil {
+		return game.Monster{}, err
+	}
+	monster, ok := game.FindMonster(monsters, monsterID)
+	if !ok {
+		return game.Monster{}, pgx.ErrNoRows
+	}
+	return monster, nil
+}
+
+// handleRoomMonsters lists the room rule book's monsters for its game masters.
+func (s *Server) handleRoomMonsters(w http.ResponseWriter, r *http.Request) {
+	u, _, ok := s.requireUser(w, r)
+	if !ok {
+		return
+	}
+	roomID := r.PathValue("roomID")
+	if !s.isDM(r.Context(), u.ID, roomID) {
+		WriteError(w, 403, "forbidden", "only game masters can place monsters")
+		return
+	}
+	monsters, err := s.roomMonsters(r.Context(), roomID)
+	if err != nil {
+		respondRaw(w, nil, err)
+		return
+	}
+	WriteJSON(w, 200, monsters)
 }
 
 func (s *Server) handleTokenAttacksPatch(w http.ResponseWriter, r *http.Request) {
@@ -1206,7 +1310,11 @@ func (s *Server) visibleState(ctx context.Context, roomID, userID string) (map[s
 			}
 			t.AttacksEditable = t.CanEditAttacks(userID, isDM)
 		}
-		// Raw NPC attacks never reach other viewers through attributes.
+		// Monster stat blocks and other token attributes reach only game masters and the owner;
+		// raw attacks never travel in attributes (resolved attacks are sent separately above).
+		if !isDM && t.OwnerUserID != userID {
+			t.Attributes = map[string]any{}
+		}
 		delete(t.Attributes, "attacks")
 		if t.OwnerUserID == userID {
 			own = append(own, t)

@@ -2,7 +2,7 @@ import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { ArrowLeft, Circle, Eye, EyeSlash, MapTrifold, Trash, UsersThree } from "@phosphor-icons/react";
 import { apiFetch, connectRoomSocket, patchJSON, postJSON, requestId } from "../api/client";
-import type { ChatMessage, GameMap, RoomMember, ServerEnvelope, Sheet, VisibleRoomState } from "../api/types";
+import type { ChatMessage, GameMap, Monster, RoomMember, ServerEnvelope, Sheet, VisibleRoomState } from "../api/types";
 import { useSession } from "../auth/SessionContext";
 import { MapCanvas, type MapSelection } from "../components/MapCanvas";
 import { ChatPanel } from "../components/ChatPanel";
@@ -29,6 +29,8 @@ export function RoomPage() {
   const [sheet, setSheet] = useState("");
   const [mapChoice, setMapChoice] = useState("");
   const [tokenName, setTokenName] = useState("Encounter token");
+  const [monsters, setMonsters] = useState<Monster[]>([]);
+  const [monsterChoice, setMonsterChoice] = useState("");
   const [mapSelection, setMapSelection] = useState<MapSelection | null>(null);
   const [toolsOpen, setToolsOpen] = useState(false);
   const [attackEditorTokenId, setAttackEditorTokenId] = useState<string | null>(null);
@@ -92,6 +94,11 @@ export function RoomPage() {
   }, [currentMapId]);
 
   useEffect(() => setConfirmRemove(false), [mapSelection]);
+
+  useEffect(() => {
+    if (!isDM || !roomId) return;
+    apiFetch<Monster[]>(`/api/rooms/${roomId}/monsters`).then((items) => setMonsters(items ?? [])).catch(() => setMonsters([]));
+  }, [isDM, roomId]);
 
   useEffect(() => {
     if (!roomId) return;
@@ -174,7 +181,10 @@ export function RoomPage() {
   function addToken(e: FormEvent) {
     e.preventDefault();
     if (isDM) {
-      const body = { name: tokenName.trim() || sheets.find((item) => item.id === sheet)?.name || "Token", sheet_id: sheet || undefined, x_m: 2, y_m: 2 };
+      // Monster tokens are named and numbered by the server unless the DM typed a name.
+      const body = monsterChoice
+        ? { monster_id: monsterChoice, name: tokenName.trim() || undefined, x_m: 2, y_m: 2 }
+        : { name: tokenName.trim() || sheets.find((item) => item.id === sheet)?.name || "Token", sheet_id: sheet || undefined, x_m: 2, y_m: 2 };
       void update(() => postJSON(`/api/rooms/${roomId}/tokens`, body));
       return;
     }
@@ -255,18 +265,31 @@ export function RoomPage() {
         <form className="card space-y-3 p-5!" onSubmit={addToken}>
           <label className="field-label block" htmlFor={isDM ? "room-token-name" : "room-token-sheet"}>{isDM ? "Add a table token" : "Bring a character to the map"}</label>
           {isDM ? <>
-            <input id="room-token-name" className="w-full" value={tokenName} onChange={(e) => setTokenName(e.target.value)} placeholder="Token name" />
+            <input id="room-token-name" className="w-full" value={tokenName} onChange={(e) => setTokenName(e.target.value)} placeholder={monsterChoice ? `${monsters.find((item) => item.id === monsterChoice)?.name ?? "Monster"} (numbered automatically)` : "Token name"} />
+            {monsters.length > 0 && <>
+              <label className="field-label block" htmlFor="room-token-monster">Monster <span className="text-muted font-normal">(optional)</span></label>
+              <select id="room-token-monster" className="w-full min-w-0" value={monsterChoice} onChange={(e) => {
+                setMonsterChoice(e.target.value);
+                if (e.target.value) {
+                  setSheet("");
+                  setTokenName("");
+                }
+              }}>
+                <option value="">No monster</option>
+                {monsters.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}
+              </select>
+            </>}
             <label className="field-label block" htmlFor="room-token-sheet">Character sheet <span className="text-muted font-normal">(optional)</span></label>
           </> : null}
           <div className="flex flex-col gap-3">
-            <select id="room-token-sheet" className="w-full min-w-0" value={sheet} onChange={(e) => setSheet(e.target.value)}>
+            <select id="room-token-sheet" className="w-full min-w-0" value={sheet} disabled={isDM && !!monsterChoice} onChange={(e) => setSheet(e.target.value)}>
               <option value="">{isDM ? "No character sheet" : "Choose a character sheet"}</option>
               {roomSheets.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}
             </select>
             <button className="btn shrink-0" disabled={(!isDM && !sheet) || busy}>{busy ? "Adding…" : "Add token"}</button>
           </div>
           {!isDM && roomSheets.length === 0 && <p className="text-muted text-sm">No {state.room.rule_book.name} characters yet. <Link className="text-[var(--accent)] underline underline-offset-4" to={`/sheets?room=${encodeURIComponent(state.room.id)}`}>Create a character</Link> to place a token.</p>}
-          {isDM && <p className="text-muted text-sm">DM tokens do not require a character sheet.</p>}
+          {isDM && <p className="text-muted text-sm">DM tokens do not require a character sheet. A monster token gets its own copy of the rule book's stat block and attacks; players never see its stats.</p>}
         </form>
 
         {isDM && <div className="card space-y-3 p-5!">

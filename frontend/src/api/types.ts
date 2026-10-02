@@ -81,6 +81,15 @@ export type RuleBook = {
   is_public: boolean;
   attributes: Record<string, unknown>;
   creation_rules: CreationRules;
+  monsters: Monster[];
+};
+/** A rule book stat block. Placing it in a room copies `stats` (including `attacks`) into the token. */
+export type Monster = {
+  id: string;
+  name: string;
+  description: string;
+  size_m: number;
+  stats: Record<string, unknown>;
 };
 export type Sheet = {
   id: string;

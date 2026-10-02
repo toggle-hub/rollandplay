@@ -48,11 +48,11 @@ func newTestApp(t *testing.T) *testApp {
 	if err := db.ApplyMigrations(ctx, pool, migrations.Files); err != nil {
 		t.Fatal(err)
 	}
-	_, err = pool.Exec(ctx, `truncate room_check_targets, room_checks, chat_message_recipients, chat_messages, room_tokens, npcs, room_maps, map_structures, map_editors, maps, assets, room_members, rooms, sheets, rule_book_editors, rule_books, friends, sessions, auth_magic_links, users cascade`)
+	_, err = pool.Exec(ctx, `truncate room_check_targets, room_checks, chat_message_recipients, chat_messages, room_tokens, room_maps, map_structures, map_editors, maps, assets, room_members, rooms, sheets, rule_book_editors, rule_books, friends, sessions, auth_magic_links, users cascade`)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, name := range []string{"004_default_dnd_rule_book.sql", "005_character_creation_rules.sql"} {
+	for _, name := range []string{"004_default_dnd_rule_book.sql", "005_character_creation_rules.sql", "009_rule_book_monsters.sql"} {
 		seed, err := migrations.Files.ReadFile(name)
 		if err != nil {
 			t.Fatal(err)
@@ -1015,6 +1015,86 @@ func TestRoomCheckPrompts(t *testing.T) {
 	sendWS(t, dmWS, "check.close", "close-will", map[string]any{"checkId": willID})
 	readReply(bWS, "check.changed", "close-will")
 	expectError(bWS, "bob-late", "check_closed", map[string]any{"checkId": willID}, "check.roll")
+}
+
+func TestRuleBookMonsters(t *testing.T) {
+	a := newTestApp(t)
+	const dndID = "00000000-0000-4000-8000-000000000005"
+	dm, _ := login(t, a, "monsters-dm@example.com")
+	player, _ := login(t, a, "monsters-player@example.com")
+
+	builtIn := get[map[string]any](t, dm, a.server.URL, "/api/rule-books/"+dndID)
+	if monsters := builtIn["monsters"].([]any); len(monsters) != 12 {
+		t.Fatalf("built-in book should ship 12 SRD monsters, got %d", len(monsters))
+	}
+
+	goblin := map[string]any{"id": "goblin", "name": "Goblin", "size_m": 1.5, "stats": map[string]any{"hit_points": 7}}
+	custom := post[map[string]any](t, dm, a.server.URL, "/api/rule-books", map[string]any{"name": "Homebrew", "monsters": []any{goblin}})
+	if monsters := custom["monsters"].([]any); len(monsters) != 1 || monsters[0].(map[string]any)["name"] != "Goblin" {
+		t.Fatalf("custom monsters did not round trip: %+v", custom["monsters"])
+	}
+	if status := statusOf(t, dm, "POST", a.server.URL+"/api/rule-books", map[string]any{"name": "Bad", "monsters": []any{map[string]any{"id": "Bad ID", "name": "x", "size_m": 1}}}); status != 400 {
+		t.Fatalf("invalid monster id: status %d", status)
+	}
+	renamed := patch[map[string]any](t, dm, a.server.URL, "/api/rule-books/"+custom["id"].(string), map[string]any{"name": "Homebrew 2"})
+	if len(renamed["monsters"].([]any)) != 1 {
+		t.Fatal("patching without monsters must keep them")
+	}
+	cleared := patch[map[string]any](t, dm, a.server.URL, "/api/rule-books/"+custom["id"].(string), map[string]any{"monsters": []any{}})
+	if len(cleared["monsters"].([]any)) != 0 {
+		t.Fatal("patching monsters should replace them")
+	}
+
+	creation := map[string]any{"class_id": "fighter", "scores": map[string]any{"strength": 15, "dexterity": 14, "constitution": 13, "intelligence": 12, "wisdom": 10, "charisma": 8}, "choices": map[string]any{"skill_proficiencies": []string{"athletics", "perception"}}}
+	hero := post[map[string]any](t, player, a.server.URL, "/api/sheets", map[string]any{"rule_book_id": dndID, "name": "Hero", "creation": creation})
+	room := post[map[string]any](t, dm, a.server.URL, "/api/rooms", map[string]any{"name": "Cave", "rule_book_id": dndID})
+	roomPath := "/api/rooms/" + room["id"].(string)
+	post[map[string]any](t, player, a.server.URL, "/api/rooms/join", map[string]any{"invite_code": room["invite_code"], "sheet_id": hero["id"]})
+	post[map[string]any](t, dm, a.server.URL, roomPath+"/maps/new", map[string]any{"name": "Cave", "width_m": 12, "height_m": 8})
+
+	if status := statusOf(t, player, "GET", a.server.URL+roomPath+"/monsters", nil); status != 403 {
+		t.Fatalf("players must not list monsters: status %d", status)
+	}
+	if monsters := get[[]any](t, dm, a.server.URL, roomPath+"/monsters"); len(monsters) != 12 {
+		t.Fatalf("DM should list the room book's monsters, got %d", len(monsters))
+	}
+	if status := statusOf(t, player, "POST", a.server.URL+roomPath+"/tokens", map[string]any{"monster_id": "goblin", "sheet_id": hero["id"]}); status != 403 {
+		t.Fatalf("players must not place monsters: status %d", status)
+	}
+	if status := statusOf(t, dm, "POST", a.server.URL+roomPath+"/tokens", map[string]any{"monster_id": "goblin", "sheet_id": hero["id"]}); status != 400 {
+		t.Fatalf("a token cannot be both a sheet and a monster: status %d", status)
+	}
+	if status := statusOf(t, dm, "POST", a.server.URL+roomPath+"/tokens", map[string]any{"monster_id": "dragon"}); status != 400 {
+		t.Fatalf("unknown monster: status %d", status)
+	}
+	first := post[map[string]any](t, dm, a.server.URL, roomPath+"/tokens", map[string]any{"monster_id": "goblin", "x_m": 3, "y_m": 1})
+	second := post[map[string]any](t, dm, a.server.URL, roomPath+"/tokens", map[string]any{"monster_id": "goblin", "x_m": 5, "y_m": 5})
+	named := post[map[string]any](t, dm, a.server.URL, roomPath+"/tokens", map[string]any{"monster_id": "ogre", "name": "Grug", "x_m": 9, "y_m": 6})
+	if first["name"] != "Goblin" || second["name"] != "Goblin 2" || named["name"] != "Grug" || first["size_m"] != 1.5 || named["size_m"] != float64(3) {
+		t.Fatalf("unexpected monster tokens: %+v %+v %+v", first, second, named)
+	}
+	heroToken := post[map[string]any](t, player, a.server.URL, roomPath+"/tokens", map[string]any{"sheet_id": hero["id"], "name": "Hero", "x_m": 2, "y_m": 1})
+
+	dmState := get[map[string]any](t, dm, a.server.URL, roomPath+"/state")
+	placed := entityByID(t, dmState["visibleTokens"], first["id"].(string))
+	attacks := placed["attacks"].([]any)
+	if placed["attributes"].(map[string]any)["hit_points"] != float64(7) || len(attacks) != 2 || attacks[0].(map[string]any)["to_hit"] != float64(4) || placed["attacks_editable"] != true {
+		t.Fatalf("DM should see the goblin's stats and resolved attacks: %+v", placed)
+	}
+	if encoded, _ := json.Marshal(get[map[string]any](t, player, a.server.URL, roomPath+"/state")); strings.Contains(string(encoded), "hit_points") || strings.Contains(string(encoded), "Nimble") {
+		t.Fatalf("players must not receive monster stat blocks: %s", encoded)
+	}
+
+	dmWS := dialWS(t, a, dm, room["id"].(string))
+	defer dmWS.Close()
+	readType(t, dmWS, "state.snapshot")
+	sendWS(t, dmWS, "attack.resolve", "goblin-scimitar", map[string]any{"sourceTokenId": first["id"], "targetTokenId": heroToken["id"], "attackId": "scimitar"})
+	ev := readType(t, dmWS, "roll.result")
+	body := ev["body"].(map[string]any)
+	roll := body["roll"].(map[string]any)
+	if body["body"] != "Goblin attacks Hero with Scimitar" || roll["expression"] != "1d20+4" || roll["damage"].(map[string]any)["expression"] != "1d6+2" {
+		t.Fatalf("placed goblin should attack with its SRD scimitar: %s", fmtBody(ev))
+	}
 }
 
 func dialWS(t *testing.T, a *testApp, c *http.Client, roomID string) *websocket.Conn {

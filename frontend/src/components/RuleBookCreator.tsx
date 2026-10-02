@@ -1,10 +1,12 @@
 import { FormEvent, useState } from "react";
-import type { CreationRules, RuleBook } from "../api/types";
+import type { CreationRules, Monster, RuleBook } from "../api/types";
 
 import { fieldFromValue, objectFromFields, parseAttributes } from "../lib/attributeFields";
 import { creationRulesDraft, rulesFromDraft } from "../lib/creationRulesConfig";
+import { monsterDrafts, monstersFromDrafts } from "../lib/monsters";
 import { AttributeFields } from "./AttributeFields";
 import { CreationRulesEditor } from "./CreationRulesEditor";
+import { MonstersEditor } from "./MonstersEditor";
 
 type Props = {
   books: RuleBook[];
@@ -12,13 +14,14 @@ type Props = {
   loading: boolean;
   onSourceChange: (book?: RuleBook) => void;
   onDirty: () => void;
-  onCreate: (name: string, attributes: Record<string, unknown>, rules: CreationRules) => Promise<void>;
+  onCreate: (name: string, attributes: Record<string, unknown>, rules: CreationRules, monsters: Monster[]) => Promise<void>;
 };
 
 export function RuleBookCreator({ books, source, loading, onSourceChange, onDirty, onCreate }: Props) {
   const [name, setName] = useState(source ? `${source.name} — extended` : "");
   const [fields, setFields] = useState(() => Object.entries(source?.attributes ?? {}).map(([key, value]) => fieldFromValue(key, value)));
   const [rules, setRules] = useState(() => creationRulesDraft(source?.creation_rules));
+  const [monsters, setMonsters] = useState(() => monsterDrafts(source?.monsters));
   const [mode, setMode] = useState<"fields" | "json">("fields");
   const [json, setJson] = useState("");
   const [error, setError] = useState("");
@@ -42,9 +45,10 @@ export function RuleBookCreator({ books, source, loading, onSourceChange, onDirt
     try {
       const attributes = mode === "json" ? parseAttributes(json) : objectFromFields(fields);
       const creationRules = rulesFromDraft(rules, attributes);
+      const bookMonsters = monstersFromDrafts(monsters);
       if (!name.trim()) throw new Error("Give your rule book a name.");
       setBusy(true);
-      await onCreate(name.trim(), attributes, creationRules);
+      await onCreate(name.trim(), attributes, creationRules, bookMonsters);
     } catch (err) { reportError(err); }
     finally { setBusy(false); }
   }
@@ -74,6 +78,9 @@ export function RuleBookCreator({ books, source, loading, onSourceChange, onDirt
         <p id="attributes-help" className="text-muted text-xs leading-relaxed">Use a JSON object, for example {`{"strength": 10, "inspiration": false}`}. Switch back to Inputs to edit the same values without JSON.</p>
       </>}
       <CreationRulesEditor draft={rules} onChange={(next) => { setRules(next); onDirty(); }} />
+      <MonstersEditor drafts={monsters} onChange={(next) => { setMonsters(next); onDirty(); }} bookAttributes={() => {
+        try { return mode === "json" ? parseAttributes(json) : objectFromFields(fields); } catch { return {}; }
+      }} />
       <div className="border-t border-[var(--line)] pt-5"><button className="btn w-full" disabled={busy || !name.trim()}>{busy ? "Creating…" : source ? "Create extended rule book" : "Create rule book"}</button><p className="mb-0 mt-3 text-muted text-xs">New characters inherit these defaults. Existing characters are not changed.</p></div>
     </fieldset>
   </form>;
