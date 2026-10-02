@@ -168,6 +168,7 @@ Server layout, created by `deploy/provision.sh` (idempotent, run as root on Ubun
 | `/etc/letsencrypt/live/rollandplay/` | Let's Encrypt certificate from certbot (snap, webroot `/var/www/letsencrypt`). `snap.certbot.renew.timer` renews it and reloads nginx. |
 | `/var/lib/rollandplay/assets` | Uploaded assets. |
 | `deploy` user | CI login. The key is installed with `restrict`; sudo is limited to `systemctl restart rollandplay-backend`. |
+| `metrics` user | Optional and tunnel-only (`METRICS_PUBKEY`). Its key can only forward to `127.0.0.1:9464`: no shell, no other ports. See [Metrics and dashboards](#metrics-and-dashboards). |
 
 Provisioning or updating a server: run these from the repository root on your machine (the folder that contains `deploy/`). Replace `SERVER` with the VPS address, e.g. `143.95.169.22`. SSH asks for the root password; never put it in the command. The server doesn't need git; your local `deploy/` folder is streamed over SSH and replaces the previous copy each time. The script must run as root on the Ubuntu server, and it refuses to run anywhere else.
 
@@ -221,6 +222,7 @@ Set these variables for the backend process:
 
 ```bash
 HTTP_ADDR=':8080'
+METRICS_ADDR='127.0.0.1:9464'   # Prometheus /metrics; keep it on loopback
 PUBLIC_BASE_URL='https://your-domain.example'
 API_BASE_URL='https://your-domain.example'
 DATABASE_URL='postgres://USER:PASSWORD@HOST:5432/DBNAME?sslmode=require'
@@ -411,8 +413,47 @@ podman-compose down -v
 
 This deletes local development data.
 
+## Metrics and dashboards
+
+The backend exports OpenTelemetry metrics in Prometheus format on `METRICS_ADDR` (default `127.0.0.1:9464`, path `/metrics`). That listener is separate from the API, binds to loopback, and is never proxied by nginx.
+
+| Metric | Meaning |
+| --- | --- |
+| `http_server_request_duration_seconds` (histogram) | Requests by `http_request_method`, `http_response_status_code`, and `http_route`. The route is the ServeMux pattern, e.g. `/api/rooms/{roomID}`, and is absent for unmatched paths. No host, client, or raw-path labels. |
+| `http_server_request_body_size_bytes`, `http_server_response_body_size_bytes` | Body sizes, with the same labels. |
+| `rollandplay_websocket_connections` | Websocket connections open on the instance. |
+| `rollandplay_email_sends_total{result="sent"\|"failed"}` | Magic-link delivery attempts. |
+| `go_*`, `process_*` | Go runtime and process (memory, CPU, goroutines, GC). |
+
+Prometheus and Grafana run on your machine, in `compose.yaml`, with host networking and loopback-only ports:
+
+```bash
+podman-compose up -d prometheus grafana
+```
+
+- Grafana: `http://127.0.0.1:3030` (no login). The provisioned **Rollandplay backend** dashboard has an **Environment** selector.
+- Prometheus: `http://127.0.0.1:9090`. It scrapes the local backend (`env="local"`) and production through a tunnel (`env="production"`). Config: `observability/`.
+
+To see production, open the tunnel and leave it running:
+
+```bash
+ssh -N -L 19464:127.0.0.1:9464 -p 22022 metrics@143.95.169.22
+```
+
+Prometheus only collects production data while the tunnel is open. Gaps are expected, and counters restart on every deploy (PromQL `rate`/`increase` handle resets). Nothing is stored on the VPS.
+
+The tunnel key is set by re-running provisioning with your public key. See [Continuous deployment](#continuous-deployment-github-actions--vps) for the full command:
+
+```bash
+tar czf - deploy | ssh -p 22022 root@SERVER "rm -rf /root/rollandplay-deploy && mkdir /root/rollandplay-deploy && tar xzf - -C /root/rollandplay-deploy && \
+  METRICS_PUBKEY='$(cat ~/.ssh/id_ed25519.pub)' /root/rollandplay-deploy/deploy/provision.sh"
+```
+
 ## Useful URLs
 
 - Frontend: `http://127.0.0.1:5173`
 - Backend API: `http://localhost:8080`
 - MailHog inbox: `http://localhost:8025`
+- Grafana: `http://127.0.0.1:3030`
+- Prometheus: `http://127.0.0.1:9090`
+- Backend metrics: `http://127.0.0.1:9464/metrics`
