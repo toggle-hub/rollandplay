@@ -1,48 +1,73 @@
 import { FormEvent, useEffect, useRef, useState } from "react";
-import { Link, useParams } from "react-router-dom";
-import { ArrowLeft, ArrowsIn, ArrowsOut, Plus, UploadSimple } from "@phosphor-icons/react";
-import { apiFetch, patchJSON, postJSON } from "../api/client";
-import { MapEditorCanvas } from "../components/MapEditorCanvas";
+import { Link, useNavigate, useParams } from "react-router-dom";
+import { ArrowLeft, ArrowsIn, ArrowsOut, Plus, Trash, UploadSimple } from "@phosphor-icons/react";
+import { apiFetch, deleteJSON, patchJSON, postJSON } from "../api/client";
+import { useSession } from "../auth/SessionContext";
+import { MapEditorCanvas, type StructureGeometryChange } from "../components/MapEditorCanvas";
 import { geometryBounds, geometryCenter, nudgeGeometry, scaleGeometry, type Point } from "../lib/geometryTransforms";
 import type { GameMap, MapStructure } from "../api/types";
 import { defaultBlocksForKind, snap, structureLabel, structureTypes, templateGeometry, wallBlocks, type StructureBlocks } from "../lib/structures";
 
-type DraftSnapshot = { geometry: string; selectedStructureId?: string };
+type DraftSnapshot = { geometry: string; selectedStructureIds: string[] };
+type GeometryChange = { id: string; before: Point[]; after: Point[] };
 type UndoEntry =
   | { type: "draft-geometry"; before: DraftSnapshot }
-  | { type: "structure-geometry"; structureId: string; before: Point[]; after: Point[] };
+  | { type: "structure-geometry"; changes: GeometryChange[] }
+  | { type: "structures-deleted"; structures: MapStructure[] };
 
 export function MapEditorPage() {
   const { mapId } = useParams();
+  const navigate = useNavigate();
+  const { session } = useSession();
   const [map, setMap] = useState<GameMap | null>(null);
   const [geometry, setGeometry] = useState('[{"x":4,"y":4},{"x":10,"y":4}]');
   const [kind, setKind] = useState("wall");
   const [blocks, setBlocks] = useState<StructureBlocks>(wallBlocks);
-  const [selectedStructureId, setSelectedStructureId] = useState<string>();
+  const [selectedStructureIds, setSelectedStructureIds] = useState<string[]>([]);
   const [asset, setAsset] = useState<File | null>(null);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
+  const [confirmingMapDelete, setConfirmingMapDelete] = useState(false);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const undoHistory = useRef<UndoEntry[]>([]);
 
   const load = async () => setMap(await apiFetch<GameMap>(`/api/maps/${mapId}`));
+  const resync = () => load().catch(() => undefined);
   const draftGeometry = parsePoints(geometry);
   const draftStructure = draftGeometry ? structurePayload(kind, draftGeometry, blocks) : null;
   const structures = map?.structures ?? [];
-  const selectedStructure = structures.find((structure) => structure.id === selectedStructureId);
-  const transformGeometry = selectedStructure?.geometry ?? draftGeometry;
+  const selectedStructures = structures.filter((structure) => selectedStructureIds.includes(structure.id));
+  const transformGeometry = selectedStructures.length > 0 ? selectedStructures.flatMap((structure) => structure.geometry) : draftGeometry;
   const transformBounds = transformGeometry ? geometryBounds(transformGeometry) : null;
-  const transformTarget = selectedStructure ? `${selectedStructure.kind} layer` : "draft structure";
+  const transformTarget = selectedStructures.length > 1
+    ? `${selectedStructures.length} structures`
+    : selectedStructures.length === 1 ? `${selectedStructures[0].kind} layer` : "draft structure";
   const mapJSON = map ? JSON.stringify({ ...map, structures }, null, 2) : "";
+  const isOwner = session.status === "authenticated" && map?.owner_id === session.user.id;
 
   function rememberUndo(entry: UndoEntry) {
     undoHistory.current.push(entry);
     if (undoHistory.current.length > 100) undoHistory.current.shift();
   }
 
+  function forgetUndo(entry: UndoEntry) {
+    const index = undoHistory.current.indexOf(entry);
+    if (index !== -1) undoHistory.current.splice(index, 1);
+  }
+
+  /** Restored structures get new ids; older undo steps must follow them. */
+  function remapUndoIds(ids: Map<string, string>) {
+    const remap = (id: string) => ids.get(id) ?? id;
+    undoHistory.current = undoHistory.current.map((entry) => {
+      if (entry.type === "structure-geometry") return { ...entry, changes: entry.changes.map((change) => ({ ...change, id: remap(change.id) })) };
+      if (entry.type === "draft-geometry") return { ...entry, before: { ...entry.before, selectedStructureIds: entry.before.selectedStructureIds.map(remap) } };
+      return { ...entry, structures: entry.structures.map((structure) => ({ ...structure, id: remap(structure.id) })) };
+    });
+  }
+
   function rememberDraftGeometry(before: DraftSnapshot, after: DraftSnapshot) {
-    if (before.geometry === after.geometry && before.selectedStructureId === after.selectedStructureId) return;
+    if (before.geometry === after.geometry && sameIds(before.selectedStructureIds, after.selectedStructureIds)) return;
     rememberUndo({ type: "draft-geometry", before });
   }
 
@@ -50,11 +75,18 @@ export function MapEditorPage() {
     setKind(nextKind);
     setBlocks(defaultBlocksForKind(nextKind));
     if (draftGeometry) setGeometry(JSON.stringify(templateGeometry(nextKind, geometryCenter(draftGeometry), Number(map?.grid_size_m || 1))));
-    setSelectedStructureId(undefined);
+    setSelectedStructureIds([]);
+  }
+
+  function selectLayer(structureId: string, additive: boolean) {
+    setSelectedStructureIds((current) => !additive
+      ? [structureId]
+      : current.includes(structureId) ? current.filter((id) => id !== structureId) : [...current, structureId]);
   }
 
   useEffect(() => {
     undoHistory.current = [];
+    setSelectedStructureIds([]);
     setLoading(true);
     setError("");
     load().catch((err: Error) => setError(err.message)).finally(() => setLoading(false));
@@ -114,33 +146,62 @@ export function MapEditorPage() {
     }, "Background uploaded and attached to this map.");
   }
 
-  function commitStructureTransform(structureId: string, nextGeometry: Point[]) {
-    const previousGeometry = structures.find((structure) => structure.id === structureId)?.geometry;
-    if (!previousGeometry || busy) return;
-    const undoEntry: UndoEntry = {
-      type: "structure-geometry",
-      structureId,
-      before: previousGeometry.map((point) => ({ ...point })),
-      after: nextGeometry.map((point) => ({ ...point })),
-    };
-    rememberUndo(undoEntry);
+  function setStructureGeometries(changes: StructureGeometryChange[]) {
+    const next = new Map(changes.map((change) => [change.id, change.geometry]));
     setMap((current) => current ? {
       ...current,
-      structures: current.structures?.map((structure) => structure.id === structureId ? { ...structure, geometry: nextGeometry } : structure),
+      structures: current.structures?.map((structure) => {
+        const geometry = next.get(structure.id);
+        return geometry ? { ...structure, geometry } : structure;
+      }),
     } : current);
+  }
+
+  function patchStructureGeometries(changes: StructureGeometryChange[]) {
+    return Promise.all(changes.map((change) => patchJSON(`/api/maps/${mapId}/structures/${change.id}`, { geometry: change.geometry })));
+  }
+
+  function commitStructureTransforms(changes: StructureGeometryChange[]) {
+    if (busy) return;
+    const previous = new Map(structures.map((structure) => [structure.id, structure.geometry]));
+    const geometryChanges = changes.flatMap((change) => {
+      const before = previous.get(change.id);
+      return before ? [{ id: change.id, before: clonePoints(before), after: clonePoints(change.geometry) }] : [];
+    });
+    if (geometryChanges.length === 0) return;
+    const undoEntry: UndoEntry = { type: "structure-geometry", changes: geometryChanges };
+    rememberUndo(undoEntry);
+    setStructureGeometries(geometryChanges.map((change) => ({ id: change.id, geometry: change.after })));
     setBusy(true);
     setError("");
-    void patchJSON(`/api/maps/${mapId}/structures/${structureId}`, { geometry: nextGeometry })
-      .catch((err: unknown) => {
-        setMap((current) => current ? {
-          ...current,
-          structures: current.structures?.map((structure) => structure.id === structureId ? { ...structure, geometry: undoEntry.before } : structure),
-        } : current);
-        const index = undoHistory.current.indexOf(undoEntry);
-        if (index !== -1) undoHistory.current.splice(index, 1);
+    void patchStructureGeometries(geometryChanges.map((change) => ({ id: change.id, geometry: change.after })))
+      .catch(async (err: unknown) => {
+        forgetUndo(undoEntry);
+        setStructureGeometries(geometryChanges.map((change) => ({ id: change.id, geometry: change.before })));
         setError(err instanceof Error ? err.message : "Could not transform the structure.");
+        await resync();
       })
       .finally(() => setBusy(false));
+  }
+
+  async function deleteSelectedStructures() {
+    const doomed = selectedStructures;
+    if (doomed.length === 0 || busy) return;
+    setBusy(true);
+    setError("");
+    setNotice("");
+    const results = await Promise.allSettled(doomed.map((structure) => deleteJSON(`/api/maps/${mapId}/structures/${structure.id}`)));
+    const deleted = doomed.filter((_, index) => results[index].status === "fulfilled");
+    const failure = results.find((result): result is PromiseRejectedResult => result.status === "rejected");
+    if (deleted.length > 0) {
+      const gone = new Set(deleted.map((structure) => structure.id));
+      rememberUndo({ type: "structures-deleted", structures: deleted });
+      setMap((current) => current ? { ...current, structures: current.structures?.filter((structure) => !gone.has(structure.id)) } : current);
+      setSelectedStructureIds((current) => current.filter((id) => !gone.has(id)));
+      setNotice(deleted.length === 1 ? "Structure deleted. Press Ctrl/Cmd+Z to restore it." : `${deleted.length} structures deleted. Press Ctrl/Cmd+Z to restore them.`);
+    }
+    if (failure) setError(failure.reason instanceof Error ? failure.reason.message : "Could not delete the structure.");
+    setBusy(false);
   }
 
   function undoLastChange() {
@@ -149,40 +210,59 @@ export function MapEditorPage() {
     setError("");
     if (entry.type === "draft-geometry") {
       setGeometry(entry.before.geometry);
-      setSelectedStructureId(entry.before.selectedStructureId);
+      setSelectedStructureIds(entry.before.selectedStructureIds);
       setNotice("Last map edit undone.");
       return;
     }
-    setMap((current) => current ? {
-      ...current,
-      structures: current.structures?.map((structure) => structure.id === entry.structureId ? { ...structure, geometry: entry.before } : structure),
-    } : current);
     setBusy(true);
     setNotice("");
-    void patchJSON(`/api/maps/${mapId}/structures/${entry.structureId}`, { geometry: entry.before })
+    if (entry.type === "structures-deleted") {
+      void Promise.allSettled(entry.structures.map((structure) => postJSON<MapStructure>(`/api/maps/${mapId}/structures`, restorePayload(structure))))
+        .then(async (results) => {
+          const restoredIds = new Map<string, string>();
+          const failed: MapStructure[] = [];
+          let failure: unknown;
+          results.forEach((result, index) => {
+            if (result.status === "fulfilled") restoredIds.set(entry.structures[index].id, result.value.id);
+            else {
+              failed.push(entry.structures[index]);
+              failure = result.reason;
+            }
+          });
+          remapUndoIds(restoredIds);
+          if (failed.length > 0) {
+            rememberUndo({ type: "structures-deleted", structures: failed });
+            setError(failure instanceof Error ? failure.message : "Could not restore the deleted structures.");
+          }
+          await resync();
+          setSelectedStructureIds([...restoredIds.values()]);
+          if (failed.length === 0) setNotice("Last map edit undone.");
+        })
+        .finally(() => setBusy(false));
+      return;
+    }
+    setStructureGeometries(entry.changes.map((change) => ({ id: change.id, geometry: change.before })));
+    void patchStructureGeometries(entry.changes.map((change) => ({ id: change.id, geometry: change.before })))
       .then(() => setNotice("Last map edit undone."))
-      .catch((err: unknown) => {
-        setMap((current) => current ? {
-          ...current,
-          structures: current.structures?.map((structure) => structure.id === entry.structureId ? { ...structure, geometry: entry.after } : structure),
-        } : current);
+      .catch(async (err: unknown) => {
         rememberUndo(entry);
         setError(err instanceof Error ? err.message : "Could not undo the structure change.");
+        await resync();
       })
       .finally(() => setBusy(false));
   }
 
-  function transformSelected(makeGeometry: (geometry: Point[]) => Point[]) {
-    if (!transformGeometry) return;
-    const nextGeometry = makeGeometry(transformGeometry);
-    if (selectedStructure) {
-      commitStructureTransform(selectedStructure.id, nextGeometry);
+  function scaleSelection(factor: number) {
+    if (selectedStructures.length > 0) {
+      const center = geometryCenter(selectedStructures.flatMap((structure) => structure.geometry));
+      commitStructureTransforms(selectedStructures.map((structure) => ({ id: structure.id, geometry: scaleGeometry(structure.geometry, factor, center) })));
       return;
     }
-    const serialized = JSON.stringify(nextGeometry);
+    if (!draftGeometry) return;
+    const serialized = JSON.stringify(scaleGeometry(draftGeometry, factor));
     rememberDraftGeometry(
-      { geometry, selectedStructureId },
-      { geometry: serialized, selectedStructureId },
+      { geometry, selectedStructureIds },
+      { geometry: serialized, selectedStructureIds },
     );
     setGeometry(serialized);
   }
@@ -194,14 +274,27 @@ export function MapEditorPage() {
     const target = { x: snap(point.x, grid), y: snap(point.y, grid) };
     const serialized = JSON.stringify(nudgeGeometry(draftGeometry, target.x - center.x, target.y - center.y));
     rememberDraftGeometry(
-      { geometry, selectedStructureId },
-      { geometry: serialized, selectedStructureId: undefined },
+      { geometry, selectedStructureIds },
+      { geometry: serialized, selectedStructureIds: [] },
     );
-    setSelectedStructureId(undefined);
+    setSelectedStructureIds([]);
     setGeometry(serialized);
     setNotice(`${kind[0].toUpperCase() + kind.slice(1)} draft moved.`);
   }
 
+  async function deleteMap() {
+    setBusy(true);
+    setError("");
+    setNotice("");
+    try {
+      await deleteJSON(`/api/maps/${mapId}`);
+      navigate("/maps");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not delete the map.");
+      setConfirmingMapDelete(false);
+      setBusy(false);
+    }
+  }
 
   function exportMapJSON() {
     if (!map) return;
@@ -230,10 +323,10 @@ export function MapEditorPage() {
       }
       const serialized = JSON.stringify(nextGeometry);
       rememberDraftGeometry(
-        { geometry, selectedStructureId },
-        { geometry: serialized, selectedStructureId: undefined },
+        { geometry, selectedStructureIds },
+        { geometry: serialized, selectedStructureIds: [] },
       );
-      setSelectedStructureId(undefined);
+      setSelectedStructureIds([]);
       setGeometry(serialized);
       setNotice("Draft geometry imported from JSON.");
     };
@@ -249,7 +342,7 @@ export function MapEditorPage() {
         <Link className="mb-6 inline-flex items-center gap-2 text-sm text-[var(--muted)] hover:text-[var(--paper)]" to="/maps"><ArrowLeft size={16} aria-hidden="true" />All maps</Link>
         <p className="eyebrow">Cartographer studio</p>
         <h1 className="page-heading break-words">{map.name}</h1>
-        <p className="page-description">Build directly on the canvas with persistent Move and Rotate modes, resize handles, and JSON import/export.</p>
+        <p className="page-description">Build directly on the canvas: select one structure or a whole area, then move, resize and rotate it with on-canvas handles. JSON import/export stays available.</p>
       </div>
       <div className="map-studio-stats" aria-label="Map summary">
         <span><strong>{map.width_m} × {map.height_m}</strong> meters</span>
@@ -272,11 +365,11 @@ export function MapEditorPage() {
       <div className="map-studio-canvas-head">
         <div>
           <h2 className="text-2xl">World canvas</h2>
-          <p className="text-muted mt-2 text-sm">Right-click a structure to choose Move or Rotate mode; it stays active until you change it. Drag structures to use that mode. In Move mode, square handles resize and clicking empty space places the draft without changing its size or rotation. In Rotate mode, drag around the structure center; hold Shift to snap to 15°. Drag empty space to pan, hold Ctrl while scrolling to zoom, and press Ctrl/Cmd+Z to undo.</p>
+          <p className="text-muted mt-2 text-sm">Click a structure to select it, Shift-click to add more, or drag across empty space to select an area. Drag the selection to move it, drag a square corner to resize, or drag the round handle above it to rotate; hold Shift to snap rotation to 15°. Press Delete to remove the selection and Escape to clear it. With nothing selected, click empty space to place the draft. Drag with the right or middle mouse button (or hold Space) to pan, hold Ctrl while scrolling to zoom, and press Ctrl/Cmd+Z to undo.</p>
         </div>
         <div className="map-studio-tool-chips" aria-label="Active editor state">
           <span>Brush: {structureLabel(kind)}</span>
-          <span>{selectedStructure ? `Layer: ${selectedStructure.kind}` : "Draft layer"}</span>
+          <span>{selectedStructures.length > 1 ? `Group: ${selectedStructures.length} layers` : selectedStructures.length === 1 ? `Layer: ${selectedStructures[0].kind}` : "Draft layer"}</span>
           {!draftGeometry && <span className="text-[var(--pink)]">Invalid draft JSON</span>}
         </div>
       </div>
@@ -284,39 +377,41 @@ export function MapEditorPage() {
         map={map}
         structures={structures}
         draftStructure={draftStructure}
-        selectedStructureId={selectedStructureId}
+        selectedStructureIds={selectedStructureIds}
         controls={<div className="grid gap-2" data-testid="map-structure-controls">
           <div className="border-b border-[var(--paper)]/10 pb-2">
             <h3 className="px-1 text-[10px] font-semibold uppercase tracking-[0.18em] text-[var(--muted)]">Transform</h3>
             <p className="mt-1 truncate px-1 text-[11px] text-[var(--paper)]" title={transformGeometry ? transformTarget : "valid draft geometry or selected structure"}>{transformGeometry ? transformTarget : "No target"}</p>
             {transformBounds && <p className="text-muted mt-0.5 px-1 text-[10px] tabular-nums">{transformBounds.width} × {transformBounds.height} m</p>}
           </div>
-          <div className="grid gap-1.5" role="group" aria-label="Resize selected structure">
+          <div className="grid gap-1.5" role="group" aria-label="Resize selected structures">
             <span className="px-1 text-[9px] font-semibold uppercase tracking-[0.14em] text-[var(--muted)]">Size</span>
             <div className="grid grid-cols-2 gap-1">
-              <button className="btn-secondary flex h-9 min-h-0 w-full items-center gap-1 px-1 py-1.5 text-[10px]" type="button" disabled={!transformGeometry || busy} aria-label="Shrink 10%" title="Shrink 10%" onClick={() => transformSelected((points) => scaleGeometry(points, 0.9))}><ArrowsIn size={15} aria-hidden="true" /><span>10%</span></button>
-              <button className="btn-secondary flex h-9 min-h-0 w-full items-center gap-1 px-1 py-1.5 text-[10px]" type="button" disabled={!transformGeometry || busy} aria-label="Grow 10%" title="Grow 10%" onClick={() => transformSelected((points) => scaleGeometry(points, 1.1))}><ArrowsOut size={15} aria-hidden="true" /><span>10%</span></button>
+              <button className="btn-secondary flex h-9 min-h-0 w-full items-center gap-1 px-1 py-1.5 text-[10px]" type="button" disabled={!transformGeometry || busy} aria-label="Shrink 10%" title="Shrink 10%" onClick={() => scaleSelection(0.9)}><ArrowsIn size={15} aria-hidden="true" /><span>10%</span></button>
+              <button className="btn-secondary flex h-9 min-h-0 w-full items-center gap-1 px-1 py-1.5 text-[10px]" type="button" disabled={!transformGeometry || busy} aria-label="Grow 10%" title="Grow 10%" onClick={() => scaleSelection(1.1)}><ArrowsOut size={15} aria-hidden="true" /><span>10%</span></button>
             </div>
           </div>
+          <button className="btn-secondary flex h-9 min-h-0 w-full items-center justify-center gap-1.5 px-1 py-1.5 text-[11px] text-[var(--pink)]" type="button" disabled={selectedStructures.length === 0 || busy} aria-label="Delete selected structures" title="Delete selected structures (Delete key)" onClick={() => void deleteSelectedStructures()}><Trash size={15} aria-hidden="true" /><span>Delete</span></button>
         </div>}
         selector={<StructurePalette
           structures={structures}
           selectedKind={kind}
-          selectedStructureId={selectedStructureId}
+          selectedStructureIds={selectedStructureIds}
           addDisabled={busy || !draftGeometry}
           onAdd={addStructure}
           onSelect={selectKind}
-          onSelectStructure={setSelectedStructureId}
+          onSelectStructure={selectLayer}
         />}
         disabled={busy}
-        onSelectStructure={(id) => setSelectedStructureId(id)}
+        onSelectStructures={setSelectedStructureIds}
         onTransformDraft={(nextGeometry) => setGeometry(JSON.stringify(nextGeometry))}
         onTransformDraftEnd={(originalGeometry, nextGeometry) => rememberDraftGeometry(
-          { geometry: JSON.stringify(originalGeometry), selectedStructureId },
-          { geometry: JSON.stringify(nextGeometry), selectedStructureId },
+          { geometry: JSON.stringify(originalGeometry), selectedStructureIds },
+          { geometry: JSON.stringify(nextGeometry), selectedStructureIds },
         )}
-        onTransformStructure={commitStructureTransform}
+        onTransformStructures={commitStructureTransforms}
         onMoveDraft={moveDraft}
+        onDeleteSelection={() => void deleteSelectedStructures()}
       />
     </section>
 
@@ -344,6 +439,15 @@ export function MapEditorPage() {
           <p className="text-muted mt-3 text-xs">{map.background_asset_id ? "A background is attached. Upload another image to replace it." : "Add an image to use as this map’s background."}</p>
           <button className="btn-secondary mt-4" type="button" disabled={!asset || busy} onClick={upload}><UploadSimple size={18} aria-hidden="true" />Upload background</button>
         </div>
+        {isOwner && <div className="border-t border-[var(--paper)]/10 pt-5">
+          <h3 className="field-label mb-3">Delete map</h3>
+          <p className="text-muted text-xs">Removes this map and every structure on it. A map attached to a room can’t be deleted.</p>
+          {confirmingMapDelete ? <div className="mt-4 flex flex-wrap items-center gap-3">
+            <span className="mr-auto text-sm text-[var(--pink)]">Delete “{map.name}” permanently?</span>
+            <button className="btn-secondary text-[var(--pink)]" type="button" disabled={busy} onClick={() => void deleteMap()}>{busy ? "Deleting…" : "Confirm"}</button>
+            <button className="btn-secondary" type="button" disabled={busy} onClick={() => setConfirmingMapDelete(false)}>Cancel</button>
+          </div> : <button className="btn-secondary mt-4" type="button" disabled={busy} onClick={() => setConfirmingMapDelete(true)}><Trash size={18} aria-hidden="true" />Delete map</button>}
+        </div>}
       </section>
 
       <form className="card space-y-5" onSubmit={add}>
@@ -375,7 +479,7 @@ export function MapEditorPage() {
 function StructurePalette({
   structures,
   selectedKind,
-  selectedStructureId,
+  selectedStructureIds,
   addDisabled,
   onAdd,
   onSelect,
@@ -383,11 +487,11 @@ function StructurePalette({
 }: {
   structures: MapStructure[];
   selectedKind: string;
-  selectedStructureId?: string;
+  selectedStructureIds: string[];
   addDisabled: boolean;
   onAdd: () => void;
   onSelect: (kind: string) => void;
-  onSelectStructure: (structureId: string) => void;
+  onSelectStructure: (structureId: string, additive: boolean) => void;
 }) {
   return <div className="flex h-full min-h-0 flex-col" data-testid="map-structure-palette">
     <div className="shrink-0 border-b border-[var(--paper)]/10 px-3 py-3">
@@ -418,12 +522,13 @@ function StructurePalette({
       <div className="mt-2 max-h-56 space-y-1 overflow-y-auto pr-1">
         {structures.length === 0 && <p className="text-muted text-[11px] leading-relaxed">Saved layers appear here after adding a structure.</p>}
         {structures.map((structure, index) => {
-          const selected = structure.id === selectedStructureId;
+          const selected = selectedStructureIds.includes(structure.id);
           return <button
             key={structure.id}
             type="button"
+            aria-pressed={selected}
             className={`w-full rounded-md border px-2.5 py-2 text-left text-xs transition-colors ${selected ? "border-[var(--accent)]/90 bg-[var(--accent)]/15 text-[var(--paper)]" : "border-[var(--paper)]/10 bg-[var(--input)]/85 text-[var(--paper)] hover:border-[var(--muted)]/70"}`}
-            onClick={() => onSelectStructure(structure.id)}
+            onClick={(event) => onSelectStructure(structure.id, event.shiftKey || event.ctrlKey || event.metaKey)}
           >
             <span className="block">{index + 1}. {structureLabel(structure.kind)}</span>
             <span className="text-muted mt-0.5 block text-[10px]">{structure.geometry.length} points</span>
@@ -453,6 +558,19 @@ function parsePoints(raw: string): Point[] | null {
 
 function structurePayload(kind: string, geometry: Point[], blocks: StructureBlocks) {
   return { kind, geometry, ...blocks, cover_bonus: 0, pass_rules: {} };
+}
+
+function restorePayload(structure: MapStructure) {
+  const { kind, geometry, blocks_vision, blocks_movement, blocks_attacks, cover_bonus, pass_rules } = structure;
+  return { kind, geometry, blocks_vision, blocks_movement, blocks_attacks, cover_bonus, pass_rules };
+}
+
+function clonePoints(points: Point[]) {
+  return points.map((point) => ({ ...point }));
+}
+
+function sameIds(left: string[], right: string[]) {
+  return left.length === right.length && left.every((id, index) => id === right[index]);
 }
 
 function safeFileName(name: string) {

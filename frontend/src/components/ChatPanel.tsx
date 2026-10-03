@@ -77,12 +77,12 @@ export function ChatPanel({ messages, members, isDM, onSend }: Props) {
         </article>;
       })}
     </div>
-    <form className="space-y-3 border-t border-[var(--line)] bg-[var(--input)]/30 p-4" onSubmit={submit}>
+    <form className="relative space-y-3 border-t border-[var(--line)] bg-[var(--input)]/30 p-4" onSubmit={submit}>
       {isDM && <details className="text-xs">
         <summary className="cursor-pointer rounded-md py-1 text-[var(--lavender)]">
           <span className="ml-1 inline-flex items-center gap-1.5 align-middle"><LockSimple size={13} aria-hidden="true" />{recipients.length ? `Private · ${recipients.length} selected` : "To everyone"}</span>
         </summary>
-        <fieldset className="mt-3 rounded-lg border border-[var(--line)] p-3">
+        <fieldset className="absolute inset-x-4 bottom-full z-20 mb-2 rounded-lg border border-[var(--line)] bg-[var(--ink)] p-3 shadow-xl">
           <legend className="px-1 text-[var(--paper)]">Private recipients</legend>
           <p className="mb-3 leading-relaxed text-[var(--muted)]">Leave everyone unchecked to send to the whole table.</p>
           <div className="max-h-32 space-y-2 overflow-y-auto overscroll-contain">

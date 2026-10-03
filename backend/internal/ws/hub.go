@@ -239,6 +239,10 @@ func (c *client) handle(msg clientEnvelope) {
 		c.chatSend(msg)
 	case "token.move":
 		c.tokenMove(msg)
+	case "tokens.move":
+		c.tokensMove(msg)
+	case "token.remove":
+		c.tokenRemove(msg)
 	case "token.visibility":
 		c.tokenVisibility(msg)
 	case "structure.move":
@@ -334,9 +338,6 @@ func (c *client) chatSend(msg clientEnvelope) {
 		evType = "roll.result"
 	}
 	c.hub.publish(c.roomID, envelope{Type: evType, RequestID: &msg.RequestID, Body: bodyMap})
-	if kind == "roll" {
-		c.hub.publish(c.roomID, envelope{Type: "chat.message", RequestID: &msg.RequestID, Body: bodyMap})
-	}
 }
 
 func (c *client) tokenMove(msg clientEnvelope) {
@@ -354,15 +355,15 @@ func (c *client) tokenMove(msg clientEnvelope) {
 		c.error(msg.RequestID, "not_found", "token not found")
 		return
 	}
-	if !c.isDM && token.OwnerUserID != c.userID {
-		c.error(msg.RequestID, "forbidden", "token ownership required")
+	if !token.MovableBy(c.userID, c.isDM) {
+		c.error(msg.RequestID, "forbidden", "you cannot move this token")
 		return
 	}
 	structures, _ := c.hub.loadStructures(context.Background(), c.roomID)
 	if len(req.Path) == 0 {
-		req.Path = []game.Point{{token.X, token.Y}, req.To}
+		req.Path = []game.Point{{X: token.X, Y: token.Y}, req.To}
 	} else {
-		req.Path = append([]game.Point{{token.X, token.Y}}, req.Path...)
+		req.Path = append([]game.Point{{X: token.X, Y: token.Y}}, req.Path...)
 		req.Path = append(req.Path, req.To)
 	}
 	if !game.CanMove(req.Path, structures, token) {
@@ -376,6 +377,100 @@ func (c *client) tokenMove(msg clientEnvelope) {
 	}
 	c.hub.bump(c.roomID)
 	c.hub.publish(c.roomID, envelope{Type: "token.moved", RequestID: &msg.RequestID, Body: map[string]any{"room_id": c.roomID, "token_id": req.TokenID, "to": req.To}})
+	c.hub.publish(c.roomID, envelope{Type: "vision.update", RequestID: nil, Body: map[string]any{"room_id": c.roomID, "version": time.Now().UnixNano()}})
+}
+
+// maxGroupMove bounds one group move; a marquee selection on a busy map stays well under it.
+const maxGroupMove = 100
+
+// tokensMove moves several tokens at once. Every move is checked before any is written,
+// so the group lands together or not at all.
+func (c *client) tokensMove(msg clientEnvelope) {
+	var req struct {
+		Moves []struct {
+			TokenID string     `json:"tokenId"`
+			To      game.Point `json:"to"`
+		} `json:"moves"`
+	}
+	if json.Unmarshal(msg.Body, &req) != nil || len(req.Moves) == 0 || len(req.Moves) > maxGroupMove {
+		c.error(msg.RequestID, "bad_json", "invalid body")
+		return
+	}
+	seen := map[string]bool{}
+	for _, m := range req.Moves {
+		if seen[m.TokenID] {
+			c.error(msg.RequestID, "bad_json", "invalid body")
+			return
+		}
+		seen[m.TokenID] = true
+	}
+	ctx := context.Background()
+	structures, _ := c.hub.loadStructures(ctx, c.roomID)
+	ids := make([]string, 0, len(req.Moves))
+	for _, m := range req.Moves {
+		token, err := c.hub.loadToken(ctx, c.roomID, m.TokenID)
+		if err != nil {
+			c.error(msg.RequestID, "not_found", "token not found")
+			return
+		}
+		if !token.MovableBy(c.userID, c.isDM) {
+			c.error(msg.RequestID, "forbidden", "you cannot move this token")
+			return
+		}
+		if !game.CanMove([]game.Point{{X: token.X, Y: token.Y}, m.To}, structures, token) {
+			c.error(msg.RequestID, "blocked_movement", "movement is blocked")
+			return
+		}
+		ids = append(ids, m.TokenID)
+	}
+	tx, err := c.hub.pool.Begin(ctx)
+	if err != nil {
+		c.error(msg.RequestID, "db", err.Error())
+		return
+	}
+	defer tx.Rollback(ctx)
+	for _, m := range req.Moves {
+		if _, err = tx.Exec(ctx, `update room_tokens set x_m=$1,y_m=$2,updated_at=now() where id=$3`, m.To.X, m.To.Y, m.TokenID); err != nil {
+			break
+		}
+	}
+	if err == nil {
+		err = tx.Commit(ctx)
+	}
+	if err != nil {
+		c.error(msg.RequestID, "db", err.Error())
+		return
+	}
+	c.hub.bump(c.roomID)
+	c.hub.publish(c.roomID, envelope{Type: "token.moved", RequestID: &msg.RequestID, Body: map[string]any{"room_id": c.roomID, "token_ids": ids}})
+	c.hub.publish(c.roomID, envelope{Type: "vision.update", RequestID: nil, Body: map[string]any{"room_id": c.roomID, "version": time.Now().UnixNano()}})
+}
+
+// tokenRemove deletes a token from the table; only its owner or the game master may do it.
+func (c *client) tokenRemove(msg clientEnvelope) {
+	var req struct {
+		TokenID string `json:"tokenId"`
+	}
+	if json.Unmarshal(msg.Body, &req) != nil {
+		c.error(msg.RequestID, "bad_json", "invalid body")
+		return
+	}
+	ctx := context.Background()
+	token, err := c.hub.loadToken(ctx, c.roomID, req.TokenID)
+	if err != nil {
+		c.error(msg.RequestID, "not_found", "token not found")
+		return
+	}
+	if !c.isDM && token.OwnerUserID != c.userID {
+		c.error(msg.RequestID, "forbidden", "only the token's owner or the game master can remove it")
+		return
+	}
+	if _, err := c.hub.pool.Exec(ctx, `delete from room_tokens where id=$1`, req.TokenID); err != nil {
+		c.error(msg.RequestID, "db", err.Error())
+		return
+	}
+	c.hub.bump(c.roomID)
+	c.hub.publish(c.roomID, envelope{Type: "token.removed", RequestID: &msg.RequestID, Body: map[string]any{"room_id": c.roomID, "token_id": req.TokenID}})
 	c.hub.publish(c.roomID, envelope{Type: "vision.update", RequestID: nil, Body: map[string]any{"room_id": c.roomID, "version": time.Now().UnixNano()}})
 }
 
@@ -739,15 +834,7 @@ func isRigidTransform(current, next []game.Point) bool {
 	return true
 }
 func (h *Hub) loadToken(ctx context.Context, roomID, tokenID string) (game.Token, error) {
-	var t game.Token
-	var attrs, stats []byte
-	err := h.pool.QueryRow(ctx, `select rt.id::text,coalesce(rt.owner_user_id::text,''),rt.name,rt.x_m::float8,rt.y_m::float8,rt.rotation_deg::float8,rt.size_m::float8,rt.vision_range_m::float8,rt.vision_angle_deg::float8,rt.is_hidden,rt.attributes,coalesce(rt.sheet_id::text,''),coalesce(s.user_id::text,''),coalesce(s.data,rt.attributes) from room_tokens rt join room_maps rm on rm.id=rt.room_map_id left join sheets s on s.id=rt.sheet_id where rm.room_id=$1 and rt.id=$2`, roomID, tokenID).Scan(&t.ID, &t.OwnerUserID, &t.Name, &t.X, &t.Y, &t.RotationDeg, &t.SizeM, &t.VisionRangeM, &t.VisionAngleDeg, &t.IsHidden, &attrs, &t.SheetID, &t.SheetOwnerUserID, &stats)
-	if err != nil {
-		return t, err
-	}
-	_ = json.Unmarshal(attrs, &t.Attributes)
-	_ = json.Unmarshal(stats, &t.Stats)
-	return t, nil
+	return ScanToken(h.pool.QueryRow(ctx, TokenSelectSQL+` where rm.room_id=$1 and rt.id=$2`, roomID, tokenID))
 }
 
 // PublishTokenUpdated notifies room clients to reload after an HTTP-side token change.

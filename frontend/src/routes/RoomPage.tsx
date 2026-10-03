@@ -2,7 +2,7 @@ import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { ArrowLeft, Circle, Eye, EyeSlash, MapTrifold, Trash, UsersThree } from "@phosphor-icons/react";
 import { apiFetch, connectRoomSocket, patchJSON, postJSON, requestId } from "../api/client";
-import type { ChatMessage, GameMap, Monster, RoomMember, ServerEnvelope, Sheet, VisibleRoomState } from "../api/types";
+import type { ChatMessage, GameMap, Monster, RoomMember, ServerEnvelope, Sheet, TokenPatch, VisibleRoomState } from "../api/types";
 import { useSession } from "../auth/SessionContext";
 import { MapCanvas, type MapSelection } from "../components/MapCanvas";
 import { ChatPanel } from "../components/ChatPanel";
@@ -10,6 +10,8 @@ import { CheckPromptForm } from "../components/CheckPromptForm";
 import { RoomChecks } from "../components/RoomChecks";
 import { PlayerName } from "../components/PlayerName";
 import { TokenAttacksEditor } from "../components/TokenAttacksEditor";
+import { TokenSettingsPanel } from "../components/TokenSettingsPanel";
+import { useToast } from "../components/Toast";
 import { defaultBlocksForKind, structureTypes, type StructureBlocks } from "../lib/structures";
 
 type Point = { x: number; y: number };
@@ -23,7 +25,7 @@ export function RoomPage() {
   const [sheets, setSheets] = useState<Sheet[]>([]);
   const [maps, setMaps] = useState<GameMap[]>([]);
   const [ruler, setRuler] = useState<number | undefined>();
-  const [error, setError] = useState("");
+  const [loadError, setLoadError] = useState("");
   const [connected, setConnected] = useState(false);
   const [busy, setBusy] = useState(false);
   const [sheet, setSheet] = useState("");
@@ -42,21 +44,25 @@ export function RoomPage() {
   const previousMapId = useRef("");
   const toolsToggleRef = useRef<HTMLButtonElement>(null);
   const wsRef = useRef<WebSocket | null>(null);
+  // Once the room has loaded, later failures become toasts instead of replacing the page.
+  const loaded = useRef(false);
+  const toast = useToast();
   const myMember = members.find((member) => member.user_id === user?.id);
   const isDM = !!myMember?.is_dm;
   // Characters usable at this table: the room's rule book, and for players only their own sheets.
   const roomSheets = sheets.filter((item) => item.rule_book_id === state?.room.rule_book.id && (isDM || item.user_id === user?.id));
   const currentMapId = state ? activeMapId(state) : "";
-  const movableTokenIds = useMemo(() => {
-    const ids = new Set<string>();
-    const tokens = isDM ? state?.visibleTokens : state?.ownTokens;
-    tokens?.forEach((token) => ids.add(token.id));
-    return ids;
-  }, [isDM, state?.visibleTokens, state?.ownTokens]);
-  const selectedToken = mapSelection?.kind === "token" ? state?.visibleTokens.find((token) => token.id === mapSelection.id) : undefined;
+  const movableTokenIds = useMemo(
+    () => new Set(state?.visibleTokens.filter((token) => token.can_move).map((token) => token.id)),
+    [state?.visibleTokens],
+  );
+  const selectedTokens = mapSelection?.kind === "tokens" ? state?.visibleTokens.filter((token) => mapSelection.ids.includes(token.id)) ?? [] : [];
+  const removableTokens = selectedTokens.filter((token) => isDM || token.owner_user_id === user?.id);
   const selectedStructure = mapSelection?.kind === "structure" ? state?.structures.find((structure) => structure.id === mapSelection.id) : undefined;
-  const selectedMapObject = selectedToken ?? selectedStructure;
-  const selectedMapObjectLabel = selectedToken?.name ?? selectedStructure?.kind;
+  const hasSelection = selectedTokens.length > 0 || !!selectedStructure;
+  const selectionHides = selectedTokens.length > 0 ? selectedTokens.some((token) => !token.is_hidden) : !selectedStructure?.is_hidden;
+  const canManageSelectedToken = selectedTokens.length === 1 && (isDM || selectedTokens[0].owner_user_id === user?.id);
+  const settingsToken = canManageSelectedToken ? selectedTokens[0] : undefined;
   const attackEditorToken = state?.visibleTokens.find((token) => token.id === attackEditorTokenId && token.attacks_editable);
 
   async function load() {
@@ -74,14 +80,18 @@ export function RoomPage() {
       setMaps(nextMaps ?? []);
       setSheet((current) => current || nextMembers?.find((member) => member.user_id === user?.id)?.sheet_id || "");
       setMapChoice((current) => current || activeMapId(nextState) || nextMaps?.[0]?.id || "");
+      loaded.current = true;
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Could not load this room.");
+      const message = err instanceof Error ? err.message : "Could not load this room.";
+      if (loaded.current) toast({ kind: "error", message });
+      else setLoadError(message);
     }
   }
 
   useEffect(() => {
     setState(null);
-    setError("");
+    setLoadError("");
+    loaded.current = false;
     void load();
   }, [roomId]);
 
@@ -107,10 +117,10 @@ export function RoomPage() {
         const message = event.body;
         setState((current) => current ? { ...current, chatHistory: [...(current.chatHistory ?? []), message] } : current);
       }
-      if (event.type === "token.moved" || event.type === "token.updated" || event.type === "structure.moved" || event.type === "structure.updated" || event.type === "structure.created" || event.type === "structure.removed" || event.type === "map.activated" || event.type === "vision.update" || event.type === "check.changed" || event.type === "state.snapshot") void load();
+      if (event.type === "token.moved" || event.type === "token.updated" || event.type === "token.removed" || event.type === "structure.moved" || event.type === "structure.updated" || event.type === "structure.created" || event.type === "structure.removed" || event.type === "map.activated" || event.type === "vision.update" || event.type === "check.changed" || event.type === "state.snapshot") void load();
       if (event.type === "ruler.result" && isMetersBody(event.body)) setRuler(Number(event.body.meters));
       if (event.type === "error" && isErrorBody(event.body)) {
-        setError(event.body.message);
+        toast({ kind: "error", message: event.body.message });
         void load();
       }
     });
@@ -122,7 +132,7 @@ export function RoomPage() {
     ws.onclose = () => {
       setConnected(false);
     };
-    ws.onerror = () => setError("The live connection was interrupted. Reload this room to reconnect.");
+    ws.onerror = () => toast({ kind: "error", message: "The live connection was interrupted. Reload this room to reconnect." });
     return () => {
       ws.onopen = null;
       ws.onclose = null;
@@ -142,18 +152,30 @@ export function RoomPage() {
       send(type, body);
       return true;
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Could not send the map action.");
+      toast({ kind: "error", message: err instanceof Error ? err.message : "Could not send the map action." });
       return false;
     }
   }
 
   function toggleSelectedVisibility() {
-    if (!isDM || !mapSelection || !selectedMapObject) return;
-    if (mapSelection.kind === "token") {
-      sendMap("token.visibility", { tokenId: mapSelection.id, isHidden: !selectedMapObject.is_hidden });
+    if (!isDM) return;
+    if (selectedTokens.length > 0) {
+      for (const token of selectedTokens) {
+        if (!sendMap("token.visibility", { tokenId: token.id, isHidden: selectionHides })) return;
+      }
       return;
     }
-    sendMap("structure.visibility", { structureId: mapSelection.id, isHidden: !selectedMapObject.is_hidden });
+    if (selectedStructure) sendMap("structure.visibility", { structureId: selectedStructure.id, isHidden: selectionHides });
+  }
+  function removeSelectedTokens() {
+    if (!confirmRemove) {
+      setConfirmRemove(true);
+      return;
+    }
+    for (const token of removableTokens) {
+      if (!sendMap("token.remove", { tokenId: token.id })) return;
+    }
+    setMapSelection(null);
   }
   function moveRoomStructure(structureId: string, geometry: Point[]) {
     if (!sendMap("structure.move", { structureId, geometry })) return;
@@ -162,20 +184,45 @@ export function RoomPage() {
       structures: current.structures.map((structure) => structure.id === structureId ? { ...structure, geometry } : structure),
     } : current);
   }
+  // Dropped tokens stay where they landed; a rejected move answers with an error, which reloads the room.
+  function moveRoomTokens(type: string, body: unknown, moves: { tokenId: string; to: Point }[]) {
+    if (!sendMap(type, body)) return;
+    setState((current) => current ? {
+      ...current,
+      visibleTokens: current.visibleTokens.map((token) => {
+        const move = moves.find((item) => item.tokenId === token.id);
+        return move ? { ...token, x_m: move.to.x, y_m: move.to.y } : token;
+      }),
+    } : current);
+  }
 
   const measure = useMemo(() => throttlePoint((from: Point, to: Point) => sendMap("ruler.measure", { from, to }), 100), [roomId]);
 
   async function update(action: () => Promise<unknown>) {
     setBusy(true);
-    setError("");
     try {
       await action();
       await load();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Could not update this room.");
+      toast({ kind: "error", message: err instanceof Error ? err.message : "Could not update this room." });
     } finally {
       setBusy(false);
     }
+  }
+
+  function patchToken(tokenId: string, patch: TokenPatch) {
+    return patchJSON(`/api/rooms/${roomId}/tokens/${tokenId}`, patch);
+  }
+
+  function uploadTokenImage(tokenId: string, file: File) {
+    void update(async () => {
+      const form = new FormData();
+      form.append("file", file);
+      form.append("name", file.name);
+      form.append("kind", "token");
+      const asset = await apiFetch<{ id: string }>("/api/assets", { method: "POST", body: form });
+      await patchToken(tokenId, { image_asset_id: asset.id });
+    });
   }
 
   function addToken(e: FormEvent) {
@@ -206,7 +253,7 @@ export function RoomPage() {
     });
   }
 
-  if (!state) return <div className="card space-y-4">{error ? <p role="alert" className="text-[var(--pink)]">{error}</p> : <p role="status">Setting your table…</p>}<Link className="text-sm text-[var(--accent)]" to="/rooms">Back to rooms</Link></div>;
+  if (!state) return <div className="card space-y-4">{loadError ? <p role="alert" className="text-[var(--pink)]">{loadError}</p> : <p role="status">Setting your table…</p>}<Link className="text-sm text-[var(--accent)]" to="/rooms">Back to rooms</Link></div>;
 
   return <div className="workspace-page">
     <header>
@@ -214,7 +261,6 @@ export function RoomPage() {
       <div className="flex flex-wrap items-center justify-between gap-4"><h1 className="page-heading min-w-0 break-words">{state.room.name}</h1><p role="status" className="flex items-center gap-2 text-sm text-[var(--muted)]"><Circle size={8} weight="fill" className={connected ? "text-[var(--green)]" : "text-[var(--pink)]"} aria-hidden="true" />{connected ? "Live at the table" : "Not connected"}</p></div>
       <p className="text-muted mt-3 break-all text-sm">Rule book <span className="ml-2 text-[var(--lavender)]">{state.room.rule_book.name}</span><span className="mx-3" aria-hidden="true">·</span>Invite your party with <span className="ml-2 select-all font-mono text-[var(--paper)]">{state.room.invite_code}</span></p>
     </header>
-    {error && <p role="alert" className="rounded-lg border border-[var(--pink)]/30 p-4 text-sm text-[var(--pink)]">{error}</p>}
     <div className="grid grid-cols-[minmax(0,1fr)] items-start gap-4 md:grid-cols-[240px_minmax(0,1fr)] md:gap-6 2xl:grid-cols-[240px_minmax(0,1fr)_280px]">
       <div className="sticky top-4 z-30 col-start-1 row-start-1 min-w-0 md:row-span-2" onKeyDown={(event) => {
         if (event.key === "Escape" && toolsOpen) {
@@ -230,6 +276,10 @@ export function RoomPage() {
             setToolsOpen(false);
             toolsToggleRef.current?.focus();
           }}>Close tools</button>
+        {settingsToken && <TokenSettingsPanel key={settingsToken.id} token={settingsToken} isDM={isDM} canEditImage={canManageSelectedToken} members={members} busy={busy}
+          onSave={(patch) => void update(() => patchToken(settingsToken.id, patch))}
+          onUploadImage={(file) => uploadTokenImage(settingsToken.id, file)}
+          onClearImage={() => void update(() => patchToken(settingsToken.id, { image_asset_id: null }))} />}
         {isDM && <form className="card space-y-4 p-5!" onSubmit={attachMap}>
           <h2 className="flex items-center gap-2 text-xl"><MapTrifold size={22} className="text-[var(--accent)]" aria-hidden="true" />Room map</h2>
           <p className="text-muted text-sm">Choose one of your maps and make it active at this table.</p>
@@ -262,7 +312,9 @@ export function RoomPage() {
           <button className="btn-secondary w-full" disabled={busy}>{busy ? "Saving…" : "Start blank map"}</button>
         </form>}
 
-        <form className="card space-y-3 p-5!" onSubmit={addToken}>
+        {!isDM && state.ownTokens.length > 0 ? <div className="card space-y-3 p-5!">
+          <p className="text-muted text-sm">Your character is on the map. Select it and choose Remove token to bring a different one.</p>
+        </div> : <form className="card space-y-3 p-5!" onSubmit={addToken}>
           <label className="field-label block" htmlFor={isDM ? "room-token-name" : "room-token-sheet"}>{isDM ? "Add a table token" : "Bring a character to the map"}</label>
           {isDM ? <>
             <input id="room-token-name" className="w-full" value={tokenName} onChange={(e) => setTokenName(e.target.value)} placeholder={monsterChoice ? `${monsters.find((item) => item.id === monsterChoice)?.name ?? "Monster"} (numbered automatically)` : "Token name"} />
@@ -290,7 +342,7 @@ export function RoomPage() {
           </div>
           {!isDM && roomSheets.length === 0 && <p className="text-muted text-sm">No {state.room.rule_book.name} characters yet. <Link className="text-[var(--accent)] underline underline-offset-4" to={`/sheets?room=${encodeURIComponent(state.room.id)}`}>Create a character</Link> to place a token.</p>}
           {isDM && <p className="text-muted text-sm">DM tokens do not require a character sheet. A monster token gets its own copy of the rule book's stat block and attacks; players never see its stats.</p>}
-        </form>
+        </form>}
 
         {isDM && <div className="card space-y-3 p-5!">
           <h2 className="text-xl">Place structure</h2>
@@ -328,16 +380,24 @@ export function RoomPage() {
       </div>
       <section className="col-start-1 row-start-2 min-w-0 space-y-3 md:col-start-2 md:row-start-1" aria-label="Tabletop">
           <div className="flex flex-wrap items-center justify-between gap-2"><h2 className="text-xl">{state.activeMap?.name ?? "The tabletop"}</h2><p className="text-muted text-xs">{state.metersPerGrid} m per grid square</p></div>
-          <p className="text-muted text-xs">{isDM ? "Right-click a structure without dragging to choose Move or Rotate mode from the wheel. The mode stays active for every structure until you change it. Left-drag structures to apply the chosen mode; hold Shift while rotating to snap to 15°. Left-drag tokens to move them. Click any token without dragging to pick one of its attacks, then click a target. Select an object to hide it from or reveal it to players. Hold the right mouse button and drag to measure distance; release to hide the ruler. Use Place structure to add walls, doors, windows, cover or terrain to this room's map, and select a structure to remove it; these changes stay in this room and never alter the saved map." : "Left-drag your own character tokens to move them. Click one without dragging to pick an attack and see its range, then click a highlighted target; the dice roll automatically. Walls and other attack-blocking structures stop attacks unless they let attacks pass. Hold the right mouse button and drag to measure distance; release to hide the ruler."}</p>
-          {isDM && <div className="grid grid-cols-1 items-center gap-3 rounded-lg border border-[var(--paper)]/10 bg-[var(--input)] px-3 py-2 sm:grid-cols-[minmax(0,1fr)_auto]" role="group" aria-label="Selected tabletop object">
-            {selectedMapObject
-              ? <p className="min-w-0 truncate text-sm text-[var(--paper)]"><span className="text-muted mr-2 text-xs uppercase tracking-[0.12em]">{mapSelection?.kind}</span>{selectedMapObjectLabel}<span className="text-muted ml-2 text-xs">{selectedMapObject.is_hidden ? "Hidden" : "Visible"}</span></p>
-              : <p className="text-muted min-w-0 truncate text-sm">Select a token or structure on the map to manage its visibility.</p>}
+          <p className="text-muted text-xs">{isDM ? "Left-drag a structure to move it. Drag the round handle above the selected structure to rotate it; hold Shift to snap to 15°. Drag a token to move it; it snaps to the grid. Drag across empty space to select several tokens, then drag one of them to move the group. Click any token without dragging to pick one of its attacks, then click a target. Select an object to hide it from or reveal it to players. Hold the right mouse button and drag to measure distance; release to hide the ruler. Use Place structure to add walls, doors, windows, cover or terrain to this room's map, and select a structure to remove it; these changes stay in this room and never alter the saved map." : "Drag a token to move it; it snaps to the grid. Drag across empty space to select several tokens, then drag one of them to move the group. Click a token you control without dragging to pick an attack and see its range, then click a highlighted target; the dice roll automatically. Walls and other attack-blocking structures stop attacks unless they let attacks pass. Hold the right mouse button and drag to measure distance; release to hide the ruler."}</p>
+          <div className="grid grid-cols-1 items-center gap-3 rounded-lg border border-[var(--paper)]/10 bg-[var(--input)] px-3 py-2 sm:grid-cols-[minmax(0,1fr)_auto]" role="group" aria-label="Selected tabletop object">
+            {selectedTokens.length === 1
+              ? <p className="min-w-0 truncate text-sm text-[var(--paper)]"><span className="text-muted mr-2 text-xs uppercase tracking-[0.12em]">token</span>{selectedTokens[0].name}{isDM && <span className="text-muted ml-2 text-xs">{selectedTokens[0].is_hidden ? "Hidden" : "Visible"}</span>}</p>
+              : selectedTokens.length > 1
+                ? <p className="min-w-0 truncate text-sm text-[var(--paper)]">{`${selectedTokens.length} tokens selected`}</p>
+                : selectedStructure
+                  ? <p className="min-w-0 truncate text-sm text-[var(--paper)]"><span className="text-muted mr-2 text-xs uppercase tracking-[0.12em]">structure</span>{selectedStructure.kind}<span className="text-muted ml-2 text-xs">{selectedStructure.is_hidden ? "Hidden" : "Visible"}</span></p>
+                  : <p className="text-muted min-w-0 truncate text-sm">{isDM ? "Select a token or structure on the map to manage it." : "Select your token on the map to manage it."}</p>}
             <div className="flex flex-wrap justify-end gap-2" role="group" aria-label="Selected object actions">
-              <button className={`btn-secondary min-h-9 shrink-0 px-3 py-1.5 text-xs${selectedMapObject ? "" : " invisible"}`} type="button" disabled={!selectedMapObject} aria-hidden={!selectedMapObject} onClick={toggleSelectedVisibility}>
-                {selectedMapObject?.is_hidden ? <Eye size={16} aria-hidden="true" /> : <EyeSlash size={16} aria-hidden="true" />}
-                {selectedMapObject?.is_hidden ? "Reveal to players" : "Hide from players"}
-              </button>
+              {isDM && <button className={`btn-secondary min-h-9 shrink-0 px-3 py-1.5 text-xs${hasSelection ? "" : " invisible"}`} type="button" disabled={!hasSelection} aria-hidden={!hasSelection} onClick={toggleSelectedVisibility}>
+                {selectionHides ? <EyeSlash size={16} aria-hidden="true" /> : <Eye size={16} aria-hidden="true" />}
+                {selectionHides ? "Hide from players" : "Reveal to players"}
+              </button>}
+              {removableTokens.length > 0 && <button className="btn-secondary min-h-9 shrink-0 px-3 py-1.5 text-xs" type="button" onClick={removeSelectedTokens}>
+                <Trash size={16} aria-hidden="true" />
+                {confirmRemove ? "Confirm remove" : removableTokens.length > 1 ? `Remove ${removableTokens.length} tokens` : "Remove token"}
+              </button>}
               {selectedStructure && <button className="btn-secondary min-h-9 shrink-0 px-3 py-1.5 text-xs" type="button" onClick={() => {
                 if (!confirmRemove) {
                   setConfirmRemove(true);
@@ -349,16 +409,17 @@ export function RoomPage() {
                 {confirmRemove ? "Confirm remove" : "Remove structure"}
               </button>}
             </div>
-          </div>}
+          </div>
           <MapCanvas
             state={state}
-            selectedTokenId={mapSelection?.kind === "token" ? mapSelection.id : undefined}
+            selectedTokenIds={mapSelection?.kind === "tokens" ? mapSelection.ids : undefined}
             selectedStructureId={mapSelection?.kind === "structure" ? mapSelection.id : undefined}
             movableTokenIds={movableTokenIds}
             canMoveStructures={isDM}
             rulerDistanceMeters={ruler}
             onSelect={setMapSelection}
-            onMoveToken={(tokenId, to, path) => sendMap("token.move", { tokenId, to, path })}
+            onMoveToken={(tokenId, to, path) => moveRoomTokens("token.move", { tokenId, to, path }, [{ tokenId, to }])}
+            onMoveTokens={(moves) => moveRoomTokens("tokens.move", { moves }, moves)}
             onMoveStructure={moveRoomStructure}
             onMeasure={measure}
             onAttack={(sourceTokenId, targetTokenId, attackId) => sendMap("attack.resolve", { sourceTokenId, targetTokenId, attackId })}

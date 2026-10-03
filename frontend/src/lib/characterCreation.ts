@@ -1,5 +1,12 @@
 import type { CharacterCreation, CreationRules, RuleBook } from "../api/types";
 
+export type CreationErrorGroup = "form" | "name" | "book" | "class" | `choice:${string}` | "points" | "values";
+
+/** A character-creation error shown at the top of the form group it belongs to. */
+export class CreationError extends Error {
+  constructor(message: string, readonly group: CreationErrorGroup) { super(message); }
+}
+
 export function creationLabel(name: string) {
   const words = name.replace(/([a-z0-9])([A-Z])/g, "$1 $2").replace(/[_-]+/g, " ");
   return words.charAt(0).toUpperCase() + words.slice(1);
@@ -55,7 +62,7 @@ function equalValue(left: unknown, right: unknown): boolean {
 export function validateManagedData(book: RuleBook, creation: CharacterCreation, data: Record<string, unknown>) {
   for (const [key, expected] of Object.entries(managedCharacterData(book, creation))) {
     if (Object.hasOwn(data, key) && !equalValue(data[key], expected)) {
-      throw new Error(`${creationLabel(key)} is set by your class or point allocation. Change it using the controls above, not the character JSON.`);
+      throw new CreationError(`${creationLabel(key)} is set by your class or point allocation. Change it using the controls above, not the character JSON.`, "values");
     }
   }
 }
@@ -63,11 +70,11 @@ export function validateManagedData(book: RuleBook, creation: CharacterCreation,
 export function validateCharacterCreation(book: RuleBook, creation: CharacterCreation) {
   const rules = book.creation_rules;
   const selected = rules.classes?.find((item) => item.id === creation.class_id);
-  if (rules.classes?.length && !selected) throw new Error("Choose a class for your character.");
+  if (rules.classes?.length && !selected) throw new CreationError("Choose a class for your character.", "class");
   for (const choice of selected?.choices ?? []) {
     const chosen = creation.choices?.[choice.attribute] ?? [];
     if (chosen.length !== choice.count || new Set(chosen).size !== chosen.length || chosen.some((option) => !choice.options.includes(option))) {
-      throw new Error(`${choice.label}: choose exactly ${choice.count} different options from the list.`);
+      throw new CreationError(`${choice.label}: choose exactly ${choice.count} different options from the list.`, `choice:${choice.attribute}`);
     }
   }
   const points = rules.point_buy;
@@ -76,11 +83,11 @@ export function validateCharacterCreation(book: RuleBook, creation: CharacterCre
   for (const attribute of points.attributes) {
     const score = creation.scores?.[attribute];
     const bonus = creation.bonuses?.[attribute] ?? 0;
-    if (score === undefined || !Number.isInteger(score) || score < points.min || score > points.max) throw new Error(`${creationLabel(attribute)} must have a base score from ${points.min} to ${points.max}.`);
-    if (!Number.isInteger(bonus) || bonus < 0 || bonus > points.bonus_max) throw new Error(`${creationLabel(attribute)} bonus must be from 0 to ${points.bonus_max}.`);
+    if (score === undefined || !Number.isInteger(score) || score < points.min || score > points.max) throw new CreationError(`${creationLabel(attribute)} must have a base score from ${points.min} to ${points.max}.`, "points");
+    if (!Number.isInteger(bonus) || bonus < 0 || bonus > points.bonus_max) throw new CreationError(`${creationLabel(attribute)} bonus must be from 0 to ${points.bonus_max}.`, "points");
     spent += points.costs[String(score)];
     bonuses += bonus;
   }
-  if (!Number.isFinite(spent) || spent > points.budget) throw new Error(`Your base scores exceed the ${points.budget}-point budget.`);
-  if (bonuses > points.bonus_budget) throw new Error(`Your bonuses exceed the ${points.bonus_budget}-point bonus budget.`);
+  if (!Number.isFinite(spent) || spent > points.budget) throw new CreationError(`Your base scores exceed the ${points.budget}-point budget.`, "points");
+  if (bonuses > points.bonus_budget) throw new CreationError(`Your bonuses exceed the ${points.bonus_budget}-point bonus budget.`, "points");
 }

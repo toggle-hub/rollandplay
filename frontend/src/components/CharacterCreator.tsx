@@ -4,7 +4,8 @@ import type { CharacterCreation, RuleBook } from "../api/types";
 import { fieldFromValue, objectFromFields, parseAttributes } from "../lib/attributeFields";
 import { CharacterValues } from "./CharacterValues";
 import { CharacterCreationControls } from "./CharacterCreationControls";
-import { completeCharacterData, freeCharacterData, initialCreation, managedCharacterData, validateCharacterCreation, validateManagedData } from "../lib/characterCreation";
+import { completeCharacterData, CreationError, freeCharacterData, initialCreation, managedCharacterData, validateCharacterCreation, validateManagedData, type CreationErrorGroup } from "../lib/characterCreation";
+import { useToast } from "./Toast";
 
 function fieldsFromData(data: Record<string, unknown>) {
   return Object.entries(data).map(([key, value]) => fieldFromValue(key, value));
@@ -30,11 +31,16 @@ export function CharacterCreator({ books, lockedBookId, onCreate }: Props) {
   const [json, setJson] = useState("");
   const [dirty, setDirty] = useState(false);
   const [busy, setBusy] = useState(false);
-  const [error, setError] = useState("");
+  const [error, setError] = useState<{ message: string; group: CreationErrorGroup } | null>(null);
+  const toast = useToast();
   const book = books.find((item) => item.id === bookId);
 
-  function reportError(err: unknown) {
-    setError(err instanceof SyntaxError ? "Character data must be valid JSON. Check your brackets and quotation marks." : err instanceof Error ? err.message : "Could not create the character.");
+  function reportError(err: unknown, fallbackGroup: CreationErrorGroup) {
+    const next = err instanceof CreationError ? { message: err.message, group: err.group }
+      : err instanceof SyntaxError ? { message: "Character data must be valid JSON. Check your brackets and quotation marks.", group: "values" as const }
+      : { message: err instanceof Error ? err.message : "Could not create the character.", group: fallbackGroup };
+    setError(next);
+    toast({ kind: "error", message: next.message });
   }
   function changeBook(id: string) {
     if (id === bookId) return;
@@ -46,7 +52,7 @@ export function CharacterCreator({ books, lockedBookId, onCreate }: Props) {
     setFields(fieldsFor(next, nextCreation));
     setJson(JSON.stringify(next ? completeCharacterData(next, nextCreation, {}) : {}, null, 2));
     setDirty(false);
-    setError("");
+    setError(null);
   }
   function changeClass(id: string) {
     if (!book || id === creation.class_id) return;
@@ -56,7 +62,7 @@ export function CharacterCreator({ books, lockedBookId, onCreate }: Props) {
     setFields(fieldsFor(book, next));
     setJson(JSON.stringify(completeCharacterData(book, next, {}), null, 2));
     setDirty(true);
-    setError("");
+    setError(null);
   }
   function changeCreation(next: CharacterCreation) {
     if (!book) return;
@@ -64,8 +70,8 @@ export function CharacterCreator({ books, lockedBookId, onCreate }: Props) {
       if (mode === "json") setJson(JSON.stringify({ ...parseAttributes(json, "Character data"), ...managedCharacterData(book, next) }, null, 2));
       setCreation(next);
       setDirty(true);
-      setError("");
-    } catch (err) { reportError(err); }
+      setError(null);
+    } catch (err) { reportError(err, "values"); }
   }
   function switchMode(next: typeof mode) {
     if (next === mode || !book) return;
@@ -80,18 +86,21 @@ export function CharacterCreator({ books, lockedBookId, onCreate }: Props) {
         setFields(fieldsFor(book, creation, completeCharacterData(book, creation, data)));
       }
       setMode(next);
-      setError("");
-    } catch (err) { reportError(err); }
+      setError(null);
+    } catch (err) { reportError(err, "values"); }
   }
   async function create(event: FormEvent) {
     event.preventDefault();
-    setError("");
+    setError(null);
+    let data: Record<string, unknown>;
     try {
-      if (!name.trim()) throw new Error("Give your character a name.");
-      if (!book) throw new Error("Choose a rule book for your character.");
+      if (!name.trim()) throw new CreationError("Give your character a name.", "name");
+      if (!book) throw new CreationError("Choose a rule book for your character.", "book");
       validateCharacterCreation(book, creation);
-      const data = mode === "json" ? parseAttributes(json, "Character data") : objectFromFields(fields, "Character data");
+      data = mode === "json" ? parseAttributes(json, "Character data") : objectFromFields(fields, "Character data");
       validateManagedData(book, creation, data);
+    } catch (err) { reportError(err, "values"); return; }
+    try {
       setBusy(true);
       await onCreate(name.trim(), book.id, completeCharacterData(book, creation, data), creation);
       setName("");
@@ -100,14 +109,18 @@ export function CharacterCreator({ books, lockedBookId, onCreate }: Props) {
       setFields(fieldsFor(book, nextCreation));
       setJson(JSON.stringify(completeCharacterData(book, nextCreation, {}), null, 2));
       setDirty(false);
-    } catch (err) { reportError(err); }
+    } catch (err) { reportError(err, "form"); }
     finally { setBusy(false); }
   }
+  const groupAlert = (group: CreationErrorGroup) => error?.group === group && <p role="alert" className="text-sm text-[var(--pink)]">{error.message}</p>;
 
   return <form id="character-creator" className="card min-w-0" onSubmit={create} noValidate aria-labelledby="character-creator-heading">
     <fieldset disabled={busy} className="min-w-0 space-y-5">
+      {groupAlert("form")}
       <div><h2 id="character-creator-heading" className="text-2xl">Create a character</h2><p className="text-muted text-sm leading-relaxed">Choose your rules, name your hero, and make their starting values your own.</p></div>
+      {groupAlert("name")}
       <label className="field-label" htmlFor="sheet-name">Character name<input id="sheet-name" required value={name} onChange={(e) => setName(e.target.value)} placeholder="A name to remember" /></label>
+      {groupAlert("book")}
       <label className="field-label" htmlFor="sheet-book">Rule book<select id="sheet-book" required value={bookId} disabled={!!lockedBookId} onChange={(e) => changeBook(e.target.value)}>
         <option value="" disabled>Choose a rule book</option>
         {books.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}
@@ -115,13 +128,13 @@ export function CharacterCreator({ books, lockedBookId, onCreate }: Props) {
       {books.length === 0 && <p className="text-muted text-sm">You’ll need a rule book first. <Link className="text-[var(--accent)] underline underline-offset-4" to="/rule-books">Create a rule book</Link>.</p>}
       {book && <>
         <p className="rounded-lg border border-[var(--line)] p-3 text-sm text-[var(--lavender)]">Starting values come from <strong>{book.name}</strong>. Your edits apply only to this character, not the rule book.</p>
-        <CharacterCreationControls rules={book.creation_rules} creation={creation} onChange={changeCreation} onClassChange={changeClass} />
+        <CharacterCreationControls rules={book.creation_rules} creation={creation} error={error} onChange={changeCreation} onClassChange={changeClass} />
         <div className="flex flex-wrap items-center justify-between gap-3"><h3 className="mb-0 text-lg">Character values</h3><div className="flex gap-2" role="group" aria-label="Character editor mode">
           <button type="button" className={mode === "inputs" ? "btn" : "btn-secondary"} aria-pressed={mode === "inputs"} onClick={() => switchMode("inputs")}>Inputs</button>
           <button type="button" className={mode === "json" ? "btn" : "btn-secondary"} aria-pressed={mode === "json"} onClick={() => switchMode("json")}>JSON</button>
         </div></div>
+        {groupAlert("values")}
       </>}
-      {error && <p role="alert" className="text-[var(--pink)]">{error}</p>}
       {book && (mode === "inputs" ? <>
         <p className="text-muted text-sm leading-relaxed">Set hit points and other character-specific values below. Class-granted values and point allocation are controlled above. Derived stats are not calculated automatically.</p>
         {fields.length === 0 && <p className="empty-state !p-5 text-sm">No other starting attributes. You can add custom character details below.</p>}

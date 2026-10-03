@@ -14,14 +14,15 @@ type VisibilityInput struct {
 	Structures []Structure
 }
 type VisibilityResult struct {
-	FogPolygon          []Point  `json:"fogPolygon"`
-	VisibleTokenIDs     []string `json:"visibleTokenIds"`
-	VisibleStructureIDs []string `json:"visibleStructureIds"`
+	Fog                 bool      `json:"fog"`
+	VisiblePolygons     [][]Point `json:"visiblePolygons"`
+	VisibleTokenIDs     []string  `json:"visibleTokenIds"`
+	VisibleStructureIDs []string  `json:"visibleStructureIds"`
 }
 
 func ComputeVisibility(input VisibilityInput) VisibilityResult {
 	if input.IsDM {
-		r := VisibilityResult{FogPolygon: []Point{{0, 0}, {input.MapWidthM, 0}, {input.MapWidthM, input.MapHeightM}, {0, input.MapHeightM}}}
+		r := VisibilityResult{VisiblePolygons: [][]Point{}}
 		for _, t := range input.Tokens {
 			r.VisibleTokenIDs = append(r.VisibleTokenIDs, t.ID)
 		}
@@ -30,16 +31,16 @@ func ComputeVisibility(input VisibilityInput) VisibilityResult {
 		}
 		return r
 	}
-	var polys [][]Point
+	r := VisibilityResult{Fog: true, VisiblePolygons: [][]Point{}}
 	visibleStruct := map[string]bool{}
 	visibleTok := map[string]bool{}
 	for _, t := range input.Tokens {
 		if t.OwnerUserID == input.UserID && !t.IsHidden {
-			poly := castFog(Point{t.X, t.Y}, t.RotationDeg, t.VisionAngleDeg, t.VisionRangeM, input.Structures)
-			polys = append(polys, poly)
+			origin := Point{t.X, t.Y}
+			r.VisiblePolygons = append(r.VisiblePolygons, castVision(origin, t.VisionRangeM, input.Structures))
 			visibleTok[t.ID] = true
 			for _, s := range input.Structures {
-				if structureVisible(Point{t.X, t.Y}, t, s) {
+				if structureVisible(origin, t, s) {
 					visibleStruct[s.ID] = true
 				}
 			}
@@ -47,17 +48,12 @@ func ComputeVisibility(input VisibilityInput) VisibilityResult {
 				if ot.IsHidden && ot.OwnerUserID != input.UserID {
 					continue
 				}
-				if InCone(Point{t.X, t.Y}, t.RotationDeg, t.VisionAngleDeg, t.VisionRangeM, Point{ot.X, ot.Y}) {
+				if inRange(origin, Point{ot.X, ot.Y}, t.VisionRangeM) {
 					visibleTok[ot.ID] = true
 				}
 			}
 		}
 	}
-	var fog []Point
-	if len(polys) > 0 {
-		fog = polys[0]
-	}
-	r := VisibilityResult{FogPolygon: fog}
 	for id := range visibleTok {
 		r.VisibleTokenIDs = append(r.VisibleTokenIDs, id)
 	}
@@ -69,41 +65,49 @@ func ComputeVisibility(input VisibilityInput) VisibilityResult {
 	return r
 }
 
+func inRange(origin, p Point, rangeM float64) bool { return DistanceMeters(origin, p) <= rangeM+1e-9 }
+
 func structureVisible(origin Point, tok Token, st Structure) bool {
 	if st.IsHidden {
 		return false
 	}
 	for _, p := range st.Geometry {
-		if InCone(origin, tok.RotationDeg, tok.VisionAngleDeg, tok.VisionRangeM, p) {
+		if inRange(origin, p, tok.VisionRangeM) {
 			return true
 		}
 	}
 	return false
 }
 
-func castFog(origin Point, rot, angle, rng float64, structures []Structure) []Point {
-	start := (rot - angle/2) * math.Pi / 180
-	end := (rot + angle/2) * math.Pi / 180
-	var angles []float64
-	for a := start; a <= end+1e-9; a += 2 * math.Pi / 180 {
-		angles = append(angles, a)
+// castVision returns the polygon a token sees: a full circle of radius rangeM around origin,
+// cut short wherever a visible, vision-blocking structure is in the way.
+func castVision(origin Point, rangeM float64, structures []Structure) []Point {
+	const steps = 180
+	angles := make([]float64, 0, steps)
+	for i := range steps {
+		angles = append(angles, float64(i)*2*math.Pi/steps)
+	}
+	normalize := func(a float64) float64 {
+		a = math.Mod(a, 2*math.Pi)
+		if a < 0 {
+			a += 2 * math.Pi
+		}
+		return a
 	}
 	for _, st := range structures {
 		if st.IsHidden || !st.BlocksVision {
 			continue
 		}
 		for _, p := range st.Geometry {
-			aa := math.Atan2(p.Y-origin.Y, p.X-origin.X)
-			if betweenAngle(aa, start, end) {
-				angles = append(angles, aa-0.0001, aa, aa+0.0001)
-			}
+			a := math.Atan2(p.Y-origin.Y, p.X-origin.X)
+			angles = append(angles, normalize(a-0.0001), normalize(a), normalize(a+0.0001))
 		}
 	}
 	sort.Float64s(angles)
-	poly := []Point{origin}
+	poly := make([]Point, 0, len(angles))
 	for _, a := range angles {
-		nearest := rng
-		hit := Point{origin.X + math.Cos(a)*rng, origin.Y + math.Sin(a)*rng}
+		nearest := rangeM
+		hit := Point{origin.X + math.Cos(a)*rangeM, origin.Y + math.Sin(a)*rangeM}
 		for _, st := range structures {
 			if st.IsHidden || !st.BlocksVision {
 				continue
@@ -118,14 +122,4 @@ func castFog(origin Point, rot, angle, rng float64, structures []Structure) []Po
 		poly = append(poly, hit)
 	}
 	return poly
-}
-
-func betweenAngle(a, start, end float64) bool {
-	for a < start {
-		a += 2 * math.Pi
-	}
-	for a > end {
-		a -= 2 * math.Pi
-	}
-	return a >= start-1e-9 && a <= end+1e-9
 }

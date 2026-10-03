@@ -5,6 +5,7 @@ import { apiFetch, patchJSON, postJSON } from "../api/client";
 import type { CharacterCreation, Room, RuleBook, Sheet } from "../api/types";
 import { useSession } from "../auth/SessionContext";
 import { CharacterCreator } from "../components/CharacterCreator";
+import { useToast } from "../components/Toast";
 
 export function SheetsPage() {
   const [sheets, setSheets] = useState<Sheet[]>([]);
@@ -12,7 +13,8 @@ export function SheetsPage() {
   const [room, setRoom] = useState<Room | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
-  const [notice, setNotice] = useState("");
+  const [renameError, setRenameError] = useState<{ id: string; message: string } | null>(null);
+  const toast = useToast();
   const [params] = useSearchParams();
   const roomId = params.get("room");
   const { session } = useSession();
@@ -22,37 +24,45 @@ export function SheetsPage() {
     const [nextSheets, nextBooks] = await Promise.all([apiFetch<Sheet[]>("/api/sheets"), apiFetch<RuleBook[]>("/api/rule-books")]);
     setSheets(nextSheets ?? []); setBooks(nextBooks ?? []);
   }
+  function reportPageError(message: string) {
+    setError(message);
+    toast({ kind: "error", message });
+  }
   async function loadRoom(id: string) {
     try { setRoom(await apiFetch<Room>(`/api/rooms/${id}`)); }
-    catch (err) { setError(`Could not open the room invite: ${err instanceof Error ? err.message : "unknown error"}`); }
+    catch (err) { reportPageError(`Could not open the room invite: ${err instanceof Error ? err.message : "unknown error"}`); }
   }
   useEffect(() => {
     setRoom(null); setLoading(true);
-    Promise.all([load(), roomId ? loadRoom(roomId) : null]).catch((err: Error) => setError(err.message)).finally(() => setLoading(false));
+    Promise.all([load(), roomId ? loadRoom(roomId) : null]).catch((err: Error) => reportPageError(err.message)).finally(() => setLoading(false));
   }, [roomId]);
   async function create(name: string, bookId: string, data: Record<string, unknown>, creation: CharacterCreation) {
     const sheet = await postJSON<Sheet>("/api/sheets", { name, rule_book_id: bookId, data, creation });
     setSheets((current) => [sheet, ...current]);
     if (!room) {
-      setNotice(`“${sheet.name}” created. Your character is ready to join a room.`);
+      toast({ kind: "success", message: `“${sheet.name}” created. Your character is ready to join a room.` });
       return;
     }
     try {
       await patchJSON(`/api/rooms/${room.id}/members/${userId}`, { sheet_id: sheet.id });
+      toast({ kind: "success", message: `“${sheet.name}” created and chosen for ${room.name}.` });
       nav(`/rooms/${room.id}`);
     } catch (err) {
-      setError(`“${sheet.name}” was created, but could not be chosen for ${room.name}: ${err instanceof Error ? err.message : "unknown error"}`);
+      reportPageError(`“${sheet.name}” was created, but could not be chosen for ${room.name}: ${err instanceof Error ? err.message : "unknown error"}`);
     }
   }
   async function rename(id: string, value: string) {
-    setError("");
+    setRenameError(null);
     try { await patchJSON(`/api/sheets/${id}`, { name: value }); await load(); }
-    catch (err) { setError(err instanceof Error ? err.message : "Could not save the name."); }
+    catch (err) {
+      const message = err instanceof Error ? err.message : "Could not save the name.";
+      setRenameError({ id, message });
+      toast({ kind: "error", message });
+    }
   }
   return <div className="workspace-page">
     <header><p className="eyebrow">A character worth becoming</p><h1 className="page-heading max-w-5xl">Character sheets</h1><p className="page-description">Give your heroes a name, a set of strengths, and a place in the story. Start with your rule book’s defaults and make them your own.</p></header>
     {error && <p role="alert" className="text-[var(--pink)]">{error}</p>}
-    {notice && <p role="status" className="text-[var(--green)]">{notice}</p>}
     {room && <section className="card space-y-2 border-[var(--accent)]/50" aria-labelledby="room-character-heading">
       <p className="eyebrow">Your seat is waiting</p>
       <h2 id="room-character-heading" className="text-2xl">Create a character for {room.name}</h2>
@@ -70,6 +80,7 @@ export function SheetsPage() {
           <h3 className="text-xl">Every legend begins with a name.</h3>
           <p className="text-muted mx-auto mt-3 max-w-sm text-sm">Choose a rule book and create a character to bring to your next room.</p>
         </div> : <div className="grid grid-flow-dense gap-4 md:grid-cols-2 xl:grid-cols-1">{sheets.map((sheet) => <article className="card min-w-0 space-y-4" key={sheet.id}>
+          {renameError?.id === sheet.id && <p role="alert" className="text-sm text-[var(--pink)]">{renameError.message}</p>}
           <label className="field-label block" htmlFor={`sheet-${sheet.id}`}>Character name</label>
           <input id={`sheet-${sheet.id}`} className="w-full" defaultValue={sheet.name} onBlur={(e) => { if (e.target.value !== sheet.name) void rename(sheet.id, e.target.value); }} />
           <p className="text-muted text-xs">Name saves when you leave the field.</p>

@@ -1,20 +1,22 @@
 import { useEffect, useRef, useState, type MouseEvent, type PointerEvent } from "react";
+import { assetURL } from "../api/client";
 import type { MapStructure, ResolvedTokenAttack, RoomToken, VisibleRoomState } from "../api/types";
 import { attackTargetStatus, type AttackTargetStatus } from "../lib/attacks";
 import { geometryCenter, rotateGeometry, type Point } from "../lib/geometryTransforms";
 import { structureLabel, templateGeometry } from "../lib/structures";
+import { clampTokenCenter, snapTokenCenter } from "../lib/tokenGrid";
 import { TokenAttackMenu } from "./TokenAttackMenu";
-import { TransformRadialMenu, type TransformMode } from "./TransformRadialMenu";
 
-export type MapSelection = { kind: "token" | "structure"; id: string };
+export type MapSelection = { kind: "tokens"; ids: string[] } | { kind: "structure"; id: string };
 type Props = {
   state: VisibleRoomState;
-  selectedTokenId?: string;
+  selectedTokenIds?: readonly string[];
   selectedStructureId?: string;
   movableTokenIds?: ReadonlySet<string>;
   canMoveStructures?: boolean;
   rulerDistanceMeters?: number;
   onMoveToken?: (tokenId: string, to: Point, path: Point[]) => void;
+  onMoveTokens?: (moves: { tokenId: string; to: Point }[]) => void;
   onMoveStructure?: (structureId: string, geometry: Point[]) => void;
   onMeasure?: (from: Point, to: Point) => void;
   onSelect?: (selection: MapSelection | null) => void;
@@ -24,6 +26,20 @@ type Props = {
   onPlaceStructure?: (geometry: Point[]) => void;
   onCancelPlacement?: () => void;
 };
+type TokenDrag = {
+  /** Every token moving together; the grabbed one leads and snaps to the grid. */
+  tokens: RoomToken[];
+  grabbed: RoomToken;
+  /** Pointer position relative to the grabbed token's center, so the token does not jump under the pointer. */
+  grabOffset: Point;
+  from: Point;
+  current: Point;
+  clientX: number;
+  clientY: number;
+  moved: boolean;
+};
+type Marquee = { from: Point; to: Point; clientX: number; clientY: number; moved: boolean };
+type TransformFrame = { box: Point[]; anchor: Point; handle: Point; center: Point };
 const n = (v: number | string | undefined, fallback = 0) =>
   typeof v === "number" ? v : v ? Number(v) : fallback;
 const tokenCenter = (token: RoomToken): Point => ({ x: n(token.x_m), y: n(token.y_m) });
@@ -32,15 +48,20 @@ const attackStatusColors: Record<AttackTargetStatus, string> = {
   blocked: "#ffa9a9",
   out_of_range: "#80738e",
 };
+const framePaddingPx = 6;
+const rotationHandleOffsetPx = 24;
+const rotationHandleRadiusPx = 7;
+const rotationHandleHitRadiusPx = 10;
 
 export function MapCanvas({
   state,
-  selectedTokenId,
+  selectedTokenIds,
   selectedStructureId,
   movableTokenIds,
   canMoveStructures = false,
   rulerDistanceMeters,
   onMoveToken,
+  onMoveTokens,
   onMoveStructure,
   onMeasure,
   onSelect,
@@ -51,23 +72,19 @@ export function MapCanvas({
   onCancelPlacement,
 }: Props) {
   const ref = useRef<HTMLCanvasElement>(null);
+  const fogLayer = useRef<HTMLCanvasElement | null>(null);
+  const images = useRef(new Map<string, HTMLImageElement>());
+  const [imageVersion, setImageVersion] = useState(0);
   const pointerActive = useRef(false);
   const rightGesture = useRef<{ from: Point; clientX: number; clientY: number; moved: boolean } | null>(null);
-  const [drag, setDrag] = useState<{
-    token: RoomToken;
-    from: Point;
-    current: Point;
-    clientX: number;
-    clientY: number;
-  } | null>(null);
+  const [drag, setDrag] = useState<TokenDrag | null>(null);
+  const [marquee, setMarquee] = useState<Marquee | null>(null);
   const [structureDrag, setStructureDrag] = useState<
     | { action: "move"; structure: MapStructure; from: Point; currentGeometry: Point[] }
-    | { action: "rotate"; structure: MapStructure; center: Point; startAngle: number | null; currentGeometry: Point[] }
+    | { action: "rotate"; structure: MapStructure; center: Point; startAngle: number; degrees: number; currentGeometry: Point[] }
     | null
   >(null);
   const [ruler, setRuler] = useState<{ from: Point; to: Point } | null>(null);
-  const [radialMenu, setRadialMenu] = useState<{ structureId: string; x: number; y: number } | null>(null);
-  const [transformMode, setTransformMode] = useState<TransformMode>("move");
   const [attackMenu, setAttackMenu] = useState<{ tokenId: string; x: number; y: number } | null>(null);
   const [rangePreview, setRangePreview] = useState<{ tokenId: string; rangeM: number } | null>(null);
   const [targeting, setTargeting] = useState<{ tokenId: string; attackId: string; hoverTokenId?: string; message?: string } | null>(null);
@@ -78,6 +95,9 @@ export function MapCanvas({
   const targetingAttack = targetingSource?.attacks?.find((attack) => attack.id === targeting?.attackId);
   const attackMenuToken = findToken(attackMenu?.tokenId);
   const previewToken = findToken(rangePreview?.tokenId);
+  const selectedStructure = canMoveStructures && selectedStructureId !== undefined
+    ? state.structures.find((structure) => structure.id === selectedStructureId)
+    : undefined;
   const scale = 24;
   const active = state.activeMap;
   const gridSize = n(active?.grid_size_m, n(state.metersPerGrid, 1));
@@ -91,12 +111,33 @@ export function MapCanvas({
       (event.clientY - rect.top) * (canvas.height / rect.height),
     );
   };
+  const mapWidth = n(active?.width_m, 30);
+  const mapHeight = n(active?.height_m, 30);
+  const isMovable = (token: RoomToken) => movableTokenIds?.has(token.id) ?? true;
+  // Where each dragged token lands: the grabbed token snaps to the grid and the rest keep their offsets to it.
+  function dragPositions(tokenDrag: TokenDrag, pointer: Point) {
+    const target = snapTokenCenter(
+      { x: pointer.x - tokenDrag.grabOffset.x, y: pointer.y - tokenDrag.grabOffset.y },
+      n(tokenDrag.grabbed.size_m, 1),
+      gridSize,
+      mapWidth,
+      mapHeight,
+    );
+    const dx = target.x - tokenDrag.from.x;
+    const dy = target.y - tokenDrag.from.y;
+    return new Map(tokenDrag.tokens.map((token) => [
+      token.id,
+      token.id === tokenDrag.grabbed.id
+        ? target
+        : clampTokenCenter({ x: n(token.x_m) + dx, y: n(token.y_m) + dy }, n(token.size_m, 1), mapWidth, mapHeight),
+    ]));
+  }
   useEffect(() => {
     const c = ref.current;
     if (!c) return;
     const ctx = c.getContext("2d")!;
-    const w = n(active?.width_m, 30) * scale;
-    const h = n(active?.height_m, 30) * scale;
+    const w = mapWidth * scale;
+    const h = mapHeight * scale;
     c.width = w;
     c.height = h;
     ctx.fillStyle = "#221c2b";
@@ -117,20 +158,55 @@ export function MapCanvas({
       ctx.stroke();
     }
     drawStructures(ctx, state.structures, scale, selectedStructureId, structureDrag);
-    if (state.visibility?.fogPolygon?.length) {
-      ctx.fillStyle = "rgba(20,16,25,.45)";
-      ctx.beginPath();
-      state.visibility.fogPolygon.forEach((p, i) => {
-        const q = toCanvas(p);
-        if (i === 0) ctx.moveTo(q.x, q.y);
-        else ctx.lineTo(q.x, q.y);
+    if (state.visibility?.fog) {
+      // Cut every token's sight out of an opaque layer, then lay that layer over the map.
+      const layer = fogLayer.current ??= document.createElement("canvas");
+      layer.width = w;
+      layer.height = h;
+      const fog = layer.getContext("2d")!;
+      fog.fillStyle = "rgba(12,10,16,.82)";
+      fog.fillRect(0, 0, w, h);
+      fog.globalCompositeOperation = "destination-out";
+      fog.fillStyle = "#000";
+      state.visibility.visiblePolygons.forEach((polygon) => {
+        fog.beginPath();
+        polygon.forEach((p, i) => {
+          const q = toCanvas(p);
+          if (i === 0) fog.moveTo(q.x, q.y);
+          else fog.lineTo(q.x, q.y);
+        });
+        fog.closePath();
+        fog.fill();
       });
-      ctx.closePath();
-      ctx.fill("evenodd");
+      fog.globalCompositeOperation = "source-over";
+      ctx.drawImage(layer, 0, 0);
     }
-    state.visibleTokens.forEach((t) =>
-      drawToken(ctx, t, scale, t.id === selectedTokenId),
-    );
+    let positions: Map<string, Point> | undefined;
+    if (drag?.moved) {
+      positions = dragPositions(drag, drag.current);
+      // Dashed outlines mark where the dragged tokens started.
+      ctx.strokeStyle = "#80738e";
+      ctx.lineWidth = 2;
+      ctx.setLineDash([5, 5]);
+      drag.tokens.forEach((token) => {
+        const center = toCanvas(tokenCenter(token));
+        ctx.beginPath();
+        ctx.arc(center.x, center.y, (n(token.size_m, 1) * scale) / 2, 0, Math.PI * 2);
+        ctx.stroke();
+      });
+      ctx.setLineDash([]);
+    }
+    state.visibleTokens.forEach((t) => {
+      const image = t.image_asset_id ? images.current.get(t.image_asset_id) : undefined;
+      drawToken(ctx, t, positions?.get(t.id) ?? tokenCenter(t), scale, !!selectedTokenIds?.includes(t.id), image);
+    });
+    const framed = canMoveStructures ? structureDrag?.structure ?? selectedStructure : undefined;
+    if (framed) {
+      const frame = structureDrag?.action === "rotate"
+        ? rotateFrame(structureFrame(structureDrag.structure.geometry, scale), structureDrag.degrees)
+        : structureFrame(structureDrag?.currentGeometry ?? framed.geometry, scale);
+      drawTransformFrame(ctx, frame, scale);
+    }
     if (placingKind && placementPoint) {
       ctx.strokeStyle = "#be8cff";
       ctx.lineWidth = 4;
@@ -179,14 +255,16 @@ export function MapCanvas({
         ctx.setLineDash([]);
       });
     }
-    if (drag) {
-      const a = toCanvas(drag.from),
-        b = toCanvas(drag.current);
-      ctx.strokeStyle = "#ffb887";
-      ctx.setLineDash([5, 5]);
+    if (marquee?.moved) {
+      const a = toCanvas(marquee.from),
+        b = toCanvas(marquee.to);
+      ctx.fillStyle = "rgba(190,140,255,.12)";
+      ctx.strokeStyle = "#be8cff";
+      ctx.lineWidth = 1;
+      ctx.setLineDash([6, 4]);
       ctx.beginPath();
-      ctx.moveTo(a.x, a.y);
-      ctx.lineTo(b.x, b.y);
+      ctx.rect(Math.min(a.x, b.x), Math.min(a.y, b.y), Math.abs(b.x - a.x), Math.abs(b.y - a.y));
+      ctx.fill();
       ctx.stroke();
       ctx.setLineDash([]);
     }
@@ -203,7 +281,17 @@ export function MapCanvas({
         ctx.fillText(`${rulerDistanceMeters.toFixed(2)} m`, b.x + 8, b.y - 8);
       }
     }
-  }, [state, selectedTokenId, selectedStructureId, canMoveStructures, rulerDistanceMeters, drag, structureDrag, ruler, rangePreview, targeting, placingKind, placementPoint, gridSize]);
+  }, [state, selectedTokenIds, selectedStructureId, canMoveStructures, rulerDistanceMeters, drag, marquee, structureDrag, ruler, rangePreview, targeting, placingKind, placementPoint, gridSize, imageVersion]);
+  useEffect(() => {
+    state.visibleTokens.forEach((token) => {
+      const id = token.image_asset_id;
+      if (!id || images.current.has(id)) return;
+      const image = new Image();
+      image.onload = () => setImageVersion((version) => version + 1);
+      image.src = assetURL(id);
+      images.current.set(id, image);
+    });
+  }, [state.visibleTokens]);
   useEffect(() => {
     if (!placingKind) {
       setPlacementPoint(null);
@@ -248,38 +336,23 @@ export function MapCanvas({
       if (hitsStructure(structure, point)) return structure;
     }
   }
-  const radialStructure = radialMenu
-    ? state.structures.find((structure) => structure.id === radialMenu.structureId)
-    : undefined;
-  function changeTransformMode(mode: TransformMode) {
-    setTransformMode(mode);
-    setRadialMenu(null);
-    ref.current?.focus({ preventScroll: true });
-  }
-  function openStructureWheel(event: MouseEvent<HTMLCanvasElement> | PointerEvent<HTMLCanvasElement>) {
-    const structure = pickMovableStructure(eventPoint(event));
-    if (!structure) return;
-    const rect = event.currentTarget.getBoundingClientRect();
-    onSelect?.({ kind: "structure", id: structure.id });
-    setRadialMenu({
-      structureId: structure.id,
-      x: event.clientX - rect.left,
-      y: event.clientY - rect.top,
-    });
+  function hitsRotationHandle(point: Point) {
+    if (!selectedStructure) return false;
+    const { handle } = structureFrame(selectedStructure.geometry, scale);
+    return Math.hypot(point.x - handle.x, point.y - handle.y) <= rotationHandleHitRadiusPx / scale;
   }
   function cancelPointerAction() {
     rightGesture.current = null;
     pointerActive.current = false;
     setDrag(null);
+    setMarquee(null);
     setStructureDrag(null);
     setRuler(null);
   }
   function finishRightGesture(event: MouseEvent<HTMLCanvasElement> | PointerEvent<HTMLCanvasElement>) {
-    const gesture = rightGesture.current;
-    if (!gesture) return;
+    if (!rightGesture.current) return;
     cancelPointerAction();
     event.currentTarget.style.cursor = "default";
-    if (!gesture.moved) openStructureWheel(event);
   }
   useEffect(() => {
     window.addEventListener("blur", cancelPointerAction);
@@ -292,21 +365,13 @@ export function MapCanvas({
         className="block h-auto w-full max-w-full touch-none rounded-xl border border-[var(--paper)]/15 bg-[var(--surface)] focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)]"
         role="img"
         tabIndex={0}
-        aria-label="Interactive tabletop map. Right-click a structure to choose persistent Move or Rotate mode. Drag structures in the chosen mode; hold Shift to snap rotation to 15 degrees. Drag tokens to move them. Click a token you control without dragging to choose an attack, then click a target. Hold the right mouse button and drag to measure distance; release to hide the ruler. While placing a structure, click the map to place it; press Escape to stop."
-        onContextMenu={(event) => {
-          event.preventDefault();
-          // Mouse contextmenu fires on press on some platforms and on release on
-          // others. Right-button clicks are resolved on release, after drag detection.
-          if (event.button === 2 || rightGesture.current) return;
-          setRadialMenu(null);
-          openStructureWheel(event);
-        }}
+        aria-label="Interactive tabletop map. Drag a structure to move it. Drag the round handle above the selected structure to rotate it; hold Shift to snap rotation to 15 degrees. Drag a token to move it; it snaps to the grid. Drag across empty space to select several tokens, then drag one of them to move the group. Click a token you control without dragging to choose an attack, then click a target. Hold the right mouse button and drag to measure distance; release to hide the ruler. Press Escape to cancel a drag. While placing a structure, click the map to place it; press Escape to stop."
+        onContextMenu={(event) => event.preventDefault()}
         onPointerDown={(event) => {
           if ((event.button !== 0 && event.button !== 2) || pointerActive.current) return;
           event.currentTarget.focus({ preventScroll: true });
           event.currentTarget.setPointerCapture?.(event.pointerId);
           pointerActive.current = true;
-          setRadialMenu(null);
           closeAttackMenu();
           const point = eventPoint(event);
           setRuler(null);
@@ -335,33 +400,48 @@ export function MapCanvas({
             }
             return;
           }
-          const token = pickToken(point, (candidate) => movableTokenIds?.has(candidate.id) ?? true);
+          if (selectedStructure && hitsRotationHandle(point)) {
+            const center = geometryCenter(selectedStructure.geometry);
+            setStructureDrag({
+              action: "rotate",
+              structure: selectedStructure,
+              center,
+              startAngle: Math.atan2(point.y - center.y, point.x - center.x),
+              degrees: 0,
+              currentGeometry: selectedStructure.geometry,
+            });
+            event.currentTarget.style.cursor = "grabbing";
+            return;
+          }
+          const token = pickToken(point, isMovable);
           if (token) {
-            setDrag({ token, from: tokenCenter(token), current: point, clientX: event.clientX, clientY: event.clientY });
-            onSelect?.({ kind: "token", id: token.id });
+            // Grabbing one token of a multi-token selection drags the whole selection.
+            const group = selectedTokenIds && selectedTokenIds.length > 1 && selectedTokenIds.includes(token.id) ? selectedTokenIds : undefined;
+            const tokens = group
+              ? state.visibleTokens.filter((candidate) => group.includes(candidate.id) && isMovable(candidate))
+              : [token];
+            const from = tokenCenter(token);
+            setDrag({
+              tokens,
+              grabbed: token,
+              grabOffset: { x: point.x - from.x, y: point.y - from.y },
+              from,
+              current: point,
+              clientX: event.clientX,
+              clientY: event.clientY,
+              moved: false,
+            });
+            if (!group) onSelect?.({ kind: "tokens", ids: [token.id] });
             return;
           }
           const structure = pickMovableStructure(point);
           if (structure) {
-            if (transformMode === "move") {
-              setStructureDrag({ action: "move", structure, from: point, currentGeometry: structure.geometry });
-            } else {
-              const center = geometryCenter(structure.geometry);
-              setStructureDrag({
-                action: "rotate",
-                structure,
-                center,
-                startAngle: Math.hypot(point.x - center.x, point.y - center.y) > 6 / scale
-                  ? Math.atan2(point.y - center.y, point.x - center.x)
-                  : null,
-                currentGeometry: structure.geometry,
-              });
-            }
-            event.currentTarget.style.cursor = transformMode === "rotate" ? "crosshair" : "grabbing";
+            setStructureDrag({ action: "move", structure, from: point, currentGeometry: structure.geometry });
+            event.currentTarget.style.cursor = "grabbing";
             onSelect?.({ kind: "structure", id: structure.id });
             return;
           }
-          onSelect?.(null);
+          setMarquee({ from: point, to: point, clientX: event.clientX, clientY: event.clientY, moved: false });
         }}
         onPointerMove={(event) => {
           const point = eventPoint(event);
@@ -390,13 +470,19 @@ export function MapCanvas({
               event.currentTarget.style.cursor = hover ? "crosshair" : "default";
               return;
             }
-            event.currentTarget.style.cursor = pickToken(point, (candidate) => movableTokenIds?.has(candidate.id) ?? true)
-              ? "move"
-              : pickMovableStructure(point) ? (transformMode === "rotate" ? "crosshair" : "move") : "default";
+            event.currentTarget.style.cursor = hitsRotationHandle(point)
+              ? "grab"
+              : pickToken(point, isMovable) || pickMovableStructure(point)
+                ? "move"
+                : "default";
             return;
           }
           if (drag) {
-            setDrag({ ...drag, current: point });
+            setDrag({ ...drag, current: point, moved: drag.moved || Math.hypot(event.clientX - drag.clientX, event.clientY - drag.clientY) >= 4 });
+            return;
+          }
+          if (marquee) {
+            setMarquee({ ...marquee, to: point, moved: marquee.moved || Math.hypot(event.clientX - marquee.clientX, event.clientY - marquee.clientY) >= 4 });
             return;
           }
           if (structureDrag) {
@@ -411,14 +497,11 @@ export function MapCanvas({
             } else {
               if (Math.hypot(point.x - structureDrag.center.x, point.y - structureDrag.center.y) <= 6 / scale) return;
               const angle = Math.atan2(point.y - structureDrag.center.y, point.x - structureDrag.center.x);
-              if (structureDrag.startAngle === null) {
-                setStructureDrag({ ...structureDrag, startAngle: angle });
-                return;
-              }
               let degrees = (angle - structureDrag.startAngle) * 180 / Math.PI;
               if (event.shiftKey) degrees = Math.round(degrees / 15) * 15;
               setStructureDrag({
                 ...structureDrag,
+                degrees,
                 currentGeometry: rotateGeometry(structureDrag.structure.geometry, degrees, structureDrag.center),
               });
             }
@@ -432,26 +515,50 @@ export function MapCanvas({
           }
           if (!pointerActive.current) return;
           if (drag) {
-            if (Math.hypot(event.clientX - drag.clientX, event.clientY - drag.clientY) >= 4) {
+            if (drag.moved || Math.hypot(event.clientX - drag.clientX, event.clientY - drag.clientY) >= 4) {
+              const positions = dragPositions(drag, eventPoint(event));
+              const to = positions.get(drag.grabbed.id)!;
+              if (to.x !== drag.from.x || to.y !== drag.from.y) {
+                if (drag.tokens.length === 1) onMoveToken?.(drag.grabbed.id, to, [drag.from, to]);
+                else onMoveTokens?.(drag.tokens.map((token) => ({ tokenId: token.id, to: positions.get(token.id)! })));
+              }
+            } else {
+              // A click on one token of a group selects just that token.
+              if (drag.tokens.length > 1) onSelect?.({ kind: "tokens", ids: [drag.grabbed.id] });
+              if (onAttack) {
+                const rect = event.currentTarget.getBoundingClientRect();
+                const firstAttack = drag.grabbed.attacks?.[0];
+                setAttackMenu({ tokenId: drag.grabbed.id, x: event.clientX - rect.left, y: event.clientY - rect.top });
+                setRangePreview(firstAttack ? { tokenId: drag.grabbed.id, rangeM: firstAttack.range_m } : null);
+              }
+            }
+          } else if (marquee) {
+            if (marquee.moved || Math.hypot(event.clientX - marquee.clientX, event.clientY - marquee.clientY) >= 4) {
               const to = eventPoint(event);
-              onMoveToken?.(drag.token.id, to, [drag.from, to]);
-            } else if (onAttack) {
-              const rect = event.currentTarget.getBoundingClientRect();
-              const firstAttack = drag.token.attacks?.[0];
-              setAttackMenu({ tokenId: drag.token.id, x: event.clientX - rect.left, y: event.clientY - rect.top });
-              setRangePreview(firstAttack ? { tokenId: drag.token.id, rangeM: firstAttack.range_m } : null);
+              const left = Math.min(marquee.from.x, to.x), right = Math.max(marquee.from.x, to.x);
+              const top = Math.min(marquee.from.y, to.y), bottom = Math.max(marquee.from.y, to.y);
+              const ids = state.visibleTokens
+                .filter((token) => {
+                  const center = tokenCenter(token);
+                  return isMovable(token) && center.x >= left && center.x <= right && center.y >= top && center.y <= bottom;
+                })
+                .map((token) => token.id);
+              onSelect?.(ids.length ? { kind: "tokens", ids } : null);
+            } else {
+              onSelect?.(null);
             }
           } else if (canMoveStructures && structureDrag && !sameGeometry(structureDrag.structure.geometry, structureDrag.currentGeometry)) {
             onMoveStructure?.(structureDrag.structure.id, structureDrag.currentGeometry);
           }
           pointerActive.current = false;
           setDrag(null);
+          setMarquee(null);
           setStructureDrag(null);
-          event.currentTarget.style.cursor = placingKind || (transformMode === "rotate" && canMoveStructures) ? "crosshair" : "default";
+          event.currentTarget.style.cursor = placingKind ? "crosshair" : "default";
         }}
         onPointerCancel={(event) => {
           cancelPointerAction();
-          event.currentTarget.style.cursor = transformMode === "rotate" && canMoveStructures ? "crosshair" : "default";
+          event.currentTarget.style.cursor = "default";
         }}
         onMouseUp={(event) => {
           // pointerup waits for the last held mouse button; mouseup does not.
@@ -462,23 +569,11 @@ export function MapCanvas({
         onKeyDown={(event) => {
           if (event.key !== "Escape") return;
           if (placingKind) onCancelPlacement?.();
-          setRadialMenu(null);
           closeAttackMenu();
           setTargeting(null);
           cancelPointerAction();
         }}
       />
-      {radialMenu && radialStructure && <TransformRadialMenu
-        x={radialMenu.x}
-        y={radialMenu.y}
-        label={radialStructure.kind}
-        mode={transformMode}
-        onModeChange={changeTransformMode}
-        onClose={() => {
-          setRadialMenu(null);
-          ref.current?.focus({ preventScroll: true });
-        }}
-      />}
       {attackMenu && attackMenuToken && <TokenAttackMenu
         x={attackMenu.x}
         y={attackMenu.y}
@@ -500,9 +595,6 @@ export function MapCanvas({
       </div> : targeting && targetingAttack && <div className="absolute left-1/2 top-3 z-30 flex -translate-x-1/2 items-center gap-3 rounded-lg border border-[var(--paper)]/15 bg-[var(--input)] px-3 py-2 text-xs text-[var(--paper)] shadow-xl" role="status" aria-live="polite">
         <span>{`${targetingAttack.name} · ${targetingAttack.range_m} m — click a highlighted target`}{targeting.message && ` · ${targeting.message}`}</span>
         <button className="shrink-0 text-[var(--accent)] underline underline-offset-4 hover:text-[var(--paper)]" type="button" onClick={cancelTargeting}>Cancel attack</button>
-      </div>}
-      {canMoveStructures && <div className="pointer-events-none absolute bottom-3 left-1/2 z-30 -translate-x-1/2 rounded-lg border border-[var(--paper)]/15 bg-[var(--input)] px-3 py-2 text-xs text-[var(--paper)] shadow-xl" role="status" aria-live="polite">
-        {transformMode === "move" ? "Move mode" : "Rotate mode"} · Drag a structure
       </div>}
     </div>
   );
@@ -529,24 +621,100 @@ function drawStructures(
     ctx.setLineDash([]);
   });
 }
+// Axis-aligned, padded bounding box with a rotation handle above its top edge,
+// or below the bottom edge when the structure hugs the top of the map.
+function structureFrame(geometry: Point[], scale: number): TransformFrame {
+  const xs = geometry.map((point) => point.x);
+  const ys = geometry.map((point) => point.y);
+  const padding = framePaddingPx / scale;
+  const left = Math.min(...xs) - padding;
+  const right = Math.max(...xs) + padding;
+  const top = Math.min(...ys) - padding;
+  const bottom = Math.max(...ys) + padding;
+  const handleAbove = top * scale - rotationHandleOffsetPx >= rotationHandleRadiusPx;
+  const anchor = { x: (left + right) / 2, y: handleAbove ? top : bottom };
+  return {
+    box: [{ x: left, y: top }, { x: right, y: top }, { x: right, y: bottom }, { x: left, y: bottom }],
+    anchor,
+    handle: { x: anchor.x, y: anchor.y + (handleAbove ? -1 : 1) * rotationHandleOffsetPx / scale },
+    center: geometryCenter(geometry),
+  };
+}
+function rotateFrame(frame: TransformFrame, degrees: number): TransformFrame {
+  const [anchor, handle, ...box] = rotateGeometry([frame.anchor, frame.handle, ...frame.box], degrees, frame.center);
+  return { box, anchor, handle, center: frame.center };
+}
+function drawTransformFrame(ctx: CanvasRenderingContext2D, frame: TransformFrame, scale: number) {
+  ctx.strokeStyle = "#f6effa";
+  ctx.lineWidth = 1;
+  ctx.setLineDash([4, 4]);
+  ctx.beginPath();
+  frame.box.forEach((point, index) => {
+    if (index === 0) ctx.moveTo(point.x * scale, point.y * scale);
+    else ctx.lineTo(point.x * scale, point.y * scale);
+  });
+  ctx.closePath();
+  ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.beginPath();
+  ctx.moveTo(frame.anchor.x * scale, frame.anchor.y * scale);
+  ctx.lineTo(frame.handle.x * scale, frame.handle.y * scale);
+  ctx.stroke();
+  ctx.fillStyle = "#be8cff";
+  ctx.beginPath();
+  ctx.arc(frame.handle.x * scale, frame.handle.y * scale, rotationHandleRadiusPx, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.stroke();
+}
 function drawToken(
   ctx: CanvasRenderingContext2D,
   t: RoomToken,
+  center: Point,
   scale: number,
   selected: boolean,
+  image?: HTMLImageElement,
 ) {
-  ctx.fillStyle = t.is_hidden ? "#80738e" : selected ? "#f6effa" : "#be8cff";
-  ctx.beginPath();
-  ctx.arc(
-    n(t.x_m) * scale,
-    n(t.y_m) * scale,
-    (n(t.size_m, 1) * scale) / 2,
-    0,
-    Math.PI * 2,
-  );
-  ctx.fill();
+  const cx = center.x * scale;
+  const cy = center.y * scale;
+  const r = (n(t.size_m, 1) * scale) / 2;
+  if (image?.complete && image.naturalWidth > 0) {
+    // Center-crop the image to a square and clip it to the token's circle.
+    const side = Math.min(image.naturalWidth, image.naturalHeight);
+    ctx.save();
+    ctx.beginPath();
+    ctx.arc(cx, cy, r, 0, Math.PI * 2);
+    ctx.clip();
+    ctx.drawImage(image, (image.naturalWidth - side) / 2, (image.naturalHeight - side) / 2, side, side, cx - r, cy - r, 2 * r, 2 * r);
+    ctx.restore();
+    if (t.is_hidden) {
+      ctx.fillStyle = "rgba(128,115,142,.5)";
+      ctx.beginPath();
+      ctx.arc(cx, cy, r, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.strokeStyle = selected ? "#f6effa" : t.is_hidden ? "#80738e" : "#be8cff";
+    ctx.lineWidth = selected ? 3 : 2;
+    ctx.beginPath();
+    ctx.arc(cx, cy, r, 0, Math.PI * 2);
+    ctx.stroke();
+  } else {
+    ctx.fillStyle = t.is_hidden ? "#80738e" : selected ? "#f6effa" : "#be8cff";
+    ctx.beginPath();
+    ctx.arc(cx, cy, r, 0, Math.PI * 2);
+    ctx.fill();
+  }
   ctx.fillStyle = t.is_hidden ? "#b8adc4" : "#f6effa";
-  ctx.fillText(`${t.name}${t.is_hidden ? " (hidden)" : ""}`, n(t.x_m) * scale + 8, n(t.y_m) * scale);
+  ctx.fillText(`${t.name}${t.is_hidden ? " (hidden)" : ""}`, cx + 8, cy);
+  if (t.max_hit_points !== undefined && t.max_hit_points > 0 && t.hit_points !== undefined) {
+    const width = Math.max(2 * r, 24);
+    const left = cx - width / 2;
+    const top = cy + r + 3;
+    const ratio = Math.min(1, Math.max(0, t.hit_points / t.max_hit_points));
+    ctx.fillStyle = "#40364c";
+    ctx.fillRect(left, top, width, 4);
+    ctx.fillStyle = ratio > 0.5 ? "#d9ffb5" : ratio > 0.25 ? "#ffb887" : "#ffa9a9";
+    ctx.fillRect(left, top, width * ratio, 4);
+  }
 }
 function hitsStructure(structure: MapStructure, point: Point) {
   const geometry = structure.geometry;

@@ -1,11 +1,12 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type MouseEvent, type PointerEvent, type ReactNode } from "react";
 import type { GameMap, MapStructure } from "../api/types";
 import { rotateGeometry, scaleGeometry, type Point } from "../lib/geometryTransforms";
-import { TransformRadialMenu, type TransformMode } from "./TransformRadialMenu";
+import { structureLabel } from "../lib/structures";
 
 type DraftStructure = Omit<MapStructure, "id" | "map_id"> & { id?: string; map_id?: string };
 type HoverState = { structure: MapStructure; canvasX: number; canvasY: number };
 export type TransformAction = "move" | "resize" | "rotate";
+export type StructureGeometryChange = { id: string; geometry: Point[] };
 type ResizeHandle = "nw" | "ne" | "se" | "sw";
 type GeometryFrame = {
   minX: number;
@@ -16,20 +17,30 @@ type GeometryFrame = {
 };
 type TransformState = {
   action: TransformAction;
-  id: string;
-  from: Point;
-  originalGeometry: Point[];
-  currentGeometry: Point[];
   draft: boolean;
+  from: Point;
+  original: StructureGeometryChange[];
+  current: StructureGeometryChange[];
+  /** Frame of the targets when the drag started; rotation draws it turned by `degrees`. */
+  frame: GeometryFrame;
+  anchor: Point;
+  startValue: number;
+  degrees: number;
   moved: boolean;
-  anchor?: Point;
-  startValue?: number;
 };
-type HandleHit = { handle: ResizeHandle; anchor: Point };
+type HandleHit = { kind: "rotate" } | { kind: "resize"; handle: ResizeHandle; anchor: Point };
 type PanState = {
   x: number;
   y: number;
   camera: Point;
+  moved: boolean;
+};
+type MarqueeState = {
+  from: Point;
+  to: Point;
+  clientX: number;
+  clientY: number;
+  additive: boolean;
   moved: boolean;
 };
 
@@ -37,15 +48,17 @@ type Props = {
   map: GameMap;
   structures: MapStructure[];
   draftStructure?: DraftStructure | null;
-  selectedStructureId?: string;
+  /** Saved structures in the current selection. With none selected, the draft is the transform target. */
+  selectedStructureIds?: string[];
   controls?: ReactNode;
   selector?: ReactNode;
   disabled?: boolean;
-  onSelectStructure?: (structureId: string) => void;
-  onTransformStructure?: (structureId: string, geometry: Point[], action: TransformAction) => void;
+  onSelectStructures?: (structureIds: string[]) => void;
+  onTransformStructures?: (changes: StructureGeometryChange[], action: TransformAction) => void;
   onTransformDraft?: (geometry: Point[], action: TransformAction) => void;
   onTransformDraftEnd?: (originalGeometry: Point[], nextGeometry: Point[], action: TransformAction) => void;
   onMoveDraft?: (point: Point) => void;
+  onDeleteSelection?: () => void;
 };
 
 const scale = 24;
@@ -53,6 +66,11 @@ const defaultViewport = { width: 720, height: 420 };
 const initialCamera = { x: 72, y: 72 };
 const draftId = "__draft__";
 const dragThreshold = 3;
+/** Screen pixels between the top of the selection frame and the rotation handle. */
+const rotateHandleOffset = 28;
+const rotateHandleRadius = 7;
+const handleHitRadius = 12;
+const noSelection: string[] = [];
 const n = (value: number | string | undefined, fallback = 0) =>
   typeof value === "number" ? value : value ? Number(value) : fallback;
 const toCanvas = (point: Point) => ({ x: point.x * scale, y: point.y * scale });
@@ -63,43 +81,51 @@ export function MapEditorCanvas({
   map,
   structures,
   draftStructure,
-  selectedStructureId,
+  selectedStructureIds = noSelection,
   controls,
   selector,
   disabled = false,
-  onSelectStructure,
-  onTransformStructure,
+  onSelectStructures,
+  onTransformStructures,
   onTransformDraft,
   onTransformDraftEnd,
   onMoveDraft,
+  onDeleteSelection,
 }: Props) {
   const ref = useRef<HTMLCanvasElement>(null);
   const viewportRef = useRef<HTMLDivElement>(null);
   const shellRef = useRef<HTMLDivElement>(null);
   const pointerActive = useRef(false);
+  const spaceHeld = useRef(false);
   const transformRef = useRef<TransformState | null>(null);
   const panRef = useRef<PanState | null>(null);
+  const marqueeRef = useRef<MarqueeState | null>(null);
   const [hover, setHover] = useState<HoverState | null>(null);
   const [transform, setTransform] = useState<TransformState | null>(null);
-  const [pan, setPan] = useState<PanState | null>(null);
+  const [marquee, setMarquee] = useState<MarqueeState | null>(null);
   const [zoom, setZoom] = useState(0.85);
   const [camera, setCamera] = useState(initialCamera);
   const [viewportSize, setViewportSize] = useState(defaultViewport);
-  const [radialMenu, setRadialMenu] = useState<{ structureId: string; x: number; y: number } | null>(null);
-  const [transformMode, setTransformMode] = useState<TransformMode>("move");
   const items = useMemo(() => {
-    const saved = structures.map((structure) => transform && !transform.draft && transform.id === structure.id ? { ...structure, geometry: transform.currentGeometry } : structure);
+    const transformed = transform ? new Map(transform.current.map((change) => [change.id, change.geometry])) : null;
+    const saved = structures.map((structure) => {
+      const geometry = transform && !transform.draft ? transformed?.get(structure.id) : undefined;
+      return geometry ? { ...structure, geometry } : structure;
+    });
     if (!draftStructure?.geometry.length) return saved;
-    const draftGeometry = transform?.draft ? transform.currentGeometry : draftStructure.geometry;
+    const draftGeometry = transform?.draft ? transform.current[0].geometry : draftStructure.geometry;
     return [...saved, { ...draftStructure, id: draftId, geometry: draftGeometry } as MapStructure];
   }, [draftStructure, structures, transform]);
-  const activeSelection = useMemo(
-    () => items.find((structure) => structure.id === selectedStructureId) ?? items.find((structure) => structure.id === draftId),
-    [items, selectedStructureId],
-  );
-  const radialTarget = radialMenu
-    ? items.find((structure) => structure.id === radialMenu.structureId)
-    : undefined;
+  const selectedIds = useMemo(() => new Set(selectedStructureIds), [selectedStructureIds]);
+  const selectedItems = useMemo(() => items.filter((structure) => structure.id !== draftId && selectedIds.has(structure.id)), [items, selectedIds]);
+  const draftItem = items.find((structure) => structure.id === draftId);
+  const targets = selectedItems.length > 0 ? selectedItems : draftItem ? [draftItem] : [];
+  const targetFrame = targets.length > 0 ? geometryFrame(targets.flatMap((structure) => structure.geometry)) : null;
+  const marqueeIds = useMemo(() => {
+    if (!marquee?.moved) return null;
+    const rect = rectFromPoints(marquee.from, marquee.to);
+    return new Set(structures.filter((structure) => geometryIntersectsRect(structure.geometry, rect)).map((structure) => structure.id));
+  }, [marquee, structures]);
 
   const canvasPoint = (event: Pick<PointerEvent<HTMLCanvasElement> | MouseEvent<HTMLCanvasElement>, "currentTarget" | "clientX" | "clientY">) => {
     const rect = event.currentTarget.getBoundingClientRect();
@@ -109,7 +135,7 @@ export function MapEditorCanvas({
     };
   };
 
-  const shellPixels = (event: Pick<PointerEvent<HTMLCanvasElement> | MouseEvent<HTMLCanvasElement>, "currentTarget" | "clientX" | "clientY">) => {
+  const shellPixels = (event: Pick<PointerEvent<HTMLCanvasElement>, "currentTarget" | "clientX" | "clientY">) => {
     const rect = shellRef.current?.getBoundingClientRect() ?? event.currentTarget.getBoundingClientRect();
     return {
       x: event.clientX - rect.left,
@@ -225,56 +251,80 @@ export function MapEditorCanvas({
     ctx.stroke();
     ctx.setLineDash([]);
 
-    items.forEach((structure) => drawStructure(ctx, structure, structure.id === activeSelection?.id));
-    if (activeSelection) drawSelectionFrame(ctx, activeSelection.geometry, zoom, transformMode);
-  }, [activeSelection, camera, items, map.grid_size_m, map.height_m, map.width_m, transformMode, viewportSize, zoom]);
+    const highlighted = new Set(targets.map((structure) => structure.id));
+    marqueeIds?.forEach((id) => highlighted.add(id));
+    items.forEach((structure) => drawStructure(ctx, structure, highlighted.has(structure.id)));
+    if (transform?.action === "rotate") drawSelectionFrame(ctx, transform.frame, zoom, transform.degrees);
+    else if (targetFrame) drawSelectionFrame(ctx, targetFrame, zoom, 0);
+    if (marquee?.moved) drawMarquee(ctx, marquee, zoom);
+  }, [camera, items, map.grid_size_m, map.height_m, map.width_m, marquee, marqueeIds, targetFrame?.minX, targetFrame?.minY, targetFrame?.maxX, targetFrame?.maxY, targets.length, transform, viewportSize, zoom]);
 
-  const pickedStructure = (point: Point) => pickStructure([...items].reverse(), point);
+  const pickTarget = (point: Point) =>
+    pickStructure(selectedItems, point) ?? pickStructure([...items].reverse(), point);
+  const select = (ids: string[]) => {
+    if (ids.length === selectedStructureIds.length && ids.every((id) => selectedIds.has(id))) return;
+    onSelectStructures?.(ids);
+  };
   const updateTransform = (next: TransformState | null) => {
     transformRef.current = next;
     setTransform(next);
   };
+  const updateMarquee = (next: MarqueeState | null) => {
+    marqueeRef.current = next;
+    setMarquee(next);
+  };
   const clearPointerAction = () => {
     pointerActive.current = false;
     updateTransform(null);
+    updateMarquee(null);
     panRef.current = null;
-    setPan(null);
   };
   const cancelPointerAction = () => {
     const activeTransform = transformRef.current;
-    if (activeTransform?.draft && activeTransform.moved) onTransformDraft?.(activeTransform.originalGeometry, activeTransform.action);
+    if (activeTransform?.draft && activeTransform.moved) onTransformDraft?.(activeTransform.original[0].geometry, activeTransform.action);
     clearPointerAction();
   };
-  const beginTransform = (structure: MapStructure, action: TransformAction, point: Point, hit?: HandleHit) => {
-    const frame = geometryFrame(structure.geometry);
-    const next: TransformState = {
+  const beginTransform = (action: TransformAction, transformTargets: MapStructure[], point: Point, hit?: HandleHit) => {
+    const original = transformTargets.map((structure) => ({ id: structure.id, geometry: structure.geometry }));
+    const frame = geometryFrame(original.flatMap((change) => change.geometry));
+    const anchor = hit?.kind === "resize" ? hit.anchor : frame.center;
+    updateTransform({
       action,
-      id: structure.id,
+      draft: transformTargets[0]?.id === draftId,
       from: point,
-      originalGeometry: structure.geometry,
-      currentGeometry: structure.geometry,
-      draft: structure.id === draftId,
+      original,
+      current: original,
+      frame,
+      anchor,
+      startValue: action === "resize"
+        ? Math.hypot(point.x - anchor.x, point.y - anchor.y)
+        : Math.atan2(point.y - anchor.y, point.x - anchor.x),
+      degrees: 0,
       moved: false,
-      anchor: hit?.anchor ?? frame.center,
-      startValue: hit
-        ? Math.hypot(point.x - hit.anchor.x, point.y - hit.anchor.y)
-        : Math.atan2(point.y - frame.center.y, point.x - frame.center.x),
-    };
-    updateTransform(next);
-    if (!next.draft) onSelectStructure?.(next.id);
+    });
+  };
+  const cursorAt = (point: Point) => {
+    if (spaceHeld.current) return "grab";
+    if (targetFrame) {
+      const hit = hitSelectionHandle(targets, targetFrame, point, zoom);
+      if (hit) return cursorForHandle(hit);
+    }
+    if (pickTarget(point) || (targetFrame && pointInFrame(targetFrame, point, zoom))) return "move";
+    return "default";
   };
 
   useEffect(() => {
     if (!disabled) return;
     cancelPointerAction();
-    setRadialMenu(null);
   }, [disabled]);
 
-  const changeTransformMode = (mode: TransformMode) => {
-    setTransformMode(mode);
-    setRadialMenu(null);
-    ref.current?.focus({ preventScroll: true });
-  };
+  const helpText = transform
+    ? "Esc cancels the drag · Shift snaps rotation to 15° or locks moves to an axis"
+    : "Drag to move · corner squares resize · round handle rotates · drag empty space to select an area · Shift-click adds · Delete removes · right-drag or Space-drag pans";
+  const selectionLabel = selectedItems.length > 1
+    ? `${selectedItems.length} structures selected`
+    : selectedItems.length === 1 ? `${structureLabel(selectedItems[0].kind)} selected` : draftItem ? "Draft selected" : "Nothing selected";
+
   return (
     <div ref={shellRef} className="relative overflow-hidden rounded-2xl border border-[var(--accent)]/25 bg-[var(--input)] shadow-[0_24px_80px_rgba(0,0,0,0.35)]" data-testid="map-editor-shell">
       <div className="pointer-events-none absolute bottom-4 left-4 top-4 z-20 flex items-start">
@@ -316,62 +366,68 @@ export function MapEditorCanvas({
           role="img"
           tabIndex={0}
           aria-describedby="map-editor-transform-help"
-          aria-label="Infinite live map canvas. Right-click a structure to choose persistent Move or Rotate mode. Drag structures in the chosen mode. In Move mode, drag square handles to resize or click empty space to place the draft. In Rotate mode, drag around the structure center; Shift snaps to 15 degrees. Drag empty space to pan, or hold Control and scroll to zoom."
-          onContextMenu={(event) => {
-            event.preventDefault();
-            if (disabled) return;
-            const point = canvasPoint(event);
-            const structure = activeSelection && pointInSelectionFrame(activeSelection.geometry, point, zoom)
-              ? activeSelection
-              : pickedStructure(point);
-            if (!structure) {
-              setRadialMenu(null);
-              return;
-            }
-            if (structure.id !== draftId) onSelectStructure?.(structure.id);
-            const position = shellPixels(event);
-            setHover(null);
-            setRadialMenu({ structureId: structure.id, x: position.x, y: position.y });
-          }}
+          aria-label="Infinite live map canvas. Click a structure to select it, Shift-click to add or remove it from the selection, or drag across empty space to select every structure in an area. Selected structures move, resize and rotate together: drag inside the dashed frame to move, drag a square corner handle to resize, drag the round handle above the frame to rotate (Shift snaps to 15 degrees). Press Delete to remove the selection and Escape to clear it. Click empty space with nothing selected to place the draft. Drag with the right or middle mouse button, or hold Space and drag, to pan; hold Control and scroll to zoom."
+          onContextMenu={(event) => event.preventDefault()}
           onPointerDown={(event) => {
-            if (event.button !== 0 || disabled) return;
+            if (disabled || pointerActive.current) return;
+            const panGesture = event.button === 1 || event.button === 2 || (event.button === 0 && spaceHeld.current);
+            if (!panGesture && event.button !== 0) return;
             event.currentTarget.focus({ preventScroll: true });
             event.currentTarget.setPointerCapture?.(event.pointerId);
             pointerActive.current = true;
             setHover(null);
-            const point = canvasPoint(event);
-            setRadialMenu(null);
-            if (activeSelection) {
-              const hit = transformMode === "move" ? hitSelectionHandle(activeSelection.geometry, point, zoom) : null;
-              if (hit) {
-                beginTransform(activeSelection, "resize", point, hit);
-                event.currentTarget.style.cursor = cursorForHandle(hit);
-                return;
-              }
-              if (pointInSelectionFrame(activeSelection.geometry, point, zoom)) {
-                beginTransform(activeSelection, transformMode, point);
-                event.currentTarget.style.cursor = "grabbing";
-                return;
-              }
-            }
-            const picked = pickedStructure(point);
-            if (picked) {
-              beginTransform(picked, transformMode, point);
+            if (panGesture) {
+              panRef.current = { x: event.clientX, y: event.clientY, camera, moved: false };
               event.currentTarget.style.cursor = "grabbing";
               return;
             }
-            const nextPan = { x: event.clientX, y: event.clientY, camera, moved: false };
-            panRef.current = nextPan;
-            setPan(nextPan);
-            event.currentTarget.style.cursor = "grabbing";
+            const point = canvasPoint(event);
+            if (targetFrame) {
+              const hit = hitSelectionHandle(targets, targetFrame, point, zoom);
+              if (hit) {
+                beginTransform(hit.kind === "rotate" ? "rotate" : "resize", targets, point, hit);
+                event.currentTarget.style.cursor = hit.kind === "rotate" ? "grabbing" : cursorForHandle(hit);
+                return;
+              }
+            }
+            const picked = pickTarget(point);
+            if (picked && (event.shiftKey || event.ctrlKey || event.metaKey)) {
+              if (picked.id !== draftId) {
+                select(selectedIds.has(picked.id)
+                  ? selectedStructureIds.filter((id) => id !== picked.id)
+                  : [...selectedStructureIds, picked.id]);
+              }
+              pointerActive.current = false;
+              return;
+            }
+            if (picked) {
+              let transformTargets = targets;
+              if (picked.id === draftId) {
+                select([]);
+                transformTargets = [picked];
+              } else if (!selectedIds.has(picked.id)) {
+                select([picked.id]);
+                transformTargets = [picked];
+              }
+              beginTransform("move", transformTargets, point);
+              event.currentTarget.style.cursor = "grabbing";
+              return;
+            }
+            if (targetFrame && pointInFrame(targetFrame, point, zoom)) {
+              beginTransform("move", targets, point);
+              event.currentTarget.style.cursor = "grabbing";
+              return;
+            }
+            updateMarquee({ from: point, to: point, clientX: event.clientX, clientY: event.clientY, additive: event.shiftKey || event.ctrlKey || event.metaKey, moved: false });
           }}
           onPointerMove={(event) => {
             if (disabled) return;
             const point = canvasPoint(event);
             const activeTransform = transformRef.current;
             if (pointerActive.current && activeTransform) {
-              if (Math.hypot(point.x - activeTransform.from.x, point.y - activeTransform.from.y) * scale * zoom < dragThreshold && !activeTransform.moved) return;
-              let nextGeometry: Point[];
+              if (!activeTransform.moved && Math.hypot(point.x - activeTransform.from.x, point.y - activeTransform.from.y) * scale * zoom < dragThreshold) return;
+              let degrees = 0;
+              let transformGeometry: (geometry: Point[]) => Point[];
               if (activeTransform.action === "move") {
                 let dx = point.x - activeTransform.from.x;
                 let dy = point.y - activeTransform.from.y;
@@ -379,53 +435,39 @@ export function MapEditorCanvas({
                   if (Math.abs(dx) >= Math.abs(dy)) dy = 0;
                   else dx = 0;
                 }
-                nextGeometry = moveGeometry(activeTransform.originalGeometry, dx, dy);
+                transformGeometry = (geometry) => moveGeometry(geometry, dx, dy);
               } else if (activeTransform.action === "resize") {
-                const anchor = activeTransform.anchor!;
-                const initialDistance = Math.max(activeTransform.startValue ?? 0, 0.001);
-                const nextDistance = Math.hypot(point.x - anchor.x, point.y - anchor.y);
-                nextGeometry = scaleGeometry(activeTransform.originalGeometry, Math.max(0.08, nextDistance / initialDistance), anchor);
+                const anchor = activeTransform.anchor;
+                const factor = Math.max(0.08, Math.hypot(point.x - anchor.x, point.y - anchor.y) / Math.max(activeTransform.startValue, 0.001));
+                transformGeometry = (geometry) => scaleGeometry(geometry, factor, anchor);
               } else {
-                const center = activeTransform.anchor!;
-                const startAngle = activeTransform.startValue ?? 0;
-                const nextAngle = Math.atan2(point.y - center.y, point.x - center.x);
-                let degrees = (nextAngle - startAngle) * 180 / Math.PI;
+                const center = activeTransform.anchor;
+                degrees = (Math.atan2(point.y - center.y, point.x - center.x) - activeTransform.startValue) * 180 / Math.PI;
                 if (event.shiftKey) degrees = Math.round(degrees / 15) * 15;
-                nextGeometry = rotateGeometry(activeTransform.originalGeometry, degrees);
+                transformGeometry = (geometry) => rotateGeometry(geometry, degrees, center);
               }
-              const nextTransform = { ...activeTransform, currentGeometry: nextGeometry, moved: true };
-              updateTransform(nextTransform);
-              if (activeTransform.draft) onTransformDraft?.(nextGeometry, activeTransform.action);
+              const current = activeTransform.original.map((change) => ({ id: change.id, geometry: transformGeometry(change.geometry) }));
+              updateTransform({ ...activeTransform, current, degrees, moved: true });
+              if (activeTransform.draft) onTransformDraft?.(current[0].geometry, activeTransform.action);
               return;
             }
-            if (pointerActive.current && (panRef.current ?? pan)) {
-              const activePan = panRef.current ?? pan!;
+            const activePan = panRef.current;
+            if (pointerActive.current && activePan) {
               const dx = event.clientX - activePan.x;
               const dy = event.clientY - activePan.y;
-              if (Math.hypot(dx, dy) < dragThreshold && !activePan.moved) return;
+              if (!activePan.moved && Math.hypot(dx, dy) < dragThreshold) return;
+              activePan.moved = true;
               setCamera({ x: activePan.camera.x + dx, y: activePan.camera.y + dy });
-              if (!activePan.moved) {
-                const nextPan = { ...activePan, moved: true };
-                panRef.current = nextPan;
-                setPan(nextPan);
-              }
               return;
             }
-            if (activeSelection) {
-              const hit = transformMode === "move" ? hitSelectionHandle(activeSelection.geometry, point, zoom) : null;
-              if (hit) {
-                event.currentTarget.style.cursor = cursorForHandle(hit);
-                setHover(null);
-                return;
-              }
-              if (pointInSelectionFrame(activeSelection.geometry, point, zoom)) {
-                event.currentTarget.style.cursor = transformMode === "rotate" ? "crosshair" : "move";
-                setHover(null);
-                return;
-              }
+            const activeMarquee = marqueeRef.current;
+            if (pointerActive.current && activeMarquee) {
+              if (!activeMarquee.moved && Math.hypot(event.clientX - activeMarquee.clientX, event.clientY - activeMarquee.clientY) < dragThreshold) return;
+              updateMarquee({ ...activeMarquee, to: point, moved: true });
+              return;
             }
-            const picked = pickedStructure(point);
-            event.currentTarget.style.cursor = picked ? transformMode === "rotate" ? "crosshair" : "move" : "grab";
+            event.currentTarget.style.cursor = cursorAt(point);
+            const picked = targetFrame && hitSelectionHandle(targets, targetFrame, point, zoom) ? null : pickTarget(point);
             if (!picked) {
               setHover(null);
               return;
@@ -434,61 +476,77 @@ export function MapEditorCanvas({
             setHover({ structure: picked, canvasX: px.x, canvasY: px.y });
           }}
           onPointerUp={(event) => {
-            if (disabled) return;
+            if (disabled || !pointerActive.current) return;
             const activeTransform = transformRef.current;
-            const activePan = panRef.current ?? pan;
+            const activeMarquee = marqueeRef.current;
             if (activeTransform?.moved) {
               if (activeTransform.draft) {
-                onTransformDraft?.(activeTransform.currentGeometry, activeTransform.action);
-                onTransformDraftEnd?.(activeTransform.originalGeometry, activeTransform.currentGeometry, activeTransform.action);
+                const [original] = activeTransform.original;
+                const [current] = activeTransform.current;
+                onTransformDraft?.(current.geometry, activeTransform.action);
+                onTransformDraftEnd?.(original.geometry, current.geometry, activeTransform.action);
               } else {
-                onTransformStructure?.(activeTransform.id, activeTransform.currentGeometry, activeTransform.action);
+                onTransformStructures?.(activeTransform.current, activeTransform.action);
               }
-            } else if (activePan && !activePan.moved && transformMode === "move") {
-              onMoveDraft?.(canvasPoint(event));
+            } else if (activeMarquee?.moved) {
+              const base = activeMarquee.additive ? selectedStructureIds : [];
+              const inside = structures
+                .filter((structure) => geometryIntersectsRect(structure.geometry, rectFromPoints(activeMarquee.from, activeMarquee.to)))
+                .map((structure) => structure.id);
+              select([...base, ...inside.filter((id) => !base.includes(id))]);
+            } else if (activeMarquee && !activeMarquee.additive) {
+              if (selectedStructureIds.length > 0) select([]);
+              else onMoveDraft?.(activeMarquee.from);
             }
             clearPointerAction();
-            event.currentTarget.style.cursor = disabled ? "not-allowed" : "grab";
+            event.currentTarget.style.cursor = cursorAt(canvasPoint(event));
           }}
           onPointerCancel={(event) => {
             cancelPointerAction();
             setHover(null);
-            event.currentTarget.style.cursor = disabled ? "not-allowed" : "grab";
+            event.currentTarget.style.cursor = "default";
           }}
           onPointerLeave={() => {
             if (!pointerActive.current) setHover(null);
           }}
+          onBlur={() => {
+            spaceHeld.current = false;
+          }}
+          onKeyUp={(event) => {
+            if (event.key === " ") spaceHeld.current = false;
+          }}
           onKeyDown={(event) => {
-            if (event.key !== "Escape") return;
-            event.preventDefault();
-            setRadialMenu(null);
-            if (pointerActive.current) cancelPointerAction();
-            event.currentTarget.style.cursor = disabled ? "not-allowed" : "grab";
+            if (event.key === " ") {
+              event.preventDefault();
+              spaceHeld.current = true;
+              if (!pointerActive.current) event.currentTarget.style.cursor = "grab";
+              return;
+            }
+            if (event.key === "Escape") {
+              event.preventDefault();
+              if (pointerActive.current) cancelPointerAction();
+              else select([]);
+              event.currentTarget.style.cursor = "default";
+              return;
+            }
+            if ((event.key === "Delete" || event.key === "Backspace") && !disabled && !pointerActive.current && selectedItems.length > 0) {
+              event.preventDefault();
+              onDeleteSelection?.();
+            }
           }}
         />
       </div>
-      {radialMenu && radialTarget && <TransformRadialMenu
-        x={radialMenu.x}
-        y={radialMenu.y}
-        label={radialTarget.id === draftId ? "Draft structure" : radialTarget.kind}
-        mode={transformMode}
-        onModeChange={changeTransformMode}
-        onClose={() => {
-          setRadialMenu(null);
-          ref.current?.focus({ preventScroll: true });
-        }}
-      />}
       <div
         id="map-editor-transform-help"
         className="pointer-events-none absolute bottom-4 left-1/2 z-20 flex max-w-[calc(100%_-_2rem)] -translate-x-1/2 items-center gap-2 rounded-lg border border-[var(--paper)]/15 bg-[var(--input)] px-3 py-2 text-[11px] text-[var(--muted)] shadow-xl lg:max-w-[calc(100%_-_420px)]"
         role="status"
         aria-live="polite"
       >
-        <strong className="font-semibold text-[var(--paper)]">{transformMode === "move" ? "Move mode" : "Rotate mode"}</strong>
+        <strong className="shrink-0 font-semibold text-[var(--paper)]">{selectionLabel}</strong>
         <span aria-hidden="true">·</span>
-        <span className="hidden md:inline">{transform ? "Esc cancels drag" : transformMode === "rotate" ? "Drag around center · Shift snaps 15° · right-click to change mode" : "Drag to move · square handles resize · right-click to change mode"}</span>
+        <span className="hidden truncate md:inline">{helpText}</span>
       </div>
-      {hover && !transform && !radialMenu && <StructureTooltip hover={hover} viewportSize={viewportSize} />}
+      {hover && !transform && !marquee?.moved && <StructureTooltip hover={hover} viewportSize={viewportSize} />}
     </div>
   );
 }
@@ -514,32 +572,76 @@ function drawStructure(ctx: CanvasRenderingContext2D, structure: MapStructure, s
   ctx.setLineDash([]);
 }
 
-function drawSelectionFrame(ctx: CanvasRenderingContext2D, geometry: Point[], zoom: number, mode: TransformMode) {
-  if (geometry.length === 0) return;
-  const frame = geometryFrame(geometry);
-  const left = frame.minX * scale;
-  const top = frame.minY * scale;
-  const right = frame.maxX * scale;
-  const bottom = frame.maxY * scale;
+/** Draws the dashed frame, square resize handles and the round rotation handle, turned by `degrees` around the frame center. */
+function drawSelectionFrame(ctx: CanvasRenderingContext2D, frame: GeometryFrame, zoom: number, degrees: number) {
+  const turn = (point: Point) => toCanvas(degrees === 0 ? point : rotatePoint(point, frame.center, degrees));
+  const corners = resizeHandles(frame).map(({ point }) => turn(point));
+  const topCenter = turn({ x: frame.center.x, y: frame.minY });
+  const handle = turn(rotateHandlePoint(frame, zoom));
   const handleSize = 10 / zoom;
 
   ctx.strokeStyle = "#f6effa";
   ctx.lineWidth = 1.5 / zoom;
   ctx.setLineDash([5 / zoom, 4 / zoom]);
   ctx.beginPath();
-  ctx.moveTo(left, top);
-  ctx.lineTo(right, top);
-  ctx.lineTo(right, bottom);
-  ctx.lineTo(left, bottom);
+  corners.forEach((corner, index) => {
+    if (index === 0) ctx.moveTo(corner.x, corner.y);
+    else ctx.lineTo(corner.x, corner.y);
+  });
   ctx.closePath();
   ctx.stroke();
   ctx.setLineDash([]);
 
-  if (mode !== "move") return;
+  ctx.beginPath();
+  ctx.moveTo(topCenter.x, topCenter.y);
+  ctx.lineTo(handle.x, handle.y);
+  ctx.stroke();
+
   ctx.fillStyle = "#f6effa";
-  for (const { point } of resizeHandles(frame)) {
-    ctx.fillRect(point.x * scale - handleSize / 2, point.y * scale - handleSize / 2, handleSize, handleSize);
+  for (const corner of corners) {
+    ctx.fillRect(corner.x - handleSize / 2, corner.y - handleSize / 2, handleSize, handleSize);
   }
+  ctx.fillStyle = "#be8cff";
+  ctx.lineWidth = 2 / zoom;
+  ctx.beginPath();
+  ctx.arc(handle.x, handle.y, rotateHandleRadius / zoom, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.stroke();
+}
+
+function drawMarquee(ctx: CanvasRenderingContext2D, marquee: MarqueeState, zoom: number) {
+  const rect = rectFromPoints(marquee.from, marquee.to);
+  const left = rect.minX * scale;
+  const top = rect.minY * scale;
+  const width = (rect.maxX - rect.minX) * scale;
+  const height = (rect.maxY - rect.minY) * scale;
+  ctx.fillStyle = "rgba(190,140,255,0.12)";
+  ctx.fillRect(left, top, width, height);
+  ctx.strokeStyle = "#be8cff";
+  ctx.lineWidth = 1 / zoom;
+  ctx.setLineDash([4 / zoom, 3 / zoom]);
+  ctx.beginPath();
+  ctx.moveTo(left, top);
+  ctx.lineTo(left + width, top);
+  ctx.lineTo(left + width, top + height);
+  ctx.lineTo(left, top + height);
+  ctx.closePath();
+  ctx.stroke();
+  ctx.setLineDash([]);
+}
+
+function rotatePoint(point: Point, center: Point, degrees: number): Point {
+  const radians = degrees * Math.PI / 180;
+  const dx = point.x - center.x;
+  const dy = point.y - center.y;
+  return {
+    x: center.x + dx * Math.cos(radians) - dy * Math.sin(radians),
+    y: center.y + dx * Math.sin(radians) + dy * Math.cos(radians),
+  };
+}
+
+function rotateHandlePoint(frame: GeometryFrame, zoom: number): Point {
+  return { x: frame.center.x, y: frame.minY - rotateHandleOffset / (scale * zoom) };
 }
 
 function geometryFrame(geometry: Point[]): GeometryFrame {
@@ -558,6 +660,10 @@ function geometryFrame(geometry: Point[]): GeometryFrame {
   return { minX, minY, maxX, maxY, center: { x: (minX + maxX) / 2, y: (minY + maxY) / 2 } };
 }
 
+function rectFromPoints(a: Point, b: Point): GeometryFrame {
+  return geometryFrame([a, b]);
+}
+
 function resizeHandles(frame: GeometryFrame) {
   return [
     { handle: "nw" as const, point: { x: frame.minX, y: frame.minY }, anchor: { x: frame.maxX, y: frame.maxY } },
@@ -567,27 +673,25 @@ function resizeHandles(frame: GeometryFrame) {
   ];
 }
 
-function hitSelectionHandle(geometry: Point[], point: Point, zoom: number): HandleHit | null {
-  if (geometry.length === 0) return null;
-  const frame = geometryFrame(geometry);
-  const radius = 12 / (scale * zoom);
+function hitSelectionHandle(targets: MapStructure[], frame: GeometryFrame, point: Point, zoom: number): HandleHit | null {
+  const radius = handleHitRadius / (scale * zoom);
+  const rotateHandle = rotateHandlePoint(frame, zoom);
+  if (Math.hypot(point.x - rotateHandle.x, point.y - rotateHandle.y) <= radius) return { kind: "rotate" };
+  // A lone two-point wall stretches from the grabbed endpoint while its other endpoint stays put.
+  const endpoints = targets.length === 1 && targets[0].geometry.length === 2 ? targets[0].geometry : null;
   for (const handle of resizeHandles(frame)) {
-    if (Math.hypot(point.x - handle.point.x, point.y - handle.point.y) <= radius) {
-      const endpointIndex = geometry.length === 2
-        ? geometry.findIndex((endpoint) => endpoint.x === handle.point.x && endpoint.y === handle.point.y)
-        : -1;
-      return {
-        handle: handle.handle,
-        anchor: endpointIndex === -1 ? handle.anchor : geometry[endpointIndex === 0 ? 1 : 0],
-      };
-    }
+    if (Math.hypot(point.x - handle.point.x, point.y - handle.point.y) > radius) continue;
+    const endpointIndex = endpoints ? endpoints.findIndex((endpoint) => endpoint.x === handle.point.x && endpoint.y === handle.point.y) : -1;
+    return {
+      kind: "resize",
+      handle: handle.handle,
+      anchor: endpoints && endpointIndex !== -1 ? endpoints[endpointIndex === 0 ? 1 : 0] : handle.anchor,
+    };
   }
   return null;
 }
 
-function pointInSelectionFrame(geometry: Point[], point: Point, zoom: number) {
-  if (geometry.length === 0) return false;
-  const frame = geometryFrame(geometry);
+function pointInFrame(frame: GeometryFrame, point: Point, zoom: number) {
   const padding = 10 / (scale * zoom);
   return point.x >= frame.minX - padding
     && point.x <= frame.maxX + padding
@@ -596,12 +700,39 @@ function pointInSelectionFrame(geometry: Point[], point: Point, zoom: number) {
 }
 
 function cursorForHandle(hit: HandleHit) {
+  if (hit.kind === "rotate") return "grab";
   return hit.handle === "nw" || hit.handle === "se" ? "nwse-resize" : "nesw-resize";
 }
 
 function pickStructure(structures: MapStructure[], point: Point) {
   const tolerance = 0.35;
   return structures.find((structure) => distanceToGeometry(point, structure.geometry) <= tolerance) ?? null;
+}
+
+function geometryIntersectsRect(geometry: Point[], rect: GeometryFrame) {
+  const inside = (point: Point) => point.x >= rect.minX && point.x <= rect.maxX && point.y >= rect.minY && point.y <= rect.maxY;
+  if (geometry.some(inside)) return true;
+  const corners = [
+    { x: rect.minX, y: rect.minY },
+    { x: rect.maxX, y: rect.minY },
+    { x: rect.maxX, y: rect.maxY },
+    { x: rect.minX, y: rect.maxY },
+  ];
+  for (let i = 1; i < geometry.length; i += 1) {
+    for (let edge = 0; edge < corners.length; edge += 1) {
+      if (segmentsIntersect(geometry[i - 1], geometry[i], corners[edge], corners[(edge + 1) % corners.length])) return true;
+    }
+  }
+  return false;
+}
+
+function segmentsIntersect(a: Point, b: Point, c: Point, d: Point) {
+  const cross = (o: Point, p: Point, q: Point) => (p.x - o.x) * (q.y - o.y) - (p.y - o.y) * (q.x - o.x);
+  const d1 = cross(c, d, a);
+  const d2 = cross(c, d, b);
+  const d3 = cross(a, b, c);
+  const d4 = cross(a, b, d);
+  return ((d1 > 0 && d2 < 0) || (d1 < 0 && d2 > 0)) && ((d3 > 0 && d4 < 0) || (d3 < 0 && d4 > 0));
 }
 
 function distanceToGeometry(point: Point, geometry: Point[]) {

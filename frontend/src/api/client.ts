@@ -66,6 +66,8 @@ export const patchJSON = <T>(path: string, body: unknown) =>
   apiFetch<T>(path, { method: "PATCH", body: JSON.stringify(body) });
 export const deleteJSON = <T>(path: string) =>
   apiFetch<T>(path, { method: "DELETE" });
+export const assetURL = (id: string) =>
+  apiURL(`/api/assets/${encodeURIComponent(id)}`);
 export function connectRoomSocket(
   roomId: string,
   onMessage: (event: ServerEnvelope) => void,

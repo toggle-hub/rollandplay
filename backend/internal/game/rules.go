@@ -1,6 +1,10 @@
 package game
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"math"
+	"slices"
+)
 
 type Structure struct {
 	ID             string          `json:"id"`
@@ -22,7 +26,6 @@ type Token struct {
 	RotationDeg      float64          `json:"rotation_deg"`
 	SizeM            float64          `json:"size_m"`
 	VisionRangeM     float64          `json:"vision_range_m"`
-	VisionAngleDeg   float64          `json:"vision_angle_deg"`
 	IsHidden         bool             `json:"is_hidden"`
 	Attributes       map[string]any   `json:"attributes"`
 	SheetID          string           `json:"sheet_id,omitempty"`
@@ -30,6 +33,31 @@ type Token struct {
 	Stats            map[string]any   `json:"-"` // sheet data when sheet-backed, else token attributes
 	Attacks          []ResolvedAttack `json:"attacks,omitempty"`
 	AttacksEditable  bool             `json:"attacks_editable,omitempty"`
+	ImageAssetID     string           `json:"image_asset_id,omitempty"`
+	MoverUserIDs     []string         `json:"mover_user_ids,omitempty"` // sent to game masters only
+	CanMove          bool             `json:"can_move,omitempty"`       // per viewer
+	HitPoints        *int             `json:"hit_points,omitempty"`     // per viewer: DM, owner, sheet owner
+	MaxHitPoints     *int             `json:"max_hit_points,omitempty"`
+}
+
+// MovableBy reports whether userID may move the token: its owner, the game master,
+// or a player the game master granted move rights.
+func (t Token) MovableBy(userID string, isDM bool) bool {
+	return isDM || t.OwnerUserID == userID || slices.Contains(t.MoverUserIDs, userID)
+}
+
+// Health reads current and maximum hit points from the token's stats; non-numeric values are nil.
+func (t Token) Health() (hp, max *int) {
+	return statInt(t.Stats, "hit_points"), statInt(t.Stats, "max_hit_points")
+}
+
+func statInt(stats map[string]any, key string) *int {
+	v, ok := stats[key].(float64)
+	if !ok || math.IsNaN(v) || math.IsInf(v, 0) {
+		return nil
+	}
+	n := int(math.Round(v))
+	return &n
 }
 
 func CanMove(path []Point, structures []Structure, token Token) bool {

@@ -69,7 +69,11 @@ func main() {
 	logger.Info("redis connected", zap.String("addr", cfg.RedisAddr))
 	auth.Init(pool, rdb, cfg)
 	go email.Sender{Redis: rdb, SMTPAddr: cfg.SMTPAddr, From: cfg.SMTPFrom, Username: cfg.SMTPUsername, Password: cfg.SMTPPassword, Logger: logger.Named("email")}.Run(ctx)
-	srv := &http.Server{Addr: cfg.HTTPAddr, Handler: httpapi.NewWithLogger(pool, rdb, cfg, logger).Handler(), ReadHeaderTimeout: 5 * time.Second}
+	api, err := httpapi.NewWithLogger(pool, rdb, cfg, logger)
+	if err != nil {
+		logger.Fatal("asset storage setup failed", zap.Error(err))
+	}
+	srv := &http.Server{Addr: cfg.HTTPAddr, Handler: api.Handler(), ReadHeaderTimeout: 5 * time.Second}
 	go func() {
 		<-ctx.Done()
 		logger.Info("shutdown requested")
@@ -80,7 +84,7 @@ func main() {
 		}
 		_ = metricsSrv.Shutdown(shutdownCtx)
 	}()
-	logger.Info("rollandplay backend listening", zap.String("http_addr", cfg.HTTPAddr), zap.String("public_base_url", cfg.PublicBaseURL), zap.String("api_base_url", cfg.APIBaseURL), zap.String("asset_storage_dir", cfg.AssetStorageDir))
+	logger.Info("rollandplay backend listening", zap.String("http_addr", cfg.HTTPAddr), zap.String("public_base_url", cfg.PublicBaseURL), zap.String("api_base_url", cfg.APIBaseURL), zap.String("asset_storage_driver", cfg.AssetStorageDriver), zap.String("asset_storage_dir", cfg.AssetStorageDir))
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		logger.Fatal("server failed", zap.Error(err))
 	}

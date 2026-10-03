@@ -46,19 +46,6 @@ func PointInPolygon(p Point, poly Polygon) bool {
 	return inside
 }
 
-func InCone(origin Point, rotationDeg, angleDeg, rangeM float64, target Point) bool {
-	d := DistanceMeters(origin, target)
-	if d > rangeM+1e-9 {
-		return false
-	}
-	if angleDeg >= 360 {
-		return true
-	}
-	ang := math.Atan2(target.Y-origin.Y, target.X-origin.X) * 180 / math.Pi
-	diff := math.Mod(ang-rotationDeg+540, 360) - 180
-	return math.Abs(diff) <= angleDeg/2+1e-9
-}
-
 func RaySegmentIntersection(origin Point, angleRad float64, seg Segment) (Point, bool, float64) {
 	r := Point{math.Cos(angleRad), math.Sin(angleRad)}
 	s := Point{seg.B.X - seg.A.X, seg.B.Y - seg.A.Y}

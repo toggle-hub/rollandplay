@@ -10,14 +10,8 @@ func TestSegmentIntersection(t *testing.T) {
 		t.Fatal("unexpected intersection")
 	}
 }
-func TestDistanceAndCone(t *testing.T) {
+func TestDistance(t *testing.T) {
 	if MeasureDistanceMeters(Point{0, 0}, Point{3, 4}) != 5 {
 		t.Fatal("distance")
-	}
-	if !InCone(Point{0, 0}, 0, 90, 10, Point{5, 1}) {
-		t.Fatal("point should be in cone")
-	}
-	if InCone(Point{0, 0}, 0, 45, 10, Point{0, 5}) {
-		t.Fatal("point should be outside cone")
 	}
 }

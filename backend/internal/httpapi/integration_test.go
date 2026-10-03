@@ -3,10 +3,14 @@ package httpapi_test
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
+	"io"
+	"mime/multipart"
 	"net/http"
 	"net/http/cookiejar"
 	"net/http/httptest"
+	"net/textproto"
 	"net/url"
 	"os"
 	"reflect"
@@ -69,7 +73,12 @@ func newTestApp(t *testing.T) *testApp {
 		t.Fatal(err)
 	}
 	auth.Init(pool, rdb, cfg)
-	srv := httptest.NewServer(httpapi.New(pool, rdb, cfg).Handler())
+	cfg.AssetStorageDir = t.TempDir()
+	api, err := httpapi.New(pool, rdb, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(api.Handler())
 	t.Cleanup(func() { srv.Close(); rdb.Close(); pool.Close() })
 	return &testApp{server: srv, redis: rdb, cfg: cfg}
 }
@@ -474,6 +483,55 @@ func TestRoomListHidesRoomsYouHaveNotJoined(t *testing.T) {
 	}
 }
 
+func TestMapDeleteOwnerOnlyAndRefusedWhileAttached(t *testing.T) {
+	a := newTestApp(t)
+	owner, _ := login(t, a, "map-delete-owner@example.com")
+	editor, eu := login(t, a, "map-delete-editor@example.com")
+	outsider, _ := login(t, a, "map-delete-outsider@example.com")
+	loose := post[map[string]any](t, owner, a.server.URL, "/api/maps", map[string]any{"name": "Loose Map"})
+	loosePath := "/api/maps/" + loose["id"].(string)
+	post[map[string]any](t, owner, a.server.URL, loosePath+"/structures", map[string]any{"kind": "wall", "geometry": []map[string]float64{{"x": 1, "y": 0}, {"x": 1, "y": 5}}})
+	if status := statusOf(t, owner, "POST", a.server.URL+loosePath+"/editors", map[string]any{"user_id": eu["id"]}); status != 204 {
+		t.Fatalf("adding editor: status %d", status)
+	}
+	if status := statusOf(t, editor, "DELETE", a.server.URL+loosePath, nil); status != 403 {
+		t.Fatalf("editor deleted a map they do not own: status %d", status)
+	}
+	if status := statusOf(t, outsider, "DELETE", a.server.URL+loosePath, nil); status != 404 {
+		t.Fatalf("outsider delete of a private map should be not found: status %d", status)
+	}
+	if status := statusOf(t, owner, "DELETE", a.server.URL+loosePath, nil); status != 204 {
+		t.Fatalf("owner delete: status %d", status)
+	}
+	if status := statusOf(t, owner, "GET", a.server.URL+loosePath, nil); status != 404 {
+		t.Fatalf("deleted map still readable: status %d", status)
+	}
+	if status := statusOf(t, owner, "DELETE", a.server.URL+loosePath, nil); status != 404 {
+		t.Fatalf("second delete should be not found: status %d", status)
+	}
+
+	room := post[map[string]any](t, owner, a.server.URL, "/api/rooms", map[string]any{"name": "Map Delete Table"})
+	attached := post[map[string]any](t, owner, a.server.URL, "/api/maps", map[string]any{"name": "Attached Map"})
+	attachedPath := "/api/maps/" + attached["id"].(string)
+	post[map[string]any](t, owner, a.server.URL, "/api/rooms/"+room["id"].(string)+"/maps", map[string]any{"map_id": attached["id"], "is_active": true})
+	req, _ := http.NewRequest("DELETE", a.server.URL+attachedPath, nil)
+	res, err := owner.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	var body struct {
+		Error struct{ Code string } `json:"error"`
+	}
+	_ = json.NewDecoder(res.Body).Decode(&body)
+	if res.StatusCode != 409 || body.Error.Code != "map_in_use" {
+		t.Fatalf("deleting an attached map: status %d code %q", res.StatusCode, body.Error.Code)
+	}
+	if got := get[map[string]any](t, owner, a.server.URL, attachedPath); got["id"] != attached["id"] {
+		t.Fatalf("attached map should survive a refused delete: %+v", got)
+	}
+}
+
 func statusOf(t *testing.T, c *http.Client, method, url string, body any) int {
 	t.Helper()
 	b, _ := json.Marshal(body)
@@ -610,6 +668,30 @@ func TestRoomWebsocketMovementAndChat(t *testing.T) {
 	sendWS(t, dmWS, "chat.send", "dm-private", map[string]any{"text": "secret", "recipientUserIds": []string{pu["id"].(string)}})
 	if ev := readType(t, pWS, "chat.message"); !strings.Contains(fmtBody(ev), "secret") {
 		t.Fatalf("missing private chat: %+v", ev)
+	}
+
+	// A roll reaches each socket once; the message sent after it marks the end of its events.
+	sendWS(t, pWS, "chat.send", "roll-once", map[string]any{"rollExpression": "1d4"})
+	sendWS(t, pWS, "chat.send", "after-roll", map[string]any{"text": "after roll"})
+	rollEvents := 0
+	for deadline := time.Now().Add(5 * time.Second); ; {
+		if time.Now().After(deadline) {
+			t.Fatal("did not read the message sent after the roll")
+		}
+		_ = pWS.SetReadDeadline(time.Now().Add(time.Second))
+		var ev map[string]any
+		if err := pWS.ReadJSON(&ev); err != nil {
+			t.Fatal(err)
+		}
+		if ev["requestId"] == "after-roll" {
+			break
+		}
+		if ev["requestId"] == "roll-once" && (ev["type"] == "roll.result" || ev["type"] == "chat.message") {
+			rollEvents++
+		}
+	}
+	if rollEvents != 1 {
+		t.Fatalf("a roll should arrive once, got %d events", rollEvents)
 	}
 	_ = du
 }
@@ -1081,7 +1163,23 @@ func TestRuleBookMonsters(t *testing.T) {
 	if placed["attributes"].(map[string]any)["hit_points"] != float64(7) || len(attacks) != 2 || attacks[0].(map[string]any)["to_hit"] != float64(4) || placed["attacks_editable"] != true {
 		t.Fatalf("DM should see the goblin's stats and resolved attacks: %+v", placed)
 	}
-	if encoded, _ := json.Marshal(get[map[string]any](t, player, a.server.URL, roomPath+"/state")); strings.Contains(string(encoded), "hit_points") || strings.Contains(string(encoded), "Nimble") {
+	playerState := get[map[string]any](t, player, a.server.URL, roomPath+"/state")
+	for _, monster := range []map[string]any{first, second, named} {
+		for _, row := range playerState["visibleTokens"].([]any) {
+			token := row.(map[string]any)
+			if token["id"] != monster["id"] {
+				continue
+			}
+			attributes, _ := token["attributes"].(map[string]any)
+			_, hp := token["hit_points"]
+			_, maxHP := token["max_hit_points"]
+			_, statHP := attributes["hit_points"]
+			if hp || maxHP || statHP {
+				t.Fatalf("players must not receive monster health: %+v", token)
+			}
+		}
+	}
+	if encoded, _ := json.Marshal(playerState); strings.Contains(string(encoded), "Nimble") {
 		t.Fatalf("players must not receive monster stat blocks: %s", encoded)
 	}
 
@@ -1094,6 +1192,177 @@ func TestRuleBookMonsters(t *testing.T) {
 	roll := body["roll"].(map[string]any)
 	if body["body"] != "Goblin attacks Hero with Scimitar" || roll["expression"] != "1d20+4" || roll["damage"].(map[string]any)["expression"] != "1d6+2" {
 		t.Fatalf("placed goblin should attack with its SRD scimitar: %s", fmtBody(ev))
+	}
+}
+
+func TestRoomTokenControls(t *testing.T) {
+	a := newTestApp(t)
+	dm, _ := login(t, a, "controls-dm@example.com")
+	playerA, ua := login(t, a, "controls-a@example.com")
+	playerB, _ := login(t, a, "controls-b@example.com")
+	aID := ua["id"].(string)
+	rb := post[map[string]any](t, dm, a.server.URL, "/api/rule-books", map[string]any{"name": "Control Rules", "attributes": map[string]any{}, "is_public": true})
+	sheet := post[map[string]any](t, playerA, a.server.URL, "/api/sheets", map[string]any{"rule_book_id": rb["id"], "name": "Hero", "data": map[string]any{}})
+	room := post[map[string]any](t, dm, a.server.URL, "/api/rooms", map[string]any{"name": "Controls", "rule_book_id": rb["id"]})
+	roomID := room["id"].(string)
+	roomPath := "/api/rooms/" + roomID
+	post[map[string]any](t, playerA, a.server.URL, "/api/rooms/join", map[string]any{"invite_code": room["invite_code"]})
+	post[map[string]any](t, playerB, a.server.URL, "/api/rooms/join", map[string]any{"invite_code": room["invite_code"]})
+	gm := post[map[string]any](t, dm, a.server.URL, "/api/maps", map[string]any{"name": "Yard", "width_m": 10, "height_m": 10})
+	post[map[string]any](t, dm, a.server.URL, roomPath+"/maps", map[string]any{"map_id": gm["id"], "is_active": true})
+
+	request := func(c *http.Client, method, path string, body any) (int, map[string]any) {
+		t.Helper()
+		b, _ := json.Marshal(body)
+		req, _ := http.NewRequest(method, a.server.URL+path, bytes.NewReader(b))
+		req.Header.Set("Content-Type", "application/json")
+		res, err := c.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer res.Body.Close()
+		var out map[string]any
+		_ = json.NewDecoder(res.Body).Decode(&out)
+		return res.StatusCode, out
+	}
+	errorCode := func(out map[string]any) any {
+		e, _ := out["error"].(map[string]any)
+		return e["code"]
+	}
+	expectStatus := func(c *http.Client, method, path string, body any, want int) map[string]any {
+		t.Helper()
+		status, out := request(c, method, path, body)
+		if status != want {
+			t.Fatalf("%s %s %v: want %d, got %d %+v", method, path, body, want, status, out)
+		}
+		return out
+	}
+	stateToken := func(c *http.Client, id string) map[string]any {
+		t.Helper()
+		return entityByID(t, get[map[string]any](t, c, a.server.URL, roomPath+"/state")["visibleTokens"], id)
+	}
+
+	heroBody := map[string]any{"sheet_id": sheet["id"], "name": "Hero", "x_m": 1, "y_m": 1}
+	hero := expectStatus(playerA, "POST", roomPath+"/tokens", heroBody, 201)
+	if out := expectStatus(playerA, "POST", roomPath+"/tokens", heroBody, 409); errorCode(out) != "token_limit" {
+		t.Fatalf("second character should hit the token limit: %+v", out)
+	}
+	goblin := expectStatus(dm, "POST", roomPath+"/tokens", map[string]any{"name": "Goblin", "x_m": 3, "y_m": 2}, 201)
+	heroPath, goblinPath := roomPath+"/tokens/"+hero["id"].(string), roomPath+"/tokens/"+goblin["id"].(string)
+
+	// Health: only the game master sets it; a sheet-backed token writes it to the sheet.
+	expectStatus(playerA, "PATCH", heroPath, map[string]any{"hit_points": 5}, 403)
+	expectStatus(dm, "PATCH", heroPath, map[string]any{"hit_points": 5, "max_hit_points": 10}, 204)
+	if data := get[map[string]any](t, playerA, a.server.URL, "/api/sheets/"+sheet["id"].(string))["data"].(map[string]any); data["hit_points"] != float64(5) {
+		t.Fatalf("health should be written to the sheet: %+v", data)
+	}
+	if token := stateToken(playerA, hero["id"].(string)); token["hit_points"] != float64(5) || token["max_hit_points"] != float64(10) {
+		t.Fatalf("owner should see the token's health: %+v", token)
+	}
+	expectStatus(dm, "PATCH", heroPath, map[string]any{"max_hit_points": -1}, 400)
+
+	dmWS, aWS, bWS := dialWS(t, a, dm, roomID), dialWS(t, a, playerA, roomID), dialWS(t, a, playerB, roomID)
+	for _, conn := range []*websocket.Conn{dmWS, aWS, bWS} {
+		defer conn.Close()
+		readType(t, conn, "state.snapshot")
+	}
+	readReply := func(conn *websocket.Conn, typ, requestID string) map[string]any {
+		t.Helper()
+		for {
+			if ev := readType(t, conn, typ); ev["requestId"] == requestID {
+				return ev
+			}
+		}
+	}
+	expectError := func(conn *websocket.Conn, typ, id, code string, body any) {
+		t.Helper()
+		sendWS(t, conn, typ, id, body)
+		if ev := readType(t, conn, "error"); ev["requestId"] != id || ev["body"].(map[string]any)["code"] != code {
+			t.Fatalf("%s: want %s, got %+v", id, code, ev)
+		}
+	}
+
+	// Movers: the game master lets another player move a token, without sharing its other rights.
+	expectError(aWS, "token.move", "move-goblin", "forbidden", map[string]any{"tokenId": goblin["id"], "to": map[string]float64{"x": 4, "y": 2}})
+	expectStatus(dm, "PATCH", goblinPath, map[string]any{"mover_user_ids": []string{aID}}, 204)
+	if token := stateToken(playerA, goblin["id"].(string)); token["can_move"] != true || token["mover_user_ids"] != nil {
+		t.Fatalf("a mover should be able to move the goblin without seeing the mover list: %+v", token)
+	}
+	if movers, _ := stateToken(dm, goblin["id"].(string))["mover_user_ids"].([]any); len(movers) != 1 || movers[0] != aID {
+		t.Fatalf("the game master should see the goblin's movers: %+v", movers)
+	}
+	sendWS(t, aWS, "tokens.move", "group-move", map[string]any{"moves": []map[string]any{
+		{"tokenId": hero["id"], "to": map[string]float64{"x": 2.5, "y": 1.5}},
+		{"tokenId": goblin["id"], "to": map[string]float64{"x": 3.5, "y": 2.5}},
+	}})
+	readReply(aWS, "token.moved", "group-move")
+	if token := stateToken(dm, hero["id"].(string)); token["x_m"] != 2.5 || token["y_m"] != 1.5 {
+		t.Fatalf("group move did not move the hero: %+v", token)
+	}
+	if token := stateToken(dm, goblin["id"].(string)); token["x_m"] != 3.5 || token["y_m"] != 2.5 {
+		t.Fatalf("group move did not move the goblin: %+v", token)
+	}
+	expectStatus(dm, "PATCH", goblinPath, map[string]any{"mover_user_ids": []string{"7f0c6d1e-2b4a-4c39-9a51-0d8e3f6b2c17"}}, 400)
+
+	// Removal: owners remove their own tokens, movers do not.
+	expectError(bWS, "token.remove", "b-removes-hero", "forbidden", map[string]any{"tokenId": hero["id"]})
+	expectError(aWS, "token.remove", "a-removes-goblin", "forbidden", map[string]any{"tokenId": goblin["id"]})
+	sendWS(t, aWS, "token.remove", "a-removes-hero", map[string]any{"tokenId": hero["id"]})
+	if body := readReply(dmWS, "token.removed", "a-removes-hero")["body"].(map[string]any); body["token_id"] != hero["id"] {
+		t.Fatalf("wrong token removed: %+v", body)
+	}
+	hero = expectStatus(playerA, "POST", roomPath+"/tokens", heroBody, 201)
+	heroPath = roomPath + "/tokens/" + hero["id"].(string)
+
+	// Images: the owner uploads one and puts it on their token.
+	png, _ := base64.StdEncoding.DecodeString("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==")
+	var upload bytes.Buffer
+	form := multipart.NewWriter(&upload)
+	part, _ := form.CreatePart(textproto.MIMEHeader{"Content-Disposition": {`form-data; name="file"; filename="hero.png"`}, "Content-Type": {"image/png"}})
+	_, _ = part.Write(png)
+	_ = form.WriteField("name", "hero.png")
+	_ = form.WriteField("kind", "token")
+	_ = form.Close()
+	uploadReq, _ := http.NewRequest("POST", a.server.URL+"/api/assets", &upload)
+	uploadReq.Header.Set("Content-Type", form.FormDataContentType())
+	res, err := playerA.Do(uploadReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var asset map[string]any
+	_ = json.NewDecoder(res.Body).Decode(&asset)
+	res.Body.Close()
+	if res.StatusCode != 201 {
+		t.Fatalf("upload: status %d %+v", res.StatusCode, asset)
+	}
+	assetID := asset["id"].(string)
+	res, err = playerA.Get(a.server.URL + "/api/assets/" + assetID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	served, _ := io.ReadAll(res.Body)
+	res.Body.Close()
+	if res.StatusCode != 200 || res.Header.Get("Content-Type") != "image/png" || !bytes.Equal(served, png) {
+		t.Fatalf("asset should be served as uploaded: status %d type %q, %d bytes", res.StatusCode, res.Header.Get("Content-Type"), len(served))
+	}
+	expectStatus(playerA, "PATCH", heroPath, map[string]any{"image_asset_id": assetID}, 204)
+	if token := stateToken(playerA, hero["id"].(string)); token["image_asset_id"] != assetID {
+		t.Fatalf("token should carry its image: %+v", token)
+	}
+	if out := expectStatus(dm, "PATCH", goblinPath, map[string]any{"image_asset_id": assetID}, 400); errorCode(out) != "invalid_image" {
+		t.Fatalf("only the uploader may use an image: %+v", out)
+	}
+	expectStatus(playerA, "PATCH", heroPath, map[string]any{"image_asset_id": nil}, 204)
+	if token := stateToken(playerA, hero["id"].(string)); token["image_asset_id"] != nil {
+		t.Fatalf("null should clear the token's image: %+v", token)
+	}
+	res, err = http.Get(a.server.URL + "/api/assets/" + assetID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res.Body.Close()
+	if res.StatusCode != 401 {
+		t.Fatalf("assets need a session: status %d", res.StatusCode)
 	}
 }
 

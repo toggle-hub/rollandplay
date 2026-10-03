@@ -5,6 +5,8 @@ const canvasContext = {
   fillStyle: "",
   strokeStyle: "",
   lineWidth: 1,
+  globalCompositeOperation: "source-over",
+  globalAlpha: 1,
   setLineDash: vi.fn(),
   setTransform: vi.fn(),
   fillRect: vi.fn(),
@@ -16,6 +18,11 @@ const canvasContext = {
   fill: vi.fn(),
   arc: vi.fn(),
   fillText: vi.fn(),
+  save: vi.fn(),
+  restore: vi.fn(),
+  clip: vi.fn(),
+  rect: vi.fn(),
+  drawImage: vi.fn(),
 };
 Object.defineProperty(globalThis, "__canvasContext", { value: canvasContext });
 Object.defineProperty(HTMLCanvasElement.prototype, "getContext", {

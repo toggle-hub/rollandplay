@@ -40,17 +40,21 @@ type Server struct {
 	Logger *zap.Logger
 }
 
-func New(pool *pgxpool.Pool, rdb *redis.Client, cfg config.Config) *Server {
+func New(pool *pgxpool.Pool, rdb *redis.Client, cfg config.Config) (*Server, error) {
 	return NewWithLogger(pool, rdb, cfg, zap.NewNop())
 }
 
-func NewWithLogger(pool *pgxpool.Pool, rdb *redis.Client, cfg config.Config, logger *zap.Logger) *Server {
+func NewWithLogger(pool *pgxpool.Pool, rdb *redis.Client, cfg config.Config, logger *zap.Logger) (*Server, error) {
 	if logger == nil {
 		logger = zap.NewNop()
 	}
-	s := &Server{Pool: pool, Redis: rdb, Config: cfg, Assets: assets.Store{Dir: cfg.AssetStorageDir}, Logger: logger}
+	store, err := assets.New(cfg)
+	if err != nil {
+		return nil, err
+	}
+	s := &Server{Pool: pool, Redis: rdb, Config: cfg, Assets: store, Logger: logger}
 	s.Hub = ws.NewHubWithLogger(pool, rdb, logger.Named("websocket"))
-	return s
+	return s, nil
 }
 
 func (s *Server) Handler() http.Handler {
@@ -85,17 +89,20 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/maps", s.handleMapCreate)
 	mux.HandleFunc("GET /api/maps/{mapID}", s.handleMapGet)
 	mux.HandleFunc("PATCH /api/maps/{mapID}", s.handleMapPatch)
+	mux.HandleFunc("DELETE /api/maps/{mapID}", s.handleMapDelete)
 	mux.HandleFunc("POST /api/maps/{mapID}/editors", s.handleMapEditor)
 	mux.HandleFunc("POST /api/maps/{mapID}/structures", s.handleStructureCreate)
 	mux.HandleFunc("PATCH /api/maps/{mapID}/structures/{structureID}", s.handleStructurePatch)
 	mux.HandleFunc("DELETE /api/maps/{mapID}/structures/{structureID}", s.handleStructureDelete)
 	mux.HandleFunc("POST /api/assets", s.handleAssetUpload)
+	mux.HandleFunc("GET /api/assets/{assetID}", s.handleAssetGet)
 	mux.HandleFunc("POST /api/rooms/{roomID}/maps", s.handleRoomMapAttach)
 	mux.HandleFunc("POST /api/rooms/{roomID}/maps/new", s.handleRoomMapNew)
 	mux.HandleFunc("PATCH /api/rooms/{roomID}/maps/{roomMapID}", s.handleRoomMapPatch)
 	mux.HandleFunc("GET /api/rooms/{roomID}/state", s.handleRoomState)
 	mux.HandleFunc("POST /api/rooms/{roomID}/tokens", s.handleTokenCreate)
 	mux.HandleFunc("GET /api/rooms/{roomID}/monsters", s.handleRoomMonsters)
+	mux.HandleFunc("PATCH /api/rooms/{roomID}/tokens/{tokenID}", s.handleTokenPatch)
 	mux.HandleFunc("PATCH /api/rooms/{roomID}/tokens/{tokenID}/attacks", s.handleTokenAttacksPatch)
 	mux.HandleFunc("GET /api/rooms/{roomID}/ws", s.Hub.Handle)
 	return telemetry.HTTPHandler(requestLogger(cors(mux), s.Logger.Named("http")))
@@ -873,6 +880,52 @@ func (s *Server) handleMapPatch(w http.ResponseWriter, r *http.Request) {
 	respondRaw(w, row, err)
 	s.bumpMapRooms(context.Background(), id)
 }
+func (s *Server) handleMapDelete(w http.ResponseWriter, r *http.Request) {
+	u, _, ok := s.requireUser(w, r)
+	if !ok {
+		return
+	}
+	id := r.PathValue("mapID")
+	tx, err := s.Pool.Begin(r.Context())
+	if err != nil {
+		WriteError(w, 500, "db", err.Error())
+		return
+	}
+	defer tx.Rollback(r.Context())
+	// Lock the map row so no room can attach it between the in-use check and the delete.
+	var isOwner, visible bool
+	err = tx.QueryRow(r.Context(), `select owner_id=$2, owner_id=$2 or is_public or exists(select 1 from map_editors where map_id=$1 and user_id=$2) from maps where id=$1 for update`, id, u.ID).Scan(&isOwner, &visible)
+	if errors.Is(err, pgx.ErrNoRows) || (err == nil && !visible) {
+		WriteError(w, 404, "not_found", "map not found")
+		return
+	}
+	if err != nil {
+		WriteError(w, 500, "db", err.Error())
+		return
+	}
+	if !isOwner {
+		WriteError(w, 403, "forbidden", "only the map owner can delete it")
+		return
+	}
+	var inUse bool
+	if err := tx.QueryRow(r.Context(), `select exists(select 1 from room_maps where map_id=$1)`, id).Scan(&inUse); err != nil {
+		WriteError(w, 500, "db", err.Error())
+		return
+	}
+	if inUse {
+		WriteError(w, 409, "map_in_use", "This map is attached to a room; detach it before deleting.")
+		return
+	}
+	if _, err := tx.Exec(r.Context(), `delete from maps where id=$1`, id); err != nil {
+		WriteError(w, 500, "db", err.Error())
+		return
+	}
+	if err := tx.Commit(r.Context()); err != nil {
+		WriteError(w, 500, "db", err.Error())
+		return
+	}
+	w.WriteHeader(204)
+}
 func (s *Server) handleMapEditor(w http.ResponseWriter, r *http.Request) {
 	u, _, ok := s.requireUser(w, r)
 	if !ok {
@@ -962,17 +1015,40 @@ func (s *Server) handleAssetUpload(w http.ResponseWriter, r *http.Request) {
 	}
 	defer f.Close()
 	id := uuid.New().String()
-	path, size, err := s.Assets.Save(id, f)
-	if err != nil {
-		WriteError(w, 500, "storage", err.Error())
-		return
-	}
 	mime := h.Header.Get("Content-Type")
 	if mime == "" {
 		mime = "application/octet-stream"
 	}
+	path, size, err := s.Assets.Save(r.Context(), id, mime, f, h.Size)
+	if err != nil {
+		WriteError(w, 500, "storage", err.Error())
+		return
+	}
 	row, err := s.oneJSON(r.Context(), `insert into assets(id,owner_id,name,kind,mime_type,byte_size,storage_path,is_public) values($1,$2,$3,$4,$5,$6,$7,$8) returning jsonb_build_object('id',id::text,'owner_id',owner_id::text,'name',name,'kind',kind,'mime_type',mime_type,'byte_size',byte_size,'storage_path',storage_path,'is_public',is_public)`, id, u.ID, form(r.MultipartForm, "name", h.Filename), form(r.MultipartForm, "kind", "site"), mime, size, path, form(r.MultipartForm, "is_public", "") == "true")
 	respondRawStatus(w, row, err, 201)
+}
+
+func (s *Server) handleAssetGet(w http.ResponseWriter, r *http.Request) {
+	// Any signed-in user may read: asset IDs are random UUIDs and token images are shown to whole tables.
+	if _, _, ok := s.requireUser(w, r); !ok {
+		return
+	}
+	id := r.PathValue("assetID")
+	if _, err := uuid.Parse(id); err != nil {
+		WriteError(w, 404, "not_found", "asset not found")
+		return
+	}
+	var storagePath, mime string
+	err := s.Pool.QueryRow(r.Context(), `select storage_path,mime_type from assets where id=$1`, id).Scan(&storagePath, &mime)
+	if errors.Is(err, pgx.ErrNoRows) {
+		WriteError(w, 404, "not_found", "asset not found")
+		return
+	}
+	if err != nil {
+		WriteError(w, 500, "db", err.Error())
+		return
+	}
+	s.Assets.Serve(w, r, storagePath, mime)
 }
 
 func (s *Server) handleRoomMapAttach(w http.ResponseWriter, r *http.Request) {
@@ -1132,6 +1208,17 @@ func (s *Server) handleTokenCreate(w http.ResponseWriter, r *http.Request) {
 		WriteError(w, 400, "no_active_map", "room has no active map")
 		return
 	}
+	if !isDM {
+		var placed bool
+		if err := s.Pool.QueryRow(r.Context(), `select exists(select 1 from room_tokens where room_map_id=$1 and owner_user_id=$2)`, roomMapID, u.ID).Scan(&placed); err != nil {
+			WriteError(w, 500, "db", err.Error())
+			return
+		}
+		if placed {
+			WriteError(w, 409, "token_limit", "You already have a character on this map. Remove it before placing another.")
+			return
+		}
+	}
 	name := strings.TrimSpace(str(req, "name", ""))
 	sizeM := floatv(req, "size_m", 1)
 	attributes := jsonRaw(req["attributes"])
@@ -1163,7 +1250,7 @@ func (s *Server) handleTokenCreate(w http.ResponseWriter, r *http.Request) {
 	if name == "" {
 		name = "Token"
 	}
-	row, err := s.oneJSON(r.Context(), `insert into room_tokens(id,room_map_id,sheet_id,owner_user_id,name,x_m,y_m,rotation_deg,size_m,vision_range_m,vision_angle_deg,is_hidden,attributes) values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) returning jsonb_build_object('id',id::text,'room_map_id',room_map_id::text,'sheet_id',sheet_id::text,'owner_user_id',owner_user_id::text,'name',name,'x_m',x_m,'y_m',y_m,'rotation_deg',rotation_deg,'size_m',size_m,'vision_range_m',vision_range_m,'vision_angle_deg',vision_angle_deg,'is_hidden',is_hidden,'attributes',attributes)`, uuid.New().String(), roomMapID, nullableLiteral(sheet), u.ID, name, floatv(req, "x_m", 1), floatv(req, "y_m", 1), floatv(req, "rotation_deg", 0), sizeM, floatv(req, "vision_range_m", 12), floatv(req, "vision_angle_deg", 90), boolv(req, "is_hidden", false), attributes)
+	row, err := s.oneJSON(r.Context(), `insert into room_tokens(id,room_map_id,sheet_id,owner_user_id,name,x_m,y_m,rotation_deg,size_m,vision_range_m,is_hidden,attributes) values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) returning jsonb_build_object('id',id::text,'room_map_id',room_map_id::text,'sheet_id',sheet_id::text,'owner_user_id',owner_user_id::text,'name',name,'x_m',x_m,'y_m',y_m,'rotation_deg',rotation_deg,'size_m',size_m,'vision_range_m',vision_range_m,'is_hidden',is_hidden,'attributes',attributes)`, uuid.New().String(), roomMapID, nullableLiteral(sheet), u.ID, name, floatv(req, "x_m", 1), floatv(req, "y_m", 1), floatv(req, "rotation_deg", 0), sizeM, floatv(req, "vision_range_m", 12), boolv(req, "is_hidden", false), attributes)
 	respondRawStatus(w, row, err, 201)
 	s.bumpRoom(context.Background(), roomID)
 }
@@ -1269,6 +1356,158 @@ func (s *Server) handleTokenAttacksPatch(w http.ResponseWriter, r *http.Request)
 	WriteJSON(w, 200, map[string]any{"attacks": game.ResolveAttacks(attacks, token.Stats)})
 }
 
+// handleTokenPatch lets the game master set a token's health, vision radius and extra movers,
+// and the owner or game master set its image. Health of a sheet-backed token is written to the sheet.
+func (s *Server) handleTokenPatch(w http.ResponseWriter, r *http.Request) {
+	u, _, ok := s.requireUser(w, r)
+	if !ok {
+		return
+	}
+	roomID, tokenID := r.PathValue("roomID"), r.PathValue("tokenID")
+	if err := auth.RequireRoomMember(r.Context(), u.ID, roomID); err != nil {
+		WriteError(w, 403, "forbidden", "room membership required")
+		return
+	}
+	if _, err := uuid.Parse(tokenID); err != nil {
+		WriteError(w, 404, "not_found", "token not found")
+		return
+	}
+	token, err := s.loadToken(r.Context(), roomID, tokenID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		WriteError(w, 404, "not_found", "token not found")
+		return
+	}
+	if err != nil {
+		WriteError(w, 500, "db", err.Error())
+		return
+	}
+	var req struct {
+		HitPoints    *int            `json:"hit_points"`
+		MaxHitPoints *int            `json:"max_hit_points"`
+		VisionRangeM *float64        `json:"vision_range_m"`
+		MoverUserIDs *[]string       `json:"mover_user_ids"`
+		ImageAssetID json.RawMessage `json:"image_asset_id"` // absent: keep; null: clear; "uuid": set
+	}
+	if err := ReadJSON(r, &req); err != nil {
+		WriteError(w, 400, "bad_json", "invalid JSON")
+		return
+	}
+	dmFields := req.HitPoints != nil || req.MaxHitPoints != nil || req.VisionRangeM != nil || req.MoverUserIDs != nil
+	imageSet := req.ImageAssetID != nil
+	if !dmFields && !imageSet {
+		WriteError(w, 400, "invalid_token", "nothing to update")
+		return
+	}
+	isDM := s.isDM(r.Context(), u.ID, roomID)
+	if dmFields && !isDM {
+		WriteError(w, 403, "forbidden", "only the game master can change health, vision range or movers")
+		return
+	}
+	if imageSet && !isDM && token.OwnerUserID != u.ID {
+		WriteError(w, 403, "forbidden", "only the token's owner or the game master can change its image")
+		return
+	}
+	health := map[string]int{}
+	for _, field := range []struct {
+		key   string
+		value *int
+	}{{"hit_points", req.HitPoints}, {"max_hit_points", req.MaxHitPoints}} {
+		if field.value == nil {
+			continue
+		}
+		if *field.value < 0 || *field.value > 1000000 {
+			WriteError(w, 400, "invalid_token", field.key+" must be a whole number from 0 to 1000000")
+			return
+		}
+		health[field.key] = *field.value
+	}
+	if req.VisionRangeM != nil && (*req.VisionRangeM < 0.5 || *req.VisionRangeM > 1000) {
+		WriteError(w, 400, "invalid_token", "vision_range_m must be from 0.5 to 1000")
+		return
+	}
+	var movers []string
+	if req.MoverUserIDs != nil {
+		seen := map[string]bool{}
+		for _, id := range *req.MoverUserIDs {
+			parsed, err := uuid.Parse(id)
+			if err != nil {
+				WriteError(w, 400, "invalid_token", "mover_user_ids must list players in this room")
+				return
+			}
+			if !seen[parsed.String()] {
+				seen[parsed.String()] = true
+				movers = append(movers, parsed.String())
+			}
+		}
+		if len(movers) > 0 {
+			var members int
+			if err := s.Pool.QueryRow(r.Context(), `select count(*) from room_members where room_id=$1 and user_id = any($2::uuid[])`, roomID, movers).Scan(&members); err != nil {
+				WriteError(w, 500, "db", err.Error())
+				return
+			}
+			if members != len(movers) {
+				WriteError(w, 400, "invalid_token", "mover_user_ids must list players in this room")
+				return
+			}
+		}
+	}
+	var imageID *string
+	if imageSet && string(req.ImageAssetID) != "null" {
+		var id string
+		valid := json.Unmarshal(req.ImageAssetID, &id) == nil
+		if parsed, err := uuid.Parse(id); valid && err == nil {
+			id = parsed.String()
+			_ = s.Pool.QueryRow(r.Context(), `select exists(select 1 from assets where id=$1 and owner_id=$2 and mime_type like 'image/%')`, id, u.ID).Scan(&valid)
+		} else {
+			valid = false
+		}
+		if !valid {
+			WriteError(w, 400, "invalid_image", "image must be an image you uploaded")
+			return
+		}
+		imageID = &id
+	}
+	tx, err := s.Pool.Begin(r.Context())
+	if err != nil {
+		WriteError(w, 500, "db", err.Error())
+		return
+	}
+	defer tx.Rollback(r.Context())
+	if len(health) > 0 {
+		encoded, _ := json.Marshal(health)
+		if token.SheetID != "" {
+			_, err = tx.Exec(r.Context(), `update sheets set data=data||$2::jsonb,updated_at=now() where id=$1`, token.SheetID, json.RawMessage(encoded))
+		} else {
+			_, err = tx.Exec(r.Context(), `update room_tokens set attributes=attributes||$2::jsonb,updated_at=now() where id=$1`, tokenID, json.RawMessage(encoded))
+		}
+	}
+	if err == nil && req.VisionRangeM != nil {
+		_, err = tx.Exec(r.Context(), `update room_tokens set vision_range_m=$2,updated_at=now() where id=$1`, tokenID, *req.VisionRangeM)
+	}
+	if err == nil && req.MoverUserIDs != nil {
+		_, err = tx.Exec(r.Context(), `delete from room_token_movers where token_id=$1`, tokenID)
+		for _, id := range movers {
+			if err != nil {
+				break
+			}
+			_, err = tx.Exec(r.Context(), `insert into room_token_movers(token_id,user_id) values($1,$2)`, tokenID, id)
+		}
+	}
+	if err == nil && imageSet {
+		_, err = tx.Exec(r.Context(), `update room_tokens set image_asset_id=$2,updated_at=now() where id=$1`, tokenID, imageID)
+	}
+	if err == nil {
+		err = tx.Commit(r.Context())
+	}
+	if err != nil {
+		WriteError(w, 500, "db", err.Error())
+		return
+	}
+	s.bumpRoom(r.Context(), roomID)
+	s.Hub.PublishTokenUpdated(roomID, tokenID)
+	w.WriteHeader(204)
+}
+
 func (s *Server) visibleState(ctx context.Context, roomID, userID string) (map[string]any, error) {
 	room, err := s.oneJSON(ctx, `select `+roomJSON+` from rooms where id=$1`, roomID)
 	if err != nil {
@@ -1304,6 +1543,13 @@ func (s *Server) visibleState(ctx context.Context, roomID, userID string) (map[s
 	tokRows := []game.Token{}
 	own := []game.Token{}
 	for _, t := range tokens {
+		t.CanMove = t.MovableBy(userID, isDM)
+		if isDM || t.OwnerUserID == userID || (t.SheetOwnerUserID != "" && t.SheetOwnerUserID == userID) {
+			t.HitPoints, t.MaxHitPoints = t.Health()
+		}
+		if !isDM {
+			t.MoverUserIDs = nil
+		}
 		if isDM || t.OwnerUserID == userID {
 			if attacks, err := t.AttackList(); err == nil {
 				t.Attacks = game.ResolveAttacks(attacks, t.Stats)
@@ -1319,7 +1565,7 @@ func (s *Server) visibleState(ctx context.Context, roomID, userID string) (map[s
 		if t.OwnerUserID == userID {
 			own = append(own, t)
 		}
-		if isDM || visibleTokIDs[t.ID] {
+		if isDM || visibleTokIDs[t.ID] || t.CanMove {
 			tokRows = append(tokRows, t)
 		}
 	}
@@ -1380,28 +1626,15 @@ func (s *Server) loadStructures(ctx context.Context, roomID string) ([]game.Stru
 	}
 	return out, rows.Err()
 }
-const tokenSelectSQL = `select rt.id::text,coalesce(rt.owner_user_id::text,''),rt.name,rt.x_m::float8,rt.y_m::float8,rt.rotation_deg::float8,rt.size_m::float8,rt.vision_range_m::float8,rt.vision_angle_deg::float8,rt.is_hidden,rt.attributes,coalesce(rt.sheet_id::text,''),coalesce(s.user_id::text,''),coalesce(s.data,rt.attributes) from room_tokens rt join room_maps rm on rm.id=rt.room_map_id left join sheets s on s.id=rt.sheet_id`
-
-func scanToken(row pgx.Row) (game.Token, error) {
-	var t game.Token
-	var attrs, stats []byte
-	if err := row.Scan(&t.ID, &t.OwnerUserID, &t.Name, &t.X, &t.Y, &t.RotationDeg, &t.SizeM, &t.VisionRangeM, &t.VisionAngleDeg, &t.IsHidden, &attrs, &t.SheetID, &t.SheetOwnerUserID, &stats); err != nil {
-		return t, err
-	}
-	// Separate decodes keep Attributes and Stats unaliased for sheetless tokens.
-	_ = json.Unmarshal(attrs, &t.Attributes)
-	_ = json.Unmarshal(stats, &t.Stats)
-	return t, nil
-}
 func (s *Server) loadTokens(ctx context.Context, roomID string) ([]game.Token, error) {
-	rows, err := s.Pool.Query(ctx, tokenSelectSQL+` where rm.room_id=$1 and rm.is_active`, roomID)
+	rows, err := s.Pool.Query(ctx, ws.TokenSelectSQL+` where rm.room_id=$1 and rm.is_active`, roomID)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	var out []game.Token
 	for rows.Next() {
-		t, err := scanToken(rows)
+		t, err := ws.ScanToken(rows)
 		if err != nil {
 			return nil, err
 		}
@@ -1410,7 +1643,7 @@ func (s *Server) loadTokens(ctx context.Context, roomID string) ([]game.Token, e
 	return out, rows.Err()
 }
 func (s *Server) loadToken(ctx context.Context, roomID, tokenID string) (game.Token, error) {
-	return scanToken(s.Pool.QueryRow(ctx, tokenSelectSQL+` where rm.room_id=$1 and rt.id=$2`, roomID, tokenID))
+	return ws.ScanToken(s.Pool.QueryRow(ctx, ws.TokenSelectSQL+` where rm.room_id=$1 and rt.id=$2`, roomID, tokenID))
 }
 
 func (s *Server) isDM(ctx context.Context, userID, roomID string) bool {

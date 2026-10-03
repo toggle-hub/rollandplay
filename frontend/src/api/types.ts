@@ -146,11 +146,26 @@ export type RoomToken = {
   rotation_deg: number | string;
   size_m: number | string;
   vision_range_m: number | string;
-  vision_angle_deg: number | string;
   is_hidden: boolean;
   attributes: Record<string, unknown>;
   attacks?: ResolvedTokenAttack[];
   attacks_editable?: boolean;
+  image_asset_id?: string;
+  /** Players the game master lets move this token besides its owner; sent to game masters only. */
+  mover_user_ids?: string[];
+  /** Whether the viewer may move this token. */
+  can_move?: boolean;
+  /** Health reaches only the game master, the token owner and the owner of its sheet. */
+  hit_points?: number;
+  max_hit_points?: number;
+};
+export type TokenPatch = {
+  hit_points?: number;
+  max_hit_points?: number;
+  vision_range_m?: number;
+  mover_user_ids?: string[];
+  /** null clears the image. */
+  image_asset_id?: string | null;
 };
 export type RollResult = {
   expression: string;
@@ -212,7 +227,9 @@ export type VisibleRoomState = {
   checks?: RoomCheck[];
   metersPerGrid: number | string;
   visibility?: {
-    fogPolygon: { x: number; y: number }[];
+    /** Players see fog everywhere outside their tokens' vision; game masters see no fog. */
+    fog: boolean;
+    visiblePolygons: { x: number; y: number }[][];
     visibleTokenIds: string[];
     visibleStructureIds: string[];
   };
