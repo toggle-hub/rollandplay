@@ -58,3 +58,24 @@ func TestHiddenStructureDoesNotBlockOrRevealToPlayers(t *testing.T) {
 		t.Fatalf("DM should retain hidden structure visibility: %+v", dm.VisibleStructureIDs)
 	}
 }
+
+func TestTokenVisibleTo(t *testing.T) {
+	mine := Token{ID: "mine", OwnerUserID: "p", X: 0, Y: 0, VisionRangeM: 5}
+	for _, tc := range []struct {
+		name   string
+		userID string
+		target Token
+		want   bool
+	}{
+		{"in vision range", "p", Token{ID: "goblin", X: 3, Y: 0}, true},
+		{"out of vision range", "p", Token{ID: "goblin", X: 6, Y: 0}, false},
+		{"hidden in range", "p", Token{ID: "goblin", X: 1, Y: 0, IsHidden: true}, false},
+		{"movable far away", "p", Token{ID: "ally", OwnerUserID: "q", MoverUserIDs: []string{"p"}, X: 50, Y: 50}, true},
+		{"own hidden far away", "p", Token{ID: "own", OwnerUserID: "p", X: 50, Y: 50, IsHidden: true}, true},
+		{"no user against ownerless", "", Token{ID: "goblin", X: 1, Y: 0}, false},
+	} {
+		if got := TokenVisibleTo(tc.userID, tc.target, []Token{mine, tc.target}); got != tc.want {
+			t.Errorf("%s: got %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}

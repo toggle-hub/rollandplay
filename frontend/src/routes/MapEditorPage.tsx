@@ -1,142 +1,265 @@
 import { FormEvent, useEffect, useRef, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
-import { ArrowLeft, ArrowsIn, ArrowsOut, Plus, Trash, UploadSimple } from "@phosphor-icons/react";
-import { apiFetch, deleteJSON, patchJSON, postJSON } from "../api/client";
+import { ArrowLeft, Plus, Trash, UploadSimple } from "@phosphor-icons/react";
+import { apiFetch, deleteJSON, patchJSON } from "../api/client";
 import { useSession } from "../auth/SessionContext";
-import { MapEditorCanvas, type StructureGeometryChange } from "../components/MapEditorCanvas";
-import { geometryBounds, geometryCenter, nudgeGeometry, scaleGeometry, type Point } from "../lib/geometryTransforms";
-import type { GameMap, MapStructure } from "../api/types";
-import { defaultBlocksForKind, snap, structureLabel, structureTypes, templateGeometry, wallBlocks, type StructureBlocks } from "../lib/structures";
+import type { MapStructure } from "../api/types";
+import type { EditorAction } from "../components/EditorContextMenu";
+import { MapEditorCanvas, type EditorTool } from "../components/MapEditorCanvas";
+import { EditorToolbar, LayersList, PlacePanel, SelectionPanel, type SelectionCommands } from "../components/MapEditorPanels";
+import { flipGeometry, nudgeGeometry, rotateGeometry, scaleGeometry, type Point } from "../lib/geometryTransforms";
+import { expandToGroups, selectionCenter, zOrderUpdates } from "../lib/structureGroups";
+import { clampStampScale, defaultBlocksForKind, normalizeDegrees, stampGeometry, structureLabel, structureTypes, wallBlocks, type StructureBlocks } from "../lib/structures";
+import { useStructureEditor, type NewStructure, type StructureFields } from "../lib/useStructureEditor";
 
-type DraftSnapshot = { geometry: string; selectedStructureIds: string[] };
-type GeometryChange = { id: string; before: Point[]; after: Point[] };
-type UndoEntry =
-  | { type: "draft-geometry"; before: DraftSnapshot }
-  | { type: "structure-geometry"; changes: GeometryChange[] }
-  | { type: "structures-deleted"; structures: MapStructure[] };
+const invalidGeometry = "Geometry must be valid JSON: an array of points with x and y coordinates.";
 
 export function MapEditorPage() {
   const { mapId } = useParams();
   const navigate = useNavigate();
   const { session } = useSession();
-  const [map, setMap] = useState<GameMap | null>(null);
-  const [geometry, setGeometry] = useState('[{"x":4,"y":4},{"x":10,"y":4}]');
-  const [kind, setKind] = useState("wall");
-  const [blocks, setBlocks] = useState<StructureBlocks>(wallBlocks);
-  const [selectedStructureIds, setSelectedStructureIds] = useState<string[]>([]);
+  const editor = useStructureEditor(mapId);
+  const { map, structures, selectedIds, busy, error, notice, setError, setNotice, select, update, create, remove } = editor;
+  const [tool, setTool] = useState<EditorTool>("select");
+  const [brushKind, setBrushKind] = useState("wall");
+  const [brushBlocks, setBrushBlocks] = useState<StructureBlocks>(wallBlocks);
+  const [stampRotation, setStampRotation] = useState(0);
+  const [stampScale, setStampScale] = useState(100);
+  const [jsonText, setJsonText] = useState('[{"x":4,"y":4},{"x":10,"y":4}]');
   const [asset, setAsset] = useState<File | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [busy, setBusy] = useState(false);
   const [confirmingMapDelete, setConfirmingMapDelete] = useState(false);
-  const [error, setError] = useState("");
-  const [notice, setNotice] = useState("");
-  const undoHistory = useRef<UndoEntry[]>([]);
+  const clipboard = useRef<MapStructure[]>([]);
+  const pasteCount = useRef(0);
 
-  const load = async () => setMap(await apiFetch<GameMap>(`/api/maps/${mapId}`));
-  const resync = () => load().catch(() => undefined);
-  const draftGeometry = parsePoints(geometry);
-  const draftStructure = draftGeometry ? structurePayload(kind, draftGeometry, blocks) : null;
-  const structures = map?.structures ?? [];
-  const selectedStructures = structures.filter((structure) => selectedStructureIds.includes(structure.id));
-  const transformGeometry = selectedStructures.length > 0 ? selectedStructures.flatMap((structure) => structure.geometry) : draftGeometry;
-  const transformBounds = transformGeometry ? geometryBounds(transformGeometry) : null;
-  const transformTarget = selectedStructures.length > 1
-    ? `${selectedStructures.length} structures`
-    : selectedStructures.length === 1 ? `${selectedStructures[0].kind} layer` : "draft structure";
+  const grid = Number(map?.grid_size_m || 1);
+  const selected = structures.filter((structure) => selectedIds.includes(structure.id));
+  const groupIds = new Set(selected.map((structure) => structure.group_id ?? null));
+  const groupDisabled = selected.length < 2 || (groupIds.size === 1 && !groupIds.has(null));
+  const ungroupDisabled = !selected.some((structure) => structure.group_id);
   const mapJSON = map ? JSON.stringify({ ...map, structures }, null, 2) : "";
   const isOwner = session.status === "authenticated" && map?.owner_id === session.user.id;
 
-  function rememberUndo(entry: UndoEntry) {
-    undoHistory.current.push(entry);
-    if (undoHistory.current.length > 100) undoHistory.current.shift();
+  function selectKind(kind: string) {
+    setBrushKind(kind);
+    setBrushBlocks(defaultBlocksForKind(kind));
   }
 
-  function forgetUndo(entry: UndoEntry) {
-    const index = undoHistory.current.indexOf(entry);
-    if (index !== -1) undoHistory.current.splice(index, 1);
+  function pickBrush(kind: string) {
+    selectKind(kind);
+    setTool("place");
   }
 
-  /** Restored structures get new ids; older undo steps must follow them. */
-  function remapUndoIds(ids: Map<string, string>) {
-    const remap = (id: string) => ids.get(id) ?? id;
-    undoHistory.current = undoHistory.current.map((entry) => {
-      if (entry.type === "structure-geometry") return { ...entry, changes: entry.changes.map((change) => ({ ...change, id: remap(change.id) })) };
-      if (entry.type === "draft-geometry") return { ...entry, before: { ...entry.before, selectedStructureIds: entry.before.selectedStructureIds.map(remap) } };
-      return { ...entry, structures: entry.structures.map((structure) => ({ ...structure, id: remap(structure.id) })) };
-    });
+  function place(point: Point) {
+    void create([{
+      kind: brushKind,
+      geometry: stampGeometry(brushKind, point, grid, stampRotation, stampScale),
+      ...brushBlocks,
+      cover_bonus: 0,
+      pass_rules: {},
+    }]);
   }
 
-  function rememberDraftGeometry(before: DraftSnapshot, after: DraftSnapshot) {
-    if (before.geometry === after.geometry && sameIds(before.selectedStructureIds, after.selectedStructureIds)) return;
-    rememberUndo({ type: "draft-geometry", before });
+  const transformSelection = (transform: (geometry: Point[], center: Point) => Point[]) => {
+    if (selected.length === 0) return;
+    const center = selectionCenter(selected);
+    void update(selected.map((structure) => ({ id: structure.id, fields: { geometry: transform(structure.geometry, center) } })));
+  };
+  const rotateSelection = (degrees: number) => {
+    if (normalizeDegrees(degrees) !== 0) transformSelection((geometry, center) => rotateGeometry(geometry, degrees, center));
+  };
+  const scaleSelection = (factor: number) => {
+    if (factor > 0 && factor !== 1) transformSelection((geometry, center) => scaleGeometry(geometry, factor, center));
+  };
+  const flipSelection = (axis: "horizontal" | "vertical") => transformSelection((geometry, center) => flipGeometry(geometry, axis, center));
+  const nudgeSelection = (dx: number, dy: number) => transformSelection((geometry) => nudgeGeometry(geometry, dx, dy));
+
+  function setSelectionFields(fields: StructureFields) {
+    if (selected.length === 0) return;
+    void update(selected.map((structure) => ({ id: structure.id, fields })));
   }
 
-  function selectKind(nextKind: string) {
-    setKind(nextKind);
-    setBlocks(defaultBlocksForKind(nextKind));
-    if (draftGeometry) setGeometry(JSON.stringify(templateGeometry(nextKind, geometryCenter(draftGeometry), Number(map?.grid_size_m || 1))));
-    setSelectedStructureIds([]);
+  function reorderSelection(direction: "front" | "back") {
+    if (selected.length === 0) return;
+    void update(zOrderUpdates(selectedIds, structures, direction).map((change) => ({ id: change.id, fields: { z_index: change.z_index } })));
   }
 
-  function selectLayer(structureId: string, additive: boolean) {
-    setSelectedStructureIds((current) => !additive
-      ? [structureId]
-      : current.includes(structureId) ? current.filter((id) => id !== structureId) : [...current, structureId]);
+  function groupSelection() {
+    if (groupDisabled) return;
+    const groupId = crypto.randomUUID();
+    void update(selected.map((structure) => ({ id: structure.id, fields: { group_id: groupId } })), `Grouped ${selected.length} structures.`);
   }
 
-  useEffect(() => {
-    undoHistory.current = [];
-    setSelectedStructureIds([]);
-    setLoading(true);
+  function ungroupSelection() {
+    if (ungroupDisabled) return;
+    const grouped = selected.filter((structure) => structure.group_id);
+    void update(grouped.map((structure) => ({ id: structure.id, fields: { group_id: null } })), `Ungrouped ${grouped.length} structures.`);
+  }
+
+  function copySelection() {
+    if (selected.length === 0) return;
+    clipboard.current = selected;
+    pasteCount.current = 0;
     setError("");
-    load().catch((err: Error) => setError(err.message)).finally(() => setLoading(false));
-  }, [mapId]);
+    setNotice(`Copied ${selected.length} structures.`);
+  }
 
+  /** Creates offset copies on top of everything, with fresh groups, and selects them. Returns how many were created. */
+  async function createCopies(sources: MapStructure[], offset: number, message: string) {
+    if (sources.length === 0) return 0;
+    const groups = new Map<string, string>();
+    const top = Math.max(0, ...structures.map((structure) => structure.z_index ?? 0));
+    const payloads: NewStructure[] = sources.map((source, index) => {
+      let groupId: string | undefined;
+      if (source.group_id) {
+        groupId = groups.get(source.group_id) ?? crypto.randomUUID();
+        groups.set(source.group_id, groupId);
+      }
+      return {
+        kind: source.kind,
+        geometry: nudgeGeometry(source.geometry, offset, offset),
+        blocks_vision: source.blocks_vision,
+        blocks_movement: source.blocks_movement,
+        blocks_attacks: source.blocks_attacks,
+        cover_bonus: source.cover_bonus,
+        pass_rules: source.pass_rules,
+        z_index: top + index + 1,
+        ...(groupId ? { group_id: groupId } : {}),
+      };
+    });
+    const created = await create(payloads, message);
+    if (created.length > 0) select(created.map((structure) => structure.id));
+    return created.length;
+  }
+
+  async function pasteClipboard() {
+    const sources = clipboard.current;
+    if (sources.length === 0) return;
+    // Each paste lands one grid square further; a paste dropped while saving does not advance the offset.
+    const created = await createCopies(sources, grid * (pasteCount.current + 1), `Pasted ${sources.length} structures.`);
+    if (created > 0) pasteCount.current += 1;
+  }
+
+  function duplicateSelection() {
+    void createCopies(selected, grid, `Duplicated ${selected.length} structures.`);
+  }
+
+  const commands: SelectionCommands = {
+    setFields: setSelectionFields,
+    rotate: rotateSelection,
+    scale: scaleSelection,
+    flip: flipSelection,
+    duplicate: duplicateSelection,
+    group: groupSelection,
+    ungroup: ungroupSelection,
+    front: () => reorderSelection("front"),
+    back: () => reorderSelection("back"),
+    remove: () => void remove(selectedIds),
+  };
+
+  const contextActions: EditorAction[] = [
+    { id: "duplicate", label: "Duplicate", shortcut: "Ctrl+D" },
+    { id: "copy", label: "Copy", shortcut: "Ctrl+C" },
+    { id: "front", label: "Bring to front" },
+    { id: "back", label: "Send to back" },
+    { id: "group", label: "Group", shortcut: "Ctrl+G", disabled: groupDisabled },
+    { id: "ungroup", label: "Ungroup", shortcut: "Ctrl+Shift+G", disabled: ungroupDisabled },
+    { id: "delete", label: "Delete", shortcut: "Del", danger: true },
+  ];
+  const contextAction: Record<string, () => void> = {
+    duplicate: duplicateSelection,
+    copy: copySelection,
+    front: commands.front,
+    back: commands.back,
+    group: groupSelection,
+    ungroup: ungroupSelection,
+    delete: commands.remove,
+  };
+
+  /** Returns true when the key ran an editor shortcut; anything else keeps the browser's default. */
+  function handleShortcut(event: KeyboardEvent): boolean {
+    const key = event.key.length === 1 ? event.key.toLowerCase() : event.key;
+    const mod = event.ctrlKey || event.metaKey;
+    const hasSelection = selected.length > 0;
+    if (mod) {
+      if (key === "z" && !event.shiftKey) void editor.undo();
+      else if ((key === "z" && event.shiftKey) || key === "y") void editor.redo();
+      // Copying highlighted page text (e.g. the exported JSON) keeps working.
+      else if (key === "c" && hasSelection && !window.getSelection()?.toString()) copySelection();
+      else if (key === "v" && clipboard.current.length > 0) void pasteClipboard();
+      else if (key === "d" && hasSelection) duplicateSelection();
+      else if (key === "a" && structures.length > 0) select(structures.map((structure) => structure.id));
+      else if (key === "g" && event.shiftKey && !ungroupDisabled) ungroupSelection();
+      else if (key === "g" && !event.shiftKey && !groupDisabled) groupSelection();
+      else return false;
+      return true;
+    }
+    if (key === "v") setTool("select");
+    else if (key === "b") setTool("place");
+    else if (key === "Escape") {
+      if (tool === "place") setTool("select");
+      else if (selectedIds.length > 0) select([]);
+      else return false;
+    } else if (key === "Delete" || key === "Backspace") {
+      if (!hasSelection) return false;
+      void remove(selectedIds);
+    } else if (key.startsWith("Arrow")) {
+      if (!hasSelection) return false;
+      const step = event.shiftKey ? grid : 0.1;
+      const [dx, dy] = key === "ArrowLeft" ? [-step, 0] : key === "ArrowRight" ? [step, 0] : key === "ArrowUp" ? [0, -step] : [0, step];
+      nudgeSelection(dx, dy);
+    } else if (key === "q" || key === "e") {
+      const degrees = key === "q" ? -15 : 15;
+      if (tool === "place") setStampRotation((current) => normalizeDegrees(current + degrees));
+      else rotateSelection(degrees);
+    } else if (key === "[" || key === "]") {
+      if (tool === "place") setStampScale((current) => clampStampScale(current + (key === "[" ? -10 : 10)));
+      else scaleSelection(key === "[" ? 0.9 : 1.1);
+    } else return false;
+    return true;
+  }
+
+  const shortcutRef = useRef(handleShortcut);
+  shortcutRef.current = handleShortcut;
   useEffect(() => {
-    const handleUndoShortcut = (event: KeyboardEvent) => {
-      if (event.key.toLowerCase() !== "z" || (!event.ctrlKey && !event.metaKey) || event.shiftKey || event.altKey) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.defaultPrevented || event.altKey) return;
       const target = event.target;
       if (target instanceof HTMLElement && (target.isContentEditable || target.matches("input, textarea, select"))) return;
-      if (busy || undoHistory.current.length === 0) return;
-      event.preventDefault();
-      undoLastChange();
+      if (shortcutRef.current(event)) event.preventDefault();
     };
-    window.addEventListener("keydown", handleUndoShortcut);
-    return () => window.removeEventListener("keydown", handleUndoShortcut);
-  }, [busy, mapId]);
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, []);
 
-  async function save(action: () => Promise<unknown>, message: string) {
-    setBusy(true);
-    setError("");
-    setNotice("");
-    try {
-      await action();
-      await load();
-      setNotice(message);
-    } catch (err) {
-      setError(err instanceof SyntaxError ? "Geometry must be valid JSON: an array of points with x and y coordinates." : err instanceof Error ? err.message : "Could not save the map.");
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  function add(e: FormEvent) {
-    e.preventDefault();
-    addStructure();
-  }
-
-  function addStructure() {
-    const points = parsePoints(geometry);
-    if (!points) {
-      setError("Geometry must be valid JSON: an array of points with x and y coordinates.");
+  function toggleLayer(id: string, additive: boolean) {
+    if (!additive) {
+      select([id]);
       return;
     }
-    void save(() => postJSON(`/api/maps/${mapId}/structures`, structurePayload(kind, points, blocks)), "Structure added.");
+    if (!selectedIds.includes(id)) {
+      select([...selectedIds, id]);
+      return;
+    }
+    const group = new Set(expandToGroups([id], structures));
+    select(selectedIds.filter((selectedId) => !group.has(selectedId)));
+  }
+
+  async function addFromJSON(event: FormEvent) {
+    event.preventDefault();
+    const points = parsePoints(jsonText);
+    if (!points) {
+      setError(invalidGeometry);
+      return;
+    }
+    const created = await create([{ kind: brushKind, geometry: points, ...brushBlocks, cover_bonus: 0, pass_rules: {} }], "Structure added.");
+    if (created.length === 0) return;
+    select(created.map((structure) => structure.id));
+    setTool("select");
   }
 
   function upload() {
     if (!asset) return;
-    void save(async () => {
+    void editor.runSaving(async () => {
       const form = new FormData();
       form.append("file", asset);
       form.append("name", asset.name);
@@ -146,144 +269,8 @@ export function MapEditorPage() {
     }, "Background uploaded and attached to this map.");
   }
 
-  function setStructureGeometries(changes: StructureGeometryChange[]) {
-    const next = new Map(changes.map((change) => [change.id, change.geometry]));
-    setMap((current) => current ? {
-      ...current,
-      structures: current.structures?.map((structure) => {
-        const geometry = next.get(structure.id);
-        return geometry ? { ...structure, geometry } : structure;
-      }),
-    } : current);
-  }
-
-  function patchStructureGeometries(changes: StructureGeometryChange[]) {
-    return Promise.all(changes.map((change) => patchJSON(`/api/maps/${mapId}/structures/${change.id}`, { geometry: change.geometry })));
-  }
-
-  function commitStructureTransforms(changes: StructureGeometryChange[]) {
-    if (busy) return;
-    const previous = new Map(structures.map((structure) => [structure.id, structure.geometry]));
-    const geometryChanges = changes.flatMap((change) => {
-      const before = previous.get(change.id);
-      return before ? [{ id: change.id, before: clonePoints(before), after: clonePoints(change.geometry) }] : [];
-    });
-    if (geometryChanges.length === 0) return;
-    const undoEntry: UndoEntry = { type: "structure-geometry", changes: geometryChanges };
-    rememberUndo(undoEntry);
-    setStructureGeometries(geometryChanges.map((change) => ({ id: change.id, geometry: change.after })));
-    setBusy(true);
-    setError("");
-    void patchStructureGeometries(geometryChanges.map((change) => ({ id: change.id, geometry: change.after })))
-      .catch(async (err: unknown) => {
-        forgetUndo(undoEntry);
-        setStructureGeometries(geometryChanges.map((change) => ({ id: change.id, geometry: change.before })));
-        setError(err instanceof Error ? err.message : "Could not transform the structure.");
-        await resync();
-      })
-      .finally(() => setBusy(false));
-  }
-
-  async function deleteSelectedStructures() {
-    const doomed = selectedStructures;
-    if (doomed.length === 0 || busy) return;
-    setBusy(true);
-    setError("");
-    setNotice("");
-    const results = await Promise.allSettled(doomed.map((structure) => deleteJSON(`/api/maps/${mapId}/structures/${structure.id}`)));
-    const deleted = doomed.filter((_, index) => results[index].status === "fulfilled");
-    const failure = results.find((result): result is PromiseRejectedResult => result.status === "rejected");
-    if (deleted.length > 0) {
-      const gone = new Set(deleted.map((structure) => structure.id));
-      rememberUndo({ type: "structures-deleted", structures: deleted });
-      setMap((current) => current ? { ...current, structures: current.structures?.filter((structure) => !gone.has(structure.id)) } : current);
-      setSelectedStructureIds((current) => current.filter((id) => !gone.has(id)));
-      setNotice(deleted.length === 1 ? "Structure deleted. Press Ctrl/Cmd+Z to restore it." : `${deleted.length} structures deleted. Press Ctrl/Cmd+Z to restore them.`);
-    }
-    if (failure) setError(failure.reason instanceof Error ? failure.reason.message : "Could not delete the structure.");
-    setBusy(false);
-  }
-
-  function undoLastChange() {
-    const entry = undoHistory.current.pop();
-    if (!entry) return;
-    setError("");
-    if (entry.type === "draft-geometry") {
-      setGeometry(entry.before.geometry);
-      setSelectedStructureIds(entry.before.selectedStructureIds);
-      setNotice("Last map edit undone.");
-      return;
-    }
-    setBusy(true);
-    setNotice("");
-    if (entry.type === "structures-deleted") {
-      void Promise.allSettled(entry.structures.map((structure) => postJSON<MapStructure>(`/api/maps/${mapId}/structures`, restorePayload(structure))))
-        .then(async (results) => {
-          const restoredIds = new Map<string, string>();
-          const failed: MapStructure[] = [];
-          let failure: unknown;
-          results.forEach((result, index) => {
-            if (result.status === "fulfilled") restoredIds.set(entry.structures[index].id, result.value.id);
-            else {
-              failed.push(entry.structures[index]);
-              failure = result.reason;
-            }
-          });
-          remapUndoIds(restoredIds);
-          if (failed.length > 0) {
-            rememberUndo({ type: "structures-deleted", structures: failed });
-            setError(failure instanceof Error ? failure.message : "Could not restore the deleted structures.");
-          }
-          await resync();
-          setSelectedStructureIds([...restoredIds.values()]);
-          if (failed.length === 0) setNotice("Last map edit undone.");
-        })
-        .finally(() => setBusy(false));
-      return;
-    }
-    setStructureGeometries(entry.changes.map((change) => ({ id: change.id, geometry: change.before })));
-    void patchStructureGeometries(entry.changes.map((change) => ({ id: change.id, geometry: change.before })))
-      .then(() => setNotice("Last map edit undone."))
-      .catch(async (err: unknown) => {
-        rememberUndo(entry);
-        setError(err instanceof Error ? err.message : "Could not undo the structure change.");
-        await resync();
-      })
-      .finally(() => setBusy(false));
-  }
-
-  function scaleSelection(factor: number) {
-    if (selectedStructures.length > 0) {
-      const center = geometryCenter(selectedStructures.flatMap((structure) => structure.geometry));
-      commitStructureTransforms(selectedStructures.map((structure) => ({ id: structure.id, geometry: scaleGeometry(structure.geometry, factor, center) })));
-      return;
-    }
-    if (!draftGeometry) return;
-    const serialized = JSON.stringify(scaleGeometry(draftGeometry, factor));
-    rememberDraftGeometry(
-      { geometry, selectedStructureIds },
-      { geometry: serialized, selectedStructureIds },
-    );
-    setGeometry(serialized);
-  }
-
-  function moveDraft(point: Point) {
-    if (!draftGeometry) return;
-    const center = geometryCenter(draftGeometry);
-    const grid = Number(map?.grid_size_m || 1);
-    const target = { x: snap(point.x, grid), y: snap(point.y, grid) };
-    const serialized = JSON.stringify(nudgeGeometry(draftGeometry, target.x - center.x, target.y - center.y));
-    rememberDraftGeometry(
-      { geometry, selectedStructureIds },
-      { geometry: serialized, selectedStructureIds: [] },
-    );
-    setSelectedStructureIds([]);
-    setGeometry(serialized);
-    setNotice(`${kind[0].toUpperCase() + kind.slice(1)} draft moved.`);
-  }
-
   async function deleteMap() {
-    setBusy(true);
+    editor.setBusy(true);
     setError("");
     setNotice("");
     try {
@@ -292,7 +279,7 @@ export function MapEditorPage() {
     } catch (err) {
       setError(err instanceof Error ? err.message : "Could not delete the map.");
       setConfirmingMapDelete(false);
-      setBusy(false);
+      editor.setBusy(false);
     }
   }
 
@@ -309,32 +296,27 @@ export function MapEditorPage() {
     setNotice("Map JSON exported.");
   }
 
-  function importDraftFromFile(file: File | null | undefined) {
+  function importGeometryFromFile(file: File | null | undefined) {
     if (!file) return;
     setError("");
     setNotice("");
     const reader = new FileReader();
     reader.onload = () => {
-      const nextGeometry = parsePoints(String(reader.result ?? ""));
-      if (!nextGeometry) {
-        setNotice("");
+      const geometry = parsePoints(String(reader.result ?? ""));
+      if (!geometry) {
         setError("Imported geometry must be JSON: an array of points with x and y coordinates.");
         return;
       }
-      const serialized = JSON.stringify(nextGeometry);
-      rememberDraftGeometry(
-        { geometry, selectedStructureIds },
-        { geometry: serialized, selectedStructureIds: [] },
-      );
-      setSelectedStructureIds([]);
-      setGeometry(serialized);
-      setNotice("Draft geometry imported from JSON.");
+      setJsonText(JSON.stringify(geometry));
+      setNotice("Geometry loaded from JSON. Press Add structure to save it.");
     };
     reader.readAsText(file);
   }
 
-  if (loading) return <div className="card" role="status">Opening map editor…</div>;
+  if (editor.loading) return <div className="card" role="status">Opening map editor…</div>;
   if (!map) return <div className="card space-y-4"><p role="alert" className="text-[var(--pink)]">Could not open this map: {error}</p><Link className="btn-secondary" to="/maps">Back to maps</Link></div>;
+
+  const saveMap = (fields: Record<string, unknown>, message: string) => void editor.runSaving(() => patchJSON(`/api/maps/${mapId}`, fields), message);
 
   return <div className="map-studio workspace-page">
     <header className="map-studio-hero">
@@ -342,7 +324,7 @@ export function MapEditorPage() {
         <Link className="mb-6 inline-flex items-center gap-2 text-sm text-[var(--muted)] hover:text-[var(--paper)]" to="/maps"><ArrowLeft size={16} aria-hidden="true" />All maps</Link>
         <p className="eyebrow">Cartographer studio</p>
         <h1 className="page-heading break-words">{map.name}</h1>
-        <p className="page-description">Build directly on the canvas: select one structure or a whole area, then move, resize and rotate it with on-canvas handles. JSON import/export stays available.</p>
+        <p className="page-description">Stamp structures with the Place tool (B), then arrange them with the Select tool (V): move, resize, rotate, group and layer them on the canvas or from the selection panel. Copy, paste, duplicate, undo and redo use the usual shortcuts.</p>
       </div>
       <div className="map-studio-stats" aria-label="Map summary">
         <span><strong>{map.width_m} × {map.height_m}</strong> meters</span>
@@ -365,53 +347,32 @@ export function MapEditorPage() {
       <div className="map-studio-canvas-head">
         <div>
           <h2 className="text-2xl">World canvas</h2>
-          <p className="text-muted mt-2 text-sm">Click a structure to select it, Shift-click to add more, or drag across empty space to select an area. Drag the selection to move it, drag a square corner to resize, or drag the round handle above it to rotate; hold Shift to snap rotation to 15°. Press Delete to remove the selection and Escape to clear it. With nothing selected, click empty space to place the draft. Drag with the right or middle mouse button (or hold Space) to pan, hold Ctrl while scrolling to zoom, and press Ctrl/Cmd+Z to undo.</p>
+          <p className="text-muted mt-2 text-sm">Place tool (B): pick a brush and click the map; Q/E rotate the stamp and [ ] resize it. Select tool (V): click or drag across structures, then drag to move, drag a corner to resize, or drag the round handle to rotate. Right-click a structure for actions. Ctrl/Cmd+C, V, D copy, paste and duplicate; Ctrl/Cmd+G groups and Ctrl/Cmd+Shift+G ungroups; arrow keys nudge (Shift for a full grid square); Delete removes; Ctrl/Cmd+Z undoes and Ctrl/Cmd+Shift+Z redoes. Scroll to zoom and drag with the right or middle button (or hold Space) to pan.</p>
         </div>
         <div className="map-studio-tool-chips" aria-label="Active editor state">
-          <span>Brush: {structureLabel(kind)}</span>
-          <span>{selectedStructures.length > 1 ? `Group: ${selectedStructures.length} layers` : selectedStructures.length === 1 ? `Layer: ${selectedStructures[0].kind}` : "Draft layer"}</span>
-          {!draftGeometry && <span className="text-[var(--pink)]">Invalid draft JSON</span>}
+          <span>{tool === "place" ? `Tool: Place · ${structureLabel(brushKind)}` : "Tool: Select"}</span>
+          <span>{selectedIds.length} selected</span>
         </div>
       </div>
       <MapEditorCanvas
         map={map}
         structures={structures}
-        draftStructure={draftStructure}
-        selectedStructureIds={selectedStructureIds}
-        controls={<div className="grid gap-2" data-testid="map-structure-controls">
-          <div className="border-b border-[var(--paper)]/10 pb-2">
-            <h3 className="px-1 text-[10px] font-semibold uppercase tracking-[0.18em] text-[var(--muted)]">Transform</h3>
-            <p className="mt-1 truncate px-1 text-[11px] text-[var(--paper)]" title={transformGeometry ? transformTarget : "valid draft geometry or selected structure"}>{transformGeometry ? transformTarget : "No target"}</p>
-            {transformBounds && <p className="text-muted mt-0.5 px-1 text-[10px] tabular-nums">{transformBounds.width} × {transformBounds.height} m</p>}
-          </div>
-          <div className="grid gap-1.5" role="group" aria-label="Resize selected structures">
-            <span className="px-1 text-[9px] font-semibold uppercase tracking-[0.14em] text-[var(--muted)]">Size</span>
-            <div className="grid grid-cols-2 gap-1">
-              <button className="btn-secondary flex h-9 min-h-0 w-full items-center gap-1 px-1 py-1.5 text-[10px]" type="button" disabled={!transformGeometry || busy} aria-label="Shrink 10%" title="Shrink 10%" onClick={() => scaleSelection(0.9)}><ArrowsIn size={15} aria-hidden="true" /><span>10%</span></button>
-              <button className="btn-secondary flex h-9 min-h-0 w-full items-center gap-1 px-1 py-1.5 text-[10px]" type="button" disabled={!transformGeometry || busy} aria-label="Grow 10%" title="Grow 10%" onClick={() => scaleSelection(1.1)}><ArrowsOut size={15} aria-hidden="true" /><span>10%</span></button>
-            </div>
-          </div>
-          <button className="btn-secondary flex h-9 min-h-0 w-full items-center justify-center gap-1.5 px-1 py-1.5 text-[11px] text-[var(--pink)]" type="button" disabled={selectedStructures.length === 0 || busy} aria-label="Delete selected structures" title="Delete selected structures (Delete key)" onClick={() => void deleteSelectedStructures()}><Trash size={15} aria-hidden="true" /><span>Delete</span></button>
+        selectedStructureIds={selectedIds}
+        tool={tool}
+        stamp={{ kind: brushKind, rotationDeg: stampRotation, scalePercent: stampScale }}
+        contextActions={contextActions}
+        controls={<EditorToolbar tool={tool} busy={busy} canUndo={editor.canUndo} canRedo={editor.canRedo} onTool={setTool} onUndo={() => void editor.undo()} onRedo={() => void editor.redo()} />}
+        selector={<div className="flex h-full min-h-0 flex-col overflow-y-auto overscroll-contain">
+          {tool === "place"
+            ? <PlacePanel kind={brushKind} rotation={stampRotation} scale={stampScale} blocks={brushBlocks} busy={busy} onKind={pickBrush} onRotation={setStampRotation} onScale={setStampScale} onBlocks={setBrushBlocks} />
+            : <SelectionPanel selected={selected} busy={busy} groupDisabled={groupDisabled} ungroupDisabled={ungroupDisabled} commands={commands} />}
+          <LayersList structures={structures} selectedIds={selectedIds} onSelect={toggleLayer} />
         </div>}
-        selector={<StructurePalette
-          structures={structures}
-          selectedKind={kind}
-          selectedStructureIds={selectedStructureIds}
-          addDisabled={busy || !draftGeometry}
-          onAdd={addStructure}
-          onSelect={selectKind}
-          onSelectStructure={selectLayer}
-        />}
         disabled={busy}
-        onSelectStructures={setSelectedStructureIds}
-        onTransformDraft={(nextGeometry) => setGeometry(JSON.stringify(nextGeometry))}
-        onTransformDraftEnd={(originalGeometry, nextGeometry) => rememberDraftGeometry(
-          { geometry: JSON.stringify(originalGeometry), selectedStructureIds },
-          { geometry: JSON.stringify(nextGeometry), selectedStructureIds },
-        )}
-        onTransformStructures={commitStructureTransforms}
-        onMoveDraft={moveDraft}
-        onDeleteSelection={() => void deleteSelectedStructures()}
+        onSelectStructures={select}
+        onTransformStructures={(changes) => void update(changes.map((change) => ({ id: change.id, fields: { geometry: change.geometry } })))}
+        onPlace={place}
+        onContextAction={(id) => contextAction[id]?.()}
       />
     </section>
 
@@ -420,19 +381,19 @@ export function MapEditorPage() {
         <h2 className="text-2xl">Map settings</h2>
         <p className="text-muted text-sm">Name, dimensions, and grid changes save when you leave a field.</p>
         <label className="field-label block" htmlFor="map-name">Map name</label>
-        <input id="map-name" className="w-full" defaultValue={map.name} disabled={busy} onBlur={(e) => { if (e.target.value !== map.name) void save(() => patchJSON(`/api/maps/${mapId}`, { name: e.target.value }), "Map name saved."); }} />
+        <input id="map-name" className="w-full" defaultValue={map.name} disabled={busy} onBlur={(e) => { if (e.target.value !== map.name) saveMap({ name: e.target.value }, "Map name saved."); }} />
         <div className="grid grid-cols-2 gap-3">
           <label className="field-label" htmlFor="map-width">
             Width (meters)
-            <input id="map-width" className="w-full" type="number" min="0.1" step="any" defaultValue={Number(map.width_m)} disabled={busy} onBlur={(e) => { const value = Number(e.target.value); if (value !== Number(map.width_m) && e.target.validity.valid && value > 0) void save(() => patchJSON(`/api/maps/${mapId}`, { width_m: value }), "Map width saved."); }} />
+            <input id="map-width" className="w-full" type="number" min="0.1" step="any" defaultValue={Number(map.width_m)} disabled={busy} onBlur={(e) => { const value = Number(e.target.value); if (value !== Number(map.width_m) && e.target.validity.valid && value > 0) saveMap({ width_m: value }, "Map width saved."); }} />
           </label>
           <label className="field-label" htmlFor="map-height">
             Height (meters)
-            <input id="map-height" className="w-full" type="number" min="0.1" step="any" defaultValue={Number(map.height_m)} disabled={busy} onBlur={(e) => { const value = Number(e.target.value); if (value !== Number(map.height_m) && e.target.validity.valid && value > 0) void save(() => patchJSON(`/api/maps/${mapId}`, { height_m: value }), "Map height saved."); }} />
+            <input id="map-height" className="w-full" type="number" min="0.1" step="any" defaultValue={Number(map.height_m)} disabled={busy} onBlur={(e) => { const value = Number(e.target.value); if (value !== Number(map.height_m) && e.target.validity.valid && value > 0) saveMap({ height_m: value }, "Map height saved."); }} />
           </label>
         </div>
         <label className="field-label block" htmlFor="map-grid">Grid size (meters)</label>
-        <input id="map-grid" className="w-full" type="number" min="0.1" step="any" defaultValue={Number(map.grid_size_m)} disabled={busy} onBlur={(e) => { const value = Number(e.target.value); if (value !== Number(map.grid_size_m) && e.target.validity.valid && value > 0) void save(() => patchJSON(`/api/maps/${mapId}`, { grid_size_m: value }), "Grid size saved."); }} />
+        <input id="map-grid" className="w-full" type="number" min="0.1" step="any" defaultValue={Number(map.grid_size_m)} disabled={busy} onBlur={(e) => { const value = Number(e.target.value); if (value !== Number(map.grid_size_m) && e.target.validity.valid && value > 0) saveMap({ grid_size_m: value }, "Grid size saved."); }} />
         <div className="border-t border-[var(--paper)]/10 pt-5">
           <label className="field-label mb-3 block" htmlFor="map-background">Background image</label>
           <input id="map-background" type="file" accept="image/*" className="w-full max-w-full text-sm" onChange={(e) => setAsset(e.target.files?.[0] ?? null)} />
@@ -450,91 +411,28 @@ export function MapEditorPage() {
         </div>}
       </section>
 
-      <form className="card space-y-5" onSubmit={add}>
-        <h2 className="text-2xl">Draft structure</h2>
+      <form className="card space-y-5" onSubmit={(event) => void addFromJSON(event)} aria-labelledby="add-from-json-heading">
+        <h2 id="add-from-json-heading" className="text-2xl">Add from JSON</h2>
         <label className="field-label block" htmlFor="structure-kind">Structure type</label>
-        <select id="structure-kind" className="w-full" value={kind} onChange={(e) => selectKind(e.target.value)}>{structureTypes.map((type) => <option key={type.value} value={type.value}>{type.label}</option>)}</select>
+        <select id="structure-kind" className="w-full" value={brushKind} onChange={(e) => selectKind(e.target.value)}>{structureTypes.map((type) => <option key={type.value} value={type.value}>{type.label}</option>)}</select>
         <label className="field-label block" htmlFor="structure-geometry">Geometry (JSON)</label>
-        <textarea id="structure-geometry" className="min-h-40 w-full font-mono text-sm" spellCheck={false} value={geometry} onChange={(e) => setGeometry(e.target.value)} aria-describedby="geometry-help" />
-        <p id="geometry-help" className="text-muted text-xs">Import or edit an array of x/y points in meters. Dragging the draft on the canvas exports back into this JSON.</p>
+        <textarea id="structure-geometry" className="min-h-40 w-full font-mono text-sm" spellCheck={false} value={jsonText} onChange={(e) => setJsonText(e.target.value)} aria-describedby="geometry-help" />
+        <p id="geometry-help" className="text-muted text-xs">An array of x/y points in meters. Adding saves the structure straight away.</p>
+        <label className="field-label block" htmlFor="geometry-import">Import geometry JSON</label>
+        <input id="geometry-import" type="file" accept="application/json,.json" className="w-full max-w-full text-sm" onChange={(e) => importGeometryFromFile(e.target.files?.[0])} />
         <fieldset className="space-y-3">
           <legend className="field-label mb-3">This structure blocks</legend>
-          {(["blocks_vision", "blocks_movement", "blocks_attacks"] as const).map((key) => <label className="flex items-center gap-3 text-sm" key={key}><input type="checkbox" checked={blocks[key]} onChange={(e) => setBlocks({ ...blocks, [key]: e.target.checked })} />{key === "blocks_vision" ? "Line of sight" : key === "blocks_movement" ? "Movement" : "Attacks"}</label>)}
+          {(["blocks_vision", "blocks_movement", "blocks_attacks"] as const).map((key) => <label className="flex items-center gap-3 text-sm" key={key}><input type="checkbox" checked={brushBlocks[key]} onChange={(e) => setBrushBlocks({ ...brushBlocks, [key]: e.target.checked })} />{key === "blocks_vision" ? "Line of sight" : key === "blocks_movement" ? "Movement" : "Attacks"}</label>)}
         </fieldset>
-        <button className="btn w-full" disabled={busy || !draftGeometry}><Plus size={18} aria-hidden="true" />{busy ? "Saving…" : "Add structure"}</button>
+        <button className="btn w-full" disabled={busy}><Plus size={18} aria-hidden="true" />{busy ? "Saving…" : "Add structure"}</button>
       </form>
 
       <section className="card min-w-0 space-y-5">
-        <h2 className="text-2xl">JSON import/export</h2>
-        <p className="text-muted text-sm">Export the whole saved map, or import draft geometry without losing the direct JSON workflow.</p>
-        <label className="field-label block" htmlFor="geometry-import">Import draft geometry JSON</label>
-        <input id="geometry-import" type="file" accept="application/json,.json" className="w-full max-w-full text-sm" onChange={(e) => importDraftFromFile(e.target.files?.[0])} />
+        <h2 className="text-2xl">Map JSON</h2>
+        <p className="text-muted text-sm">Export the whole saved map, structures included.</p>
         <button className="btn-secondary w-full" type="button" onClick={exportMapJSON}>Export map JSON</button>
         <pre className="max-h-64 rounded-lg border border-[var(--paper)]/10 bg-[var(--input)] p-3 text-xs text-[var(--paper)]">{mapJSON}</pre>
       </section>
-    </div>
-  </div>;
-}
-
-function StructurePalette({
-  structures,
-  selectedKind,
-  selectedStructureIds,
-  addDisabled,
-  onAdd,
-  onSelect,
-  onSelectStructure,
-}: {
-  structures: MapStructure[];
-  selectedKind: string;
-  selectedStructureIds: string[];
-  addDisabled: boolean;
-  onAdd: () => void;
-  onSelect: (kind: string) => void;
-  onSelectStructure: (structureId: string, additive: boolean) => void;
-}) {
-  return <div className="flex h-full min-h-0 flex-col" data-testid="map-structure-palette">
-    <div className="shrink-0 border-b border-[var(--paper)]/10 px-3 py-3">
-      <h3 className="text-[10px] font-semibold uppercase tracking-[0.18em] text-[var(--muted)]">Brushes</h3>
-      <p className="text-muted mt-1 text-[11px] leading-relaxed">Choose a type, then click empty canvas space to position its draft without changing its shape or angle.</p>
-      <button className="btn mt-3 w-full" type="button" disabled={addDisabled} onClick={onAdd}>
-        <Plus size={16} aria-hidden="true" />
-        Place {structureLabel(selectedKind)}
-      </button>
-    </div>
-    <div className="grid min-h-0 flex-1 gap-2 overflow-y-auto overscroll-contain p-2" aria-label="Brush choices">
-      {structureTypes.map((type) => {
-        const selected = selectedKind === type.value;
-        return <button
-          key={type.value}
-          type="button"
-          aria-pressed={selected}
-          className={`rounded-lg border p-3 text-left transition-colors ${selected ? "border-[var(--accent)]/90 bg-[var(--accent)]/15" : "border-[var(--paper)]/10 bg-[var(--input)]/85 hover:border-[var(--muted)]/70"}`}
-          onClick={() => onSelect(type.value)}
-        >
-          <span className="flex items-center gap-2 text-sm text-[var(--paper)]"><span className={`h-2.5 w-2.5 rounded-full ${type.swatch}`} aria-hidden="true" />{type.label}</span>
-          <span className="text-muted mt-1 block text-[11px]">{type.hint}</span>
-        </button>;
-      })}
-    </div>
-    <div className="min-h-0 shrink-0 border-t border-[var(--paper)]/10 px-3 py-3">
-      <h3 className="text-[10px] font-semibold uppercase tracking-[0.18em] text-[var(--muted)]">Layers</h3>
-      <div className="mt-2 max-h-56 space-y-1 overflow-y-auto pr-1">
-        {structures.length === 0 && <p className="text-muted text-[11px] leading-relaxed">Saved layers appear here after adding a structure.</p>}
-        {structures.map((structure, index) => {
-          const selected = selectedStructureIds.includes(structure.id);
-          return <button
-            key={structure.id}
-            type="button"
-            aria-pressed={selected}
-            className={`w-full rounded-md border px-2.5 py-2 text-left text-xs transition-colors ${selected ? "border-[var(--accent)]/90 bg-[var(--accent)]/15 text-[var(--paper)]" : "border-[var(--paper)]/10 bg-[var(--input)]/85 text-[var(--paper)] hover:border-[var(--muted)]/70"}`}
-            onClick={(event) => onSelectStructure(structure.id, event.shiftKey || event.ctrlKey || event.metaKey)}
-          >
-            <span className="block">{index + 1}. {structureLabel(structure.kind)}</span>
-            <span className="text-muted mt-0.5 block text-[10px]">{structure.geometry.length} points</span>
-          </button>;
-        })}
-      </div>
     </div>
   </div>;
 }
@@ -554,23 +452,6 @@ function parsePoints(raw: string): Point[] | null {
   } catch {
     return null;
   }
-}
-
-function structurePayload(kind: string, geometry: Point[], blocks: StructureBlocks) {
-  return { kind, geometry, ...blocks, cover_bonus: 0, pass_rules: {} };
-}
-
-function restorePayload(structure: MapStructure) {
-  const { kind, geometry, blocks_vision, blocks_movement, blocks_attacks, cover_bonus, pass_rules } = structure;
-  return { kind, geometry, blocks_vision, blocks_movement, blocks_attacks, cover_bonus, pass_rules };
-}
-
-function clonePoints(points: Point[]) {
-  return points.map((point) => ({ ...point }));
-}
-
-function sameIds(left: string[], right: string[]) {
-  return left.length === right.length && left.every((id, index) => id === right[index]);
 }
 
 function safeFileName(name: string) {

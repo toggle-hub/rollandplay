@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { geometryBounds, nudgeGeometry, rotateGeometry, scaleGeometry } from "./geometryTransforms";
+import { flipGeometry, geometryBounds, nudgeGeometry, rotateGeometry, scaleGeometry } from "./geometryTransforms";
 
 describe("geometry transforms", () => {
   it("rotates structure points around their bounding-box center", () => {
@@ -20,5 +20,10 @@ describe("geometry transforms", () => {
 
   it("reports re-dimensioned bounds", () => {
     expect(geometryBounds([{ x: 1, y: 2 }, { x: 4, y: 6 }])).toEqual({ width: 3, height: 4 });
+  });
+
+  it("mirrors geometry across its center", () => {
+    expect(flipGeometry([{ x: 1, y: 0 }, { x: 3, y: 2 }], "horizontal")).toEqual([{ x: 3, y: 0 }, { x: 1, y: 2 }]);
+    expect(flipGeometry([{ x: 1, y: 0 }, { x: 3, y: 2 }], "vertical")).toEqual([{ x: 1, y: 2 }, { x: 3, y: 0 }]);
   });
 });

@@ -56,7 +56,7 @@ func newTestApp(t *testing.T) *testApp {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, name := range []string{"004_default_dnd_rule_book.sql", "005_character_creation_rules.sql", "009_rule_book_monsters.sql"} {
+	for _, name := range []string{"004_default_dnd_rule_book.sql", "005_character_creation_rules.sql", "009_rule_book_monsters.sql", "012_key_order.sql"} {
 		seed, err := migrations.Files.ReadFile(name)
 		if err != nil {
 			t.Fatal(err)
@@ -283,6 +283,89 @@ func TestCustomRuleBookSheetDefaults(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestRuleBookAndSheetKeepAuthorKeyOrder(t *testing.T) {
+	a := newTestApp(t)
+	client, _ := login(t, a, "key-order@example.com")
+	abilities := []string{"strength", "dexterity", "constitution", "intelligence", "wisdom", "charisma"}
+
+	builtIn := get[map[string]any](t, client, a.server.URL, "/api/rule-books/00000000-0000-4000-8000-000000000005")
+	order := builtIn["key_order"]
+	if got := orderKeys(t, at(t, order, "attributes")); !reflect.DeepEqual(got[:7], append(append([]string{}, abilities...), "level")) {
+		t.Fatalf("built-in attributes should keep the seed order: %v", got)
+	}
+	if got := orderKeys(t, at(t, order, "attributes", "children", "saving_throw_proficiencies")); !reflect.DeepEqual(got, abilities) {
+		t.Fatalf("built-in saving throws: %v", got)
+	}
+	if got := orderKeys(t, at(t, order, "creation_rules", "children", "classes", "items", 0, "children", "defaults", "children", "saving_throw_proficiencies")); !reflect.DeepEqual(got, abilities) {
+		t.Fatalf("class saving throws: %v", got)
+	}
+	if got := orderKeys(t, at(t, order, "monsters", "items", 0, "children", "stats")); !reflect.DeepEqual(got[:6], abilities) {
+		t.Fatalf("monster stats: %v", got)
+	}
+
+	// json.RawMessage bodies keep the written order; Go maps would sort the keys.
+	book := post[map[string]any](t, client, a.server.URL, "/api/rule-books", json.RawMessage(`{"name":"Ordered","attributes":{"zeal":1,"agility":2,"mind":{"will":1,"focus":2}}}`))
+	bookPath := "/api/rule-books/" + book["id"].(string)
+	if got := orderKeys(t, at(t, book["key_order"], "attributes")); !reflect.DeepEqual(got, []string{"zeal", "agility", "mind"}) {
+		t.Fatalf("created book order: %v", got)
+	}
+	if got := orderKeys(t, at(t, book["key_order"], "attributes", "children", "mind")); !reflect.DeepEqual(got, []string{"will", "focus"}) {
+		t.Fatalf("created book nested order: %v", got)
+	}
+	patch[map[string]any](t, client, a.server.URL, bookPath, map[string]any{"name": "Renamed"})
+	if got := orderKeys(t, at(t, get[map[string]any](t, client, a.server.URL, bookPath)["key_order"], "attributes")); !reflect.DeepEqual(got, []string{"zeal", "agility", "mind"}) {
+		t.Fatalf("a patch without attributes should keep their order: %v", got)
+	}
+	patched := patch[map[string]any](t, client, a.server.URL, bookPath, json.RawMessage(`{"attributes":{"mind":{"focus":2,"will":1},"zeal":1,"agility":2}}`))
+	if got := orderKeys(t, at(t, patched["key_order"], "attributes")); !reflect.DeepEqual(got, []string{"mind", "zeal", "agility"}) {
+		t.Fatalf("patched book order: %v", got)
+	}
+
+	sheet := post[map[string]any](t, client, a.server.URL, "/api/sheets", json.RawMessage(`{"name":"Ada","rule_book_id":"`+book["id"].(string)+`","data":{"zeal":3,"mind":{"will":4,"focus":5}}}`))
+	stored := get[map[string]any](t, client, a.server.URL, "/api/sheets/"+sheet["id"].(string))
+	if got := orderKeys(t, at(t, stored["key_order"], "data")); !reflect.DeepEqual(got, []string{"zeal", "mind", "agility"}) {
+		t.Fatalf("sheet order should be the sent keys, then missing book defaults in book order: %v", got)
+	}
+	if got := orderKeys(t, at(t, stored["key_order"], "data", "children", "mind")); !reflect.DeepEqual(got, []string{"will", "focus"}) {
+		t.Fatalf("sheet nested order: %v", got)
+	}
+}
+
+// at walks a decoded JSON value: string steps index objects, int steps index arrays.
+func at(t *testing.T, value any, path ...any) any {
+	t.Helper()
+	for _, step := range path {
+		switch key := step.(type) {
+		case string:
+			object, ok := value.(map[string]any)
+			if !ok {
+				t.Fatalf("expected an object at %q, got %#v", key, value)
+			}
+			value = object[key]
+		case int:
+			items, ok := value.([]any)
+			if !ok || key >= len(items) {
+				t.Fatalf("expected an array with index %d, got %#v", key, value)
+			}
+			value = items[key]
+		}
+	}
+	return value
+}
+
+func orderKeys(t *testing.T, order any) []string {
+	t.Helper()
+	raw, ok := at(t, order, "keys").([]any)
+	if !ok {
+		t.Fatalf("expected an order with keys, got %#v", order)
+	}
+	keys := make([]string, len(raw))
+	for i, key := range raw {
+		keys[i] = key.(string)
+	}
+	return keys
 }
 
 func TestAuthMagicLinkCookieAndReuse(t *testing.T) {
@@ -529,6 +612,86 @@ func TestMapDeleteOwnerOnlyAndRefusedWhileAttached(t *testing.T) {
 	}
 	if got := get[map[string]any](t, owner, a.server.URL, attachedPath); got["id"] != attached["id"] {
 		t.Fatalf("attached map should survive a refused delete: %+v", got)
+	}
+}
+
+func TestMapStructureOrderAndGroups(t *testing.T) {
+	a := newTestApp(t)
+	owner, _ := login(t, a, "map-order-owner@example.com")
+	m := post[map[string]any](t, owner, a.server.URL, "/api/maps", map[string]any{"name": "Layered Map"})
+	mapPath := "/api/maps/" + m["id"].(string)
+	ids := make([]string, 3)
+	for i := range ids {
+		created := post[map[string]any](t, owner, a.server.URL, mapPath+"/structures", map[string]any{"kind": "wall", "geometry": []map[string]float64{{"x": float64(i), "y": 0}, {"x": float64(i), "y": 5}}})
+		if created["z_index"] != float64(i+1) {
+			t.Fatalf("structure %d should be placed on top with z_index %d: %+v", i, i+1, created)
+		}
+		ids[i] = created["id"].(string)
+	}
+	listed := func() []any {
+		t.Helper()
+		return get[map[string]any](t, owner, a.server.URL, mapPath)["structures"].([]any)
+	}
+	order := func() []string {
+		t.Helper()
+		out := []string{}
+		for _, row := range listed() {
+			out = append(out, row.(map[string]any)["id"].(string))
+		}
+		return out
+	}
+	if got := order(); strings.Join(got, ",") != strings.Join(ids, ",") {
+		t.Fatalf("structures should list in draw order: got %v want %v", got, ids)
+	}
+	patch[map[string]any](t, owner, a.server.URL, mapPath+"/structures/"+ids[2], map[string]any{"z_index": 0})
+	if got := order(); got[0] != ids[2] {
+		t.Fatalf("sending to back should list the structure first: %v", got)
+	}
+
+	const groupID = "6f1c2a7e-4b8d-4c3e-9a51-0d2f6b7c8e90"
+	grouped := patch[map[string]any](t, owner, a.server.URL, mapPath+"/structures/"+ids[0], map[string]any{"group_id": groupID})
+	if grouped["group_id"] != groupID {
+		t.Fatalf("patch should return the group: %+v", grouped)
+	}
+	groupOf := func(id string) any {
+		t.Helper()
+		return entityByID(t, listed(), id)["group_id"]
+	}
+	if got := groupOf(ids[0]); got != groupID {
+		t.Fatalf("group_id should persist: %v", got)
+	}
+	patch[map[string]any](t, owner, a.server.URL, mapPath+"/structures/"+ids[0], map[string]any{"kind": "door"})
+	if got := groupOf(ids[0]); got != groupID {
+		t.Fatalf("a patch without group_id should keep the group: %v", got)
+	}
+	patch[map[string]any](t, owner, a.server.URL, mapPath+"/structures/"+ids[0], map[string]any{"group_id": nil})
+	if got := groupOf(ids[0]); got != nil {
+		t.Fatalf("group_id null should clear the group: %v", got)
+	}
+
+	for _, method := range []string{"POST", "PATCH"} {
+		url := a.server.URL + mapPath + "/structures"
+		if method == "PATCH" {
+			url += "/" + ids[1]
+		}
+		b, _ := json.Marshal(map[string]any{"kind": "wall", "geometry": []map[string]float64{{"x": 0, "y": 0}, {"x": 1, "y": 0}}, "group_id": "nope"})
+		req, _ := http.NewRequest(method, url, bytes.NewReader(b))
+		req.Header.Set("Content-Type", "application/json")
+		res, err := owner.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var body struct {
+			Error struct{ Code string } `json:"error"`
+		}
+		_ = json.NewDecoder(res.Body).Decode(&body)
+		res.Body.Close()
+		if res.StatusCode != 400 || body.Error.Code != "invalid_group_id" {
+			t.Fatalf("%s with an invalid group_id: status %d code %q", method, res.StatusCode, body.Error.Code)
+		}
+	}
+	if got := len(listed()); got != 3 {
+		t.Fatalf("an invalid group_id should not create a structure: %d structures", got)
 	}
 }
 
@@ -1363,6 +1526,157 @@ func TestRoomTokenControls(t *testing.T) {
 	res.Body.Close()
 	if res.StatusCode != 401 {
 		t.Fatalf("assets need a session: status %d", res.StatusCode)
+	}
+}
+
+func TestRoomTokenDragStreaming(t *testing.T) {
+	a := newTestApp(t)
+	dm, _ := login(t, a, "drag-dm@example.com")
+	playerA, _ := login(t, a, "drag-a@example.com")
+	playerB, _ := login(t, a, "drag-b@example.com")
+	rb := post[map[string]any](t, dm, a.server.URL, "/api/rule-books", map[string]any{"name": "Drag Rules", "attributes": map[string]any{}, "is_public": true})
+	sheetA := post[map[string]any](t, playerA, a.server.URL, "/api/sheets", map[string]any{"rule_book_id": rb["id"], "name": "Hero", "data": map[string]any{}})
+	sheetB := post[map[string]any](t, playerB, a.server.URL, "/api/sheets", map[string]any{"rule_book_id": rb["id"], "name": "Scout", "data": map[string]any{}})
+	room := post[map[string]any](t, dm, a.server.URL, "/api/rooms", map[string]any{"name": "Drag", "rule_book_id": rb["id"]})
+	roomID := room["id"].(string)
+	roomPath := "/api/rooms/" + roomID
+	post[map[string]any](t, playerA, a.server.URL, "/api/rooms/join", map[string]any{"invite_code": room["invite_code"]})
+	post[map[string]any](t, playerB, a.server.URL, "/api/rooms/join", map[string]any{"invite_code": room["invite_code"]})
+	gm := post[map[string]any](t, dm, a.server.URL, "/api/maps", map[string]any{"name": "Field", "width_m": 20, "height_m": 20})
+	post[map[string]any](t, dm, a.server.URL, "/api/maps/"+gm["id"].(string)+"/structures", map[string]any{"kind": "wall", "geometry": []map[string]float64{{"x": 5, "y": 0}, {"x": 5, "y": 20}}, "blocks_vision": false, "blocks_movement": true, "blocks_attacks": true, "cover_bonus": 0, "pass_rules": map[string]bool{}})
+	post[map[string]any](t, dm, a.server.URL, roomPath+"/maps", map[string]any{"map_id": gm["id"], "is_active": true})
+	hero := post[map[string]any](t, playerA, a.server.URL, roomPath+"/tokens", map[string]any{"sheet_id": sheetA["id"], "name": "Hero", "x_m": 1, "y_m": 1})
+	post[map[string]any](t, playerB, a.server.URL, roomPath+"/tokens", map[string]any{"sheet_id": sheetB["id"], "name": "Scout", "x_m": 1, "y_m": 18})
+	goblin := post[map[string]any](t, dm, a.server.URL, roomPath+"/tokens", map[string]any{"name": "Goblin", "x_m": 3, "y_m": 1})
+	lurker := post[map[string]any](t, dm, a.server.URL, roomPath+"/tokens", map[string]any{"name": "Lurker", "x_m": 2, "y_m": 2})
+	heroID, goblinID, lurkerID := hero["id"].(string), goblin["id"].(string), lurker["id"].(string)
+
+	dmWS, aWS, bWS := dialWS(t, a, dm, roomID), dialWS(t, a, playerA, roomID), dialWS(t, a, playerB, roomID)
+	for _, conn := range []*websocket.Conn{dmWS, aWS, bWS} {
+		defer conn.Close()
+		readType(t, conn, "state.snapshot")
+	}
+	sendWS(t, dmWS, "token.visibility", "hide-lurker", map[string]any{"tokenId": lurkerID, "isHidden": true})
+	if ev := readType(t, dmWS, "token.updated"); ev["requestId"] != "hide-lurker" {
+		t.Fatalf("lurker was not hidden: %+v", ev)
+	}
+
+	// A chat marker sent after a frame on the same connection is published after it, so the
+	// events before the marker are everything that frame produced.
+	mark := func(conn *websocket.Conn, id string) {
+		t.Helper()
+		sendWS(t, conn, "chat.send", id, map[string]any{"text": id})
+	}
+	until := func(conn *websocket.Conn, id string) []map[string]any {
+		t.Helper()
+		_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+		var events []map[string]any
+		for {
+			var ev map[string]any
+			if err := conn.ReadJSON(&ev); err != nil {
+				t.Fatalf("waiting for marker %s: %v", id, err)
+			}
+			if body, _ := ev["body"].(map[string]any); ev["type"] == "chat.message" && body["body"] == id {
+				return events
+			}
+			events = append(events, ev)
+		}
+	}
+	ofType := func(events []map[string]any, typ string) []map[string]any {
+		var out []map[string]any
+		for _, ev := range events {
+			if ev["type"] == typ {
+				out = append(out, ev)
+			}
+		}
+		return out
+	}
+	move := func(id string, x, y float64) map[string]any {
+		return map[string]any{"tokenId": id, "to": map[string]float64{"x": x, "y": y}}
+	}
+	drag := func(conn *websocket.Conn, moves ...map[string]any) {
+		t.Helper()
+		sendWS(t, conn, "token.drag", "", map[string]any{"moves": moves})
+	}
+	endedIDs := func(ev map[string]any) string {
+		b, _ := json.Marshal(ev["body"].(map[string]any)["token_ids"])
+		return string(b)
+	}
+
+	// 1. A player sees only the dragged tokens visible to them; the dragger gets no echo.
+	drag(dmWS, move(goblinID, 3.25, 1.5), move(lurkerID, 2.5, 2.5))
+	mark(dmWS, "m1")
+	frames := ofType(until(aWS, "m1"), "token.dragging")
+	if len(frames) != 1 {
+		t.Fatalf("player A should get one drag frame, got %+v", frames)
+	}
+	if got, want := fmtBody(frames[0]), `{"moves":[{"token_id":"`+goblinID+`","x":3.25,"y":1.5}],"room_id":"`+roomID+`"}`; got != want {
+		t.Fatalf("player A frame: got %s, want %s", got, want)
+	}
+	if frames := ofType(until(bWS, "m1"), "token.dragging"); len(frames) != 0 {
+		t.Fatalf("player B sees neither token: %+v", frames)
+	}
+	if frames := ofType(until(dmWS, "m1"), "token.dragging"); len(frames) != 0 {
+		t.Fatalf("the dragger should not get its own frame: %+v", frames)
+	}
+
+	// 2. The game master sees a player's drag.
+	drag(aWS, move(heroID, 2.5, 1.5))
+	mark(aWS, "m2")
+	if frames := ofType(until(dmWS, "m2"), "token.dragging"); len(frames) != 1 || !strings.Contains(fmtBody(frames[0]), heroID) {
+		t.Fatalf("game master should see the hero drag: %+v", frames)
+	}
+	if frames := ofType(until(aWS, "m2"), "token.dragging"); len(frames) != 0 {
+		t.Fatalf("the dragger should not get its own frame: %+v", frames)
+	}
+
+	// 3. A token the player may not move is ignored without an error.
+	drag(aWS, move(goblinID, 4, 4))
+	mark(aWS, "m3")
+	if frames := ofType(until(dmWS, "m3"), "token.dragging"); len(frames) != 0 {
+		t.Fatalf("a forbidden drag should not be relayed: %+v", frames)
+	}
+	if errs := ofType(until(aWS, "m3"), "error"); len(errs) != 0 {
+		t.Fatalf("a forbidden drag should not reply with an error: %+v", errs)
+	}
+
+	// 4. A blocked drop ends the live drag.
+	drag(aWS, move(heroID, 6.5, 1.5))
+	sendWS(t, aWS, "token.move", "blocked", move(heroID, 6.5, 1.5))
+	if ev := readType(t, aWS, "error"); ev["requestId"] != "blocked" || ev["body"].(map[string]any)["code"] != "blocked_movement" {
+		t.Fatalf("want blocked_movement, got %+v", ev)
+	}
+	if ids := endedIDs(readType(t, dmWS, "token.drag.ended")); ids != `["`+heroID+`"]` {
+		t.Fatalf("blocked drop should end the hero drag: %s", ids)
+	}
+
+	// 5. Cancelling ends the live drag.
+	drag(aWS, move(heroID, 2.5, 1.5))
+	sendWS(t, aWS, "token.drag.end", "", map[string]any{})
+	if ids := endedIDs(readType(t, dmWS, "token.drag.ended")); ids != `["`+heroID+`"]` {
+		t.Fatalf("cancel should end the hero drag: %s", ids)
+	}
+
+	// 6. A successful drop replaces the drag with token.moved.
+	drag(aWS, move(heroID, 2.5, 1.5))
+	sendWS(t, aWS, "token.move", "landed", move(heroID, 2.5, 1.5))
+	mark(aWS, "m6")
+	events := until(dmWS, "m6")
+	moved := ofType(events, "token.moved")
+	if len(moved) != 1 || moved[0]["requestId"] != "landed" || endedIDs(moved[0]) != `["`+heroID+`"]` {
+		t.Fatalf("want one token.moved for the hero, got %+v", moved)
+	}
+	if ended := ofType(events, "token.drag.ended"); len(ended) != 0 {
+		t.Fatalf("a landed drag should not also end: %+v", ended)
+	}
+
+	// 7. Disconnecting mid-drag ends the live drag.
+	drag(aWS, move(heroID, 3.5, 1.5))
+	mark(aWS, "m7")
+	until(dmWS, "m7")
+	aWS.Close()
+	if ids := endedIDs(readType(t, dmWS, "token.drag.ended")); ids != `["`+heroID+`"]` {
+		t.Fatalf("disconnect should end the hero drag: %s", ids)
 	}
 }
 

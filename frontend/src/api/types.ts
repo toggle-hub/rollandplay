@@ -111,6 +111,9 @@ export type MapStructure = {
   cover_bonus: number;
   pass_rules: Record<string, boolean>;
   is_hidden?: boolean;
+  /** Draw order inside the map (higher draws on top). Map endpoints always send it; room state does not. */
+  z_index?: number;
+  group_id?: string | null;
 };
 export type GameMap = {
   id: string;
@@ -234,6 +237,8 @@ export type VisibleRoomState = {
     visibleStructureIds: string[];
   };
 };
+/** A live drag by someone else at the table: where their dragged tokens are right now. */
+export type TokenDragFrame = { room_id: string; moves: { token_id: string; x: number; y: number }[] };
 export type ClientEnvelope = { type: string; requestId: string; body: unknown };
 export type ServerEnvelope<T = unknown> = {
   type: string;

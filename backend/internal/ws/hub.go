@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"math"
 	"net/http"
+	"slices"
 	"sync"
 	"time"
 
@@ -33,12 +34,16 @@ type Hub struct {
 	logger   *zap.Logger
 }
 type client struct {
-	hub    *Hub
-	conn   *websocket.Conn
-	send   chan envelope
-	roomID string
-	userID string
-	isDM   bool
+	hub          *Hub
+	conn         *websocket.Conn
+	send         chan envelope
+	roomID       string
+	userID       string
+	isDM         bool
+	connID       string       // random per connection; lets broadcasts skip the sender
+	dragging     []string     // token IDs of this connection's live drag; touched only on the read goroutine
+	dragTokens   []game.Token // room tokens cached for drag frames
+	dragTokensAt time.Time
 }
 type envelope struct {
 	Type      string  `json:"type"`
@@ -49,6 +54,22 @@ type clientEnvelope struct {
 	Type      string          `json:"type"`
 	RequestID string          `json:"requestId"`
 	Body      json.RawMessage `json:"body"`
+}
+
+// dragCacheTTL is how long drag frames reuse the room's tokens before reloading them.
+const dragCacheTTL = time.Second
+
+// dragFrame is a live drag as published to every backend; visible_to is stripped per recipient.
+type dragFrame struct {
+	RoomID string     `json:"room_id"`
+	ConnID string     `json:"conn_id"`
+	Moves  []dragMove `json:"moves"`
+}
+type dragMove struct {
+	TokenID   string   `json:"token_id"`
+	X         float64  `json:"x"`
+	Y         float64  `json:"y"`
+	VisibleTo []string `json:"visible_to,omitempty"`
 }
 
 func NewHub(pool *pgxpool.Pool, rdb *redis.Client) *Hub {
@@ -97,7 +118,7 @@ func (h *Hub) Handle(w http.ResponseWriter, r *http.Request) {
 		h.logger.Warn("websocket upgrade failed", zap.String("room_id", roomID), zap.String("user_id", u.ID), zap.Error(err))
 		return
 	}
-	c := &client{hub: h, conn: conn, send: make(chan envelope, 32), roomID: roomID, userID: u.ID, isDM: isDM}
+	c := &client{hub: h, conn: conn, send: make(chan envelope, 32), roomID: roomID, userID: u.ID, isDM: isDM, connID: uuid.New().String()}
 	h.mu.Lock()
 	h.clients[c] = true
 	h.mu.Unlock()
@@ -133,19 +154,57 @@ func (h *Hub) publish(roomID string, ev envelope) {
 	h.broadcastEnvelope(ev)
 }
 func (h *Hub) broadcastEnvelope(ev envelope) {
+	var frame dragFrame
+	isDrag := ev.Type == "token.dragging"
+	if isDrag {
+		b, err := json.Marshal(ev.Body)
+		if err != nil || json.Unmarshal(b, &frame) != nil {
+			return
+		}
+	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	for c := range h.clients {
-		if c.canReceive(ev) {
-			select {
-			case c.send <- ev:
-			default:
-				h.logger.Warn("websocket client send buffer full", zap.String("room_id", c.roomID), zap.String("user_id", c.userID), zap.String("type", ev.Type))
-				close(c.send)
-				delete(h.clients, c)
+		out := ev
+		if isDrag {
+			view, ok := c.dragView(frame)
+			if !ok {
+				continue
 			}
+			out = envelope{Type: ev.Type, Body: view}
+		} else if !c.canReceive(ev) {
+			continue
+		}
+		select {
+		case c.send <- out:
+		default:
+			if isDrag {
+				continue // live frames are disposable; the next one or the drop catches up
+			}
+			h.logger.Warn("websocket client send buffer full", zap.String("room_id", c.roomID), zap.String("user_id", c.userID), zap.String("type", ev.Type))
+			close(c.send)
+			delete(h.clients, c)
 		}
 	}
+}
+
+// dragView is the part of a live drag frame this client may see: game masters see every
+// dragged token, players only the ones visible to them at the dragged position.
+func (c *client) dragView(f dragFrame) (map[string]any, bool) {
+	if f.RoomID != c.roomID || f.ConnID == c.connID {
+		return nil, false
+	}
+	kept := make([]dragMove, 0, len(f.Moves))
+	for _, m := range f.Moves {
+		if c.isDM || slices.Contains(m.VisibleTo, c.userID) {
+			m.VisibleTo = nil
+			kept = append(kept, m)
+		}
+	}
+	if len(kept) == 0 {
+		return nil, false
+	}
+	return map[string]any{"room_id": f.RoomID, "moves": kept}, true
 }
 func (c *client) canReceive(ev envelope) bool {
 	bodyBytes, _ := json.Marshal(ev.Body)
@@ -155,6 +214,9 @@ func (c *client) canReceive(ev envelope) bool {
 		return false
 	}
 	if room, ok := m["roomId"].(string); ok && room != "" && room != c.roomID {
+		return false
+	}
+	if conn, ok := m["conn_id"].(string); ok && conn != "" && conn == c.connID {
 		return false
 	}
 	if ev.Type == "chat.message" || ev.Type == "roll.result" || ev.Type == "check.changed" {
@@ -210,6 +272,7 @@ func (c *client) writeLoop() {
 	}
 }
 func (c *client) close() {
+	c.endDrag()
 	closed := false
 	c.hub.mu.Lock()
 	if c.hub.clients[c] {
@@ -241,6 +304,10 @@ func (c *client) handle(msg clientEnvelope) {
 		c.tokenMove(msg)
 	case "tokens.move":
 		c.tokensMove(msg)
+	case "token.drag":
+		c.tokenDrag(msg)
+	case "token.drag.end":
+		c.endDrag()
 	case "token.remove":
 		c.tokenRemove(msg)
 	case "token.visibility":
@@ -341,6 +408,7 @@ func (c *client) chatSend(msg clientEnvelope) {
 }
 
 func (c *client) tokenMove(msg clientEnvelope) {
+	defer c.endDrag()
 	var req struct {
 		TokenID string       `json:"tokenId"`
 		To      game.Point   `json:"to"`
@@ -375,8 +443,9 @@ func (c *client) tokenMove(msg clientEnvelope) {
 		c.error(msg.RequestID, "db", err.Error())
 		return
 	}
+	c.dragging = nil // token.moved replaces the drag preview
 	c.hub.bump(c.roomID)
-	c.hub.publish(c.roomID, envelope{Type: "token.moved", RequestID: &msg.RequestID, Body: map[string]any{"room_id": c.roomID, "token_id": req.TokenID, "to": req.To}})
+	c.hub.publish(c.roomID, envelope{Type: "token.moved", RequestID: &msg.RequestID, Body: map[string]any{"room_id": c.roomID, "token_ids": []string{req.TokenID}}})
 	c.hub.publish(c.roomID, envelope{Type: "vision.update", RequestID: nil, Body: map[string]any{"room_id": c.roomID, "version": time.Now().UnixNano()}})
 }
 
@@ -386,6 +455,7 @@ const maxGroupMove = 100
 // tokensMove moves several tokens at once. Every move is checked before any is written,
 // so the group lands together or not at all.
 func (c *client) tokensMove(msg clientEnvelope) {
+	defer c.endDrag()
 	var req struct {
 		Moves []struct {
 			TokenID string     `json:"tokenId"`
@@ -441,9 +511,93 @@ func (c *client) tokensMove(msg clientEnvelope) {
 		c.error(msg.RequestID, "db", err.Error())
 		return
 	}
+	c.dragging = nil // token.moved replaces the drag preview
 	c.hub.bump(c.roomID)
 	c.hub.publish(c.roomID, envelope{Type: "token.moved", RequestID: &msg.RequestID, Body: map[string]any{"room_id": c.roomID, "token_ids": ids}})
 	c.hub.publish(c.roomID, envelope{Type: "vision.update", RequestID: nil, Body: map[string]any{"room_id": c.roomID, "version": time.Now().UnixNano()}})
+}
+
+// tokenDrag relays a live drag preview to the table. Nothing is stored and movement blocking
+// is not checked; the drop is a regular move. Each move goes only to players who would see the
+// token at its dragged position. Frames the sender may not make are dropped without a reply.
+func (c *client) tokenDrag(msg clientEnvelope) {
+	var req struct {
+		Moves []struct {
+			TokenID string     `json:"tokenId"`
+			To      game.Point `json:"to"`
+		} `json:"moves"`
+	}
+	if json.Unmarshal(msg.Body, &req) != nil || len(req.Moves) == 0 || len(req.Moves) > maxGroupMove {
+		c.error(msg.RequestID, "bad_json", "invalid body")
+		return
+	}
+	stale := time.Since(c.dragTokensAt) > dragCacheTTL
+	for _, m := range req.Moves {
+		if stale {
+			break
+		}
+		stale = !slices.ContainsFunc(c.dragTokens, func(t game.Token) bool { return t.ID == m.TokenID })
+	}
+	if stale {
+		tokens, err := LoadActiveTokens(context.Background(), c.hub.pool, c.roomID)
+		if err != nil {
+			c.hub.logger.Error("token drag tokens load failed", zap.String("room_id", c.roomID), zap.String("user_id", c.userID), zap.Error(err))
+			return
+		}
+		c.dragTokens, c.dragTokensAt = tokens, time.Now()
+	}
+	moved := slices.Clone(c.dragTokens)
+	index := make(map[string]int, len(req.Moves))
+	for _, m := range req.Moves {
+		i := slices.IndexFunc(moved, func(t game.Token) bool { return t.ID == m.TokenID })
+		if _, dup := index[m.TokenID]; dup || i < 0 || !moved[i].MovableBy(c.userID, c.isDM) {
+			c.hub.logger.Debug("token drag ignored", zap.String("room_id", c.roomID), zap.String("user_id", c.userID))
+			return
+		}
+		index[m.TokenID] = i
+		moved[i].X, moved[i].Y = m.To.X, m.To.Y
+	}
+	// A player with no token and no move rights sees nothing, so owners and movers are every
+	// possible viewer.
+	var viewers []string
+	addViewer := func(uid string) {
+		if uid != "" && !slices.Contains(viewers, uid) {
+			viewers = append(viewers, uid)
+		}
+	}
+	for _, t := range moved {
+		addViewer(t.OwnerUserID)
+	}
+	for _, i := range index {
+		for _, uid := range moved[i].MoverUserIDs {
+			addViewer(uid)
+		}
+	}
+	moves := make([]dragMove, 0, len(req.Moves))
+	ids := make([]string, 0, len(req.Moves))
+	for _, m := range req.Moves {
+		t := moved[index[m.TokenID]]
+		var visibleTo []string
+		for _, uid := range viewers {
+			if game.TokenVisibleTo(uid, t, moved) {
+				visibleTo = append(visibleTo, uid)
+			}
+		}
+		moves = append(moves, dragMove{TokenID: t.ID, X: t.X, Y: t.Y, VisibleTo: visibleTo})
+		ids = append(ids, t.ID)
+	}
+	c.dragging = ids
+	c.hub.publish(c.roomID, envelope{Type: "token.dragging", Body: dragFrame{RoomID: c.roomID, ConnID: c.connID, Moves: moves}})
+}
+
+// endDrag tells the table this connection's live drag is over, so previews snap back to the stored position.
+func (c *client) endDrag() {
+	if len(c.dragging) == 0 {
+		return
+	}
+	ids := c.dragging
+	c.dragging = nil
+	c.hub.publish(c.roomID, envelope{Type: "token.drag.ended", Body: map[string]any{"room_id": c.roomID, "conn_id": c.connID, "token_ids": ids}})
 }
 
 // tokenRemove deletes a token from the table; only its owner or the game master may do it.
@@ -617,7 +771,7 @@ func (c *client) structureCreate(msg clientEnvelope) {
 	}
 	structure := game.Structure{ID: uuid.New().String(), Kind: req.Kind, Geometry: req.Geometry, BlocksVision: req.BlocksVision, BlocksMovement: req.BlocksMovement, BlocksAttacks: req.BlocksAttacks, PassRules: map[string]bool{}}
 	geometry, _ := json.Marshal(structure.Geometry)
-	_, err = tx.Exec(ctx, `insert into map_structures(id,map_id,room_map_id,kind,geometry,blocks_vision,blocks_movement,blocks_attacks,cover_bonus,pass_rules) values($1,$2,$3,$4,$5,$6,$7,$8,0,'{}'::jsonb)`, structure.ID, mapID, roomMapID, structure.Kind, json.RawMessage(geometry), structure.BlocksVision, structure.BlocksMovement, structure.BlocksAttacks)
+	_, err = tx.Exec(ctx, `insert into map_structures(id,map_id,room_map_id,kind,geometry,blocks_vision,blocks_movement,blocks_attacks,cover_bonus,pass_rules,z_index) values($1,$2,$3,$4,$5,$6,$7,$8,0,'{}'::jsonb,(select coalesce(max(z_index),0)+1 from map_structures where map_id=$2))`, structure.ID, mapID, roomMapID, structure.Kind, json.RawMessage(geometry), structure.BlocksVision, structure.BlocksMovement, structure.BlocksAttacks)
 	if err == nil {
 		err = tx.Commit(ctx)
 	}
@@ -755,7 +909,7 @@ func (h *Hub) isDM(ctx context.Context, userID, roomID string) bool {
 	return ok
 }
 func (h *Hub) loadStructures(ctx context.Context, roomID string) ([]game.Structure, error) {
-	rows, err := h.pool.Query(ctx, `select ms.id::text,ms.kind,coalesce(rmss.geometry,ms.geometry),ms.blocks_vision,ms.blocks_movement,ms.blocks_attacks,ms.cover_bonus,ms.pass_rules,coalesce(rmss.is_hidden,false) from map_structures ms join room_maps rm on rm.map_id=ms.map_id left join room_map_structure_states rmss on rmss.room_map_id=rm.id and rmss.structure_id=ms.id where rm.room_id=$1 and rm.is_active and (ms.room_map_id is null or ms.room_map_id=rm.id) and not coalesce(rmss.is_removed,false)`, roomID)
+	rows, err := h.pool.Query(ctx, `select ms.id::text,ms.kind,coalesce(rmss.geometry,ms.geometry),ms.blocks_vision,ms.blocks_movement,ms.blocks_attacks,ms.cover_bonus,ms.pass_rules,coalesce(rmss.is_hidden,false) from map_structures ms join room_maps rm on rm.map_id=ms.map_id left join room_map_structure_states rmss on rmss.room_map_id=rm.id and rmss.structure_id=ms.id where rm.room_id=$1 and rm.is_active and (ms.room_map_id is null or ms.room_map_id=rm.id) and not coalesce(rmss.is_removed,false) order by ms.z_index, ms.created_at, ms.id`, roomID)
 	if err != nil {
 		return nil, err
 	}

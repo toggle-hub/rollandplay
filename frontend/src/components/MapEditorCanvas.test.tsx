@@ -35,8 +35,8 @@ function drag(canvas: HTMLElement, from: { clientX: number; clientY: number }, t
   fireEvent.pointerUp(canvas, to);
 }
 
-function Editor({ initialSelection = [], onDelete }: { initialSelection?: string[]; onDelete?: () => void }) {
-  const [structures, setStructures] = useState([wall, other]);
+function Editor({ initialSelection = [], initialStructures = [wall, other] }: { initialSelection?: string[]; initialStructures?: MapStructure[] }) {
+  const [structures, setStructures] = useState(initialStructures);
   const [selected, setSelected] = useState(initialSelection);
   return <>
     <MapEditorCanvas
@@ -44,7 +44,6 @@ function Editor({ initialSelection = [], onDelete }: { initialSelection?: string
       structures={structures}
       selectedStructureIds={selected}
       onSelectStructures={setSelected}
-      onDeleteSelection={onDelete}
       onTransformStructures={(changes) => setStructures((current) => current.map((structure) => changes.find((change) => change.id === structure.id) ? { ...structure, geometry: changes.find((change) => change.id === structure.id)!.geometry } : structure))}
     />
     <output data-testid="geometry">{JSON.stringify(Object.fromEntries(structures.map((structure) => [structure.id, structure.geometry])))}</output>
@@ -60,6 +59,7 @@ describe("MapEditorCanvas", () => {
     vi.stubGlobal("PointerEvent", MouseEvent);
     globalThis.__canvasContext.arc.mockClear();
     globalThis.__canvasContext.fillRect.mockClear();
+    globalThis.__canvasContext.setLineDash.mockClear();
   });
   afterEach(cleanup);
 
@@ -86,20 +86,17 @@ describe("MapEditorCanvas", () => {
     expect(transform).toHaveBeenCalledWith([{ id: "wall", geometry: [{ x: 5, y: 6 }, { x: 11, y: 6 }] }], "move");
   });
 
-  it("zooms in and out around the pointer only while Control is held", () => {
+  it("zooms in and out around the pointer with the plain mouse wheel", () => {
     render(<MapEditorCanvas map={map} structures={[wall]} />);
     const canvas = screen.getByTestId("map-editor-canvas");
     const pointer = screenPoint(5, 4);
 
     fireEvent.wheel(canvas, { ...pointer, deltaY: -100 });
-    expect(screen.getByText("85%")).toBeInTheDocument();
-
-    fireEvent.wheel(canvas, { ...pointer, deltaY: -100, ctrlKey: true });
     expect(screen.getByText("100%")).toBeInTheDocument();
     fireEvent.pointerMove(canvas, pointer);
     expect(screen.getByText("wall")).toBeInTheDocument();
 
-    fireEvent.wheel(canvas, { ...pointer, deltaY: 100, ctrlKey: true });
+    fireEvent.wheel(canvas, { ...pointer, deltaY: 100 });
     expect(screen.getByText("85%")).toBeInTheDocument();
   });
 
@@ -169,7 +166,7 @@ describe("MapEditorCanvas", () => {
     expect(geometryOf("other")).toEqual([{ x: 20, y: 16 }, { x: 32, y: 16 }]);
   });
 
-  it("toggles structures in and out of the selection with Shift-click and clears it on empty clicks or Escape", () => {
+  it("toggles structures in and out of the selection with Shift-click and clears it on empty clicks", () => {
     render(<Editor />);
     const canvas = screen.getByTestId("map-editor-canvas");
     const click = (point: { clientX: number; clientY: number }, shiftKey = false) => {
@@ -184,47 +181,69 @@ describe("MapEditorCanvas", () => {
     expect(selection()).toEqual(["other"]);
     click(screenPoint(2, 14));
     expect(selection()).toEqual([]);
-
-    click(screenPoint(5, 4));
-    fireEvent.keyDown(canvas, { key: "Escape" });
-    expect(selection()).toEqual([]);
     expect(geometryOf("wall")).toEqual(wall.geometry);
   });
 
-  it("places the draft on an empty click only when nothing is selected", () => {
-    const moveDraft = vi.fn();
+  it("selects and moves grouped structures together", () => {
+    render(<Editor initialStructures={[{ ...wall, group_id: "g" }, { ...other, group_id: "g" }]} />);
+    const canvas = screen.getByTestId("map-editor-canvas");
+
+    drag(canvas, screenPoint(5, 4), screenPoint(5, 5));
+
+    expect(selection()).toEqual(["wall", "other"]);
+    expect(geometryOf("wall")).toEqual([{ x: 4, y: 5 }, { x: 10, y: 5 }]);
+    expect(geometryOf("other")).toEqual([{ x: 12, y: 11 }, { x: 18, y: 11 }]);
+
+    fireEvent.pointerDown(canvas, { ...screenPoint(14, 11), button: 0, shiftKey: true });
+    fireEvent.pointerUp(canvas, screenPoint(14, 11));
+    expect(selection()).toEqual([]);
+  });
+
+  it("previews the stamp under the pointer and places it on click with the Place tool", () => {
+    const place = vi.fn();
     const select = vi.fn();
-    const draft = { ...wall, geometry: [{ x: 1, y: 8 }, { x: 3, y: 8 }] };
-    const { rerender } = render(<MapEditorCanvas map={map} structures={[wall]} draftStructure={draft} selectedStructureIds={["wall"]} onSelectStructures={select} onMoveDraft={moveDraft} />);
-    const canvas = screen.getByTestId("map-editor-canvas");
-    fireEvent.pointerDown(canvas, { ...screenPoint(14, 14), button: 0 });
-    fireEvent.pointerUp(canvas, screenPoint(14, 14));
-    expect(select).toHaveBeenCalledWith([]);
-    expect(moveDraft).not.toHaveBeenCalled();
-
-    rerender(<MapEditorCanvas map={map} structures={[wall]} draftStructure={draft} onSelectStructures={select} onMoveDraft={moveDraft} />);
-    fireEvent.pointerDown(canvas, { ...screenPoint(14, 14), button: 0 });
-    fireEvent.pointerUp(canvas, screenPoint(14, 14));
-    expect(moveDraft).toHaveBeenCalledWith({ x: 14, y: 14 });
-  });
-
-  it("asks to delete the selection with Delete or Backspace only when something is selected", () => {
-    const remove = vi.fn();
-    render(<Editor onDelete={remove} />);
-    const canvas = screen.getByTestId("map-editor-canvas");
-
-    fireEvent.keyDown(canvas, { key: "Delete" });
-    expect(remove).not.toHaveBeenCalled();
-
-    drag(canvas, screenPoint(2, 2), screenPoint(19, 11));
-    fireEvent.keyDown(canvas, { key: "Backspace" });
-    expect(remove).toHaveBeenCalledTimes(1);
-  });
-
-  it("restores the draft when a handle rotation is cancelled", () => {
     const transform = vi.fn();
-    const end = vi.fn();
-    render(<MapEditorCanvas map={map} structures={[]} draftStructure={wall} onTransformDraft={transform} onTransformDraftEnd={end} />);
+    render(<MapEditorCanvas map={map} structures={[wall]} selectedStructureIds={["wall"]} tool="place" stamp={{ kind: "door", rotationDeg: 0, scalePercent: 100 }} onPlace={place} onSelectStructures={select} onTransformStructures={transform} />);
+    const canvas = screen.getByTestId("map-editor-canvas");
+
+    globalThis.__canvasContext.setLineDash.mockClear();
+    fireEvent.pointerMove(canvas, screenPoint(14, 14));
+    expect(globalThis.__canvasContext.setLineDash).toHaveBeenCalledWith([8, 5]);
+    expect(canvas.style.cursor).toBe("crosshair");
+    expect(screen.queryByText("Vision")).not.toBeInTheDocument();
+
+    drag(canvas, screenPoint(5, 4), screenPoint(8, 8));
+    expect(place).toHaveBeenCalledExactlyOnceWith({ x: 5, y: 4 });
+    expect(select).not.toHaveBeenCalled();
+    expect(transform).not.toHaveBeenCalled();
+  });
+
+  it("opens structure actions on a right click without drag, while a right drag still pans", () => {
+    const action = vi.fn();
+    const select = vi.fn();
+    const actions = [{ id: "front", label: "Bring to front" }, { id: "delete", label: "Delete", danger: true }];
+    render(<MapEditorCanvas map={map} structures={[wall]} contextActions={actions} onSelectStructures={select} onContextAction={action} />);
+    const canvas = screen.getByTestId("map-editor-canvas");
+
+    drag(canvas, screenPoint(1, 1), { clientX: screenPoint(1, 1).clientX + 72, clientY: screenPoint(1, 1).clientY }, { button: 2 });
+    expect(screen.queryByRole("menu")).not.toBeInTheDocument();
+
+    const onWall = { ...screenPoint(5, 4), clientX: screenPoint(5, 4).clientX + 72 };
+    fireEvent.pointerDown(canvas, { ...onWall, button: 2 });
+    fireEvent.pointerUp(canvas, { ...onWall, button: 2 });
+    expect(select).toHaveBeenCalledWith(["wall"]);
+    const menu = screen.getByRole("menu", { name: "Structure actions" });
+    expect(screen.getAllByRole("menuitem").map((item) => item.textContent)).toEqual(["Bring to front", "Delete"]);
+    expect(menu).toContainElement(document.activeElement as HTMLElement);
+
+    fireEvent.click(screen.getByRole("menuitem", { name: "Bring to front" }));
+    expect(action).toHaveBeenCalledWith("front");
+    expect(screen.queryByRole("menu")).not.toBeInTheDocument();
+  });
+
+  it("cancels a drag with Escape or pointercancel", () => {
+    const transform = vi.fn();
+    render(<MapEditorCanvas map={map} structures={[wall]} selectedStructureIds={["wall"]} onTransformStructures={transform} />);
     const canvas = screen.getByTestId("map-editor-canvas");
 
     for (const cancellation of ["Escape", "pointercancel"]) {
@@ -233,12 +252,8 @@ describe("MapEditorCanvas", () => {
       if (cancellation === "Escape") fireEvent.keyDown(canvas, { key: "Escape" });
       else fireEvent.pointerCancel(canvas);
       fireEvent.pointerUp(canvas, screenPoint(10, 4));
-      expect(transform).toHaveBeenLastCalledWith(wall.geometry, "rotate");
-      expect(end).not.toHaveBeenCalled();
     }
-
-    drag(canvas, rotateHandle(7, 4), screenPoint(10, 4));
-    expect(end).toHaveBeenCalledWith(wall.geometry, [{ x: 7, y: 1 }, { x: 7, y: 7 }], "rotate");
+    expect(transform).not.toHaveBeenCalled();
   });
 
   it("cancels a transform when disabled", () => {

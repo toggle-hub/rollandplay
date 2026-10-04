@@ -252,6 +252,69 @@ describe("MapCanvas", () => {
     expect(move).toHaveBeenCalledWith("big", { x: 3, y: 4 }, [{ x: 2, y: 2 }, { x: 3, y: 4 }]);
   });
 
+  describe("live token drag", () => {
+    const token = { ...tokenBase, id: "token", name: "Hero", x_m: 1, y_m: 1 };
+    function renderDrag(dragged = token) {
+      const onDragTokens = vi.fn();
+      const onDragTokensEnd = vi.fn();
+      const onMoveToken = vi.fn();
+      const { container } = render(
+        <MapCanvas
+          state={{ ...state, visibleTokens: [dragged] }}
+          onDragTokens={onDragTokens}
+          onDragTokensEnd={onDragTokensEnd}
+          onMoveToken={onMoveToken}
+        />,
+      );
+      return { canvas: container.querySelector("canvas")!, onDragTokens, onDragTokensEnd, onMoveToken };
+    }
+
+    it("keeps the token under the pointer, ghosts its landing cell and snaps it on drop", () => {
+      const { canvas, onDragTokens, onDragTokensEnd, onMoveToken } = renderDrag();
+      const arc = globalThis.__canvasContext.arc;
+      arc.mockClear();
+      fireEvent.pointerDown(canvas, { clientX: 72, clientY: 72, button: 0 });
+      fireEvent.pointerMove(canvas, { clientX: 216, clientY: 144 });
+      expect(onDragTokens).toHaveBeenLastCalledWith([{ tokenId: "token", to: { x: 3, y: 2 } }]);
+      expect(arc).toHaveBeenCalledWith(72, 48, 12, 0, Math.PI * 2);
+      expect(arc).toHaveBeenCalledWith(84, 60, 12, 0, Math.PI * 2);
+      fireEvent.pointerUp(canvas, { clientX: 216, clientY: 144 });
+      expect(onMoveToken).toHaveBeenCalledExactlyOnceWith("token", { x: 3.5, y: 2.5 }, [{ x: 1, y: 1 }, { x: 3.5, y: 2.5 }]);
+      fireEvent.lostPointerCapture(canvas);
+      expect(onDragTokensEnd).not.toHaveBeenCalled();
+    });
+
+    it("ends the live drag without moving when Escape cancels it", () => {
+      const { canvas, onDragTokensEnd, onMoveToken } = renderDrag();
+      fireEvent.pointerDown(canvas, { clientX: 72, clientY: 72, button: 0 });
+      fireEvent.pointerMove(canvas, { clientX: 216, clientY: 144 });
+      fireEvent.keyDown(canvas, { key: "Escape" });
+      expect(onDragTokensEnd).toHaveBeenCalledTimes(1);
+      fireEvent.pointerUp(canvas, { clientX: 216, clientY: 144 });
+      expect(onMoveToken).not.toHaveBeenCalled();
+      expect(onDragTokensEnd).toHaveBeenCalledTimes(1);
+    });
+
+    it("ends the live drag without moving when the token is dropped where it started", () => {
+      // A token already centred on its cell, so dropping it where it was grabbed lands where it started.
+      const { canvas, onDragTokensEnd, onMoveToken } = renderDrag({ ...token, x_m: 1.5, y_m: 1.5 });
+      fireEvent.pointerDown(canvas, { clientX: 108, clientY: 108, button: 0 });
+      fireEvent.pointerMove(canvas, { clientX: 216, clientY: 144 });
+      fireEvent.pointerMove(canvas, { clientX: 108, clientY: 108 });
+      fireEvent.pointerUp(canvas, { clientX: 108, clientY: 108 });
+      expect(onDragTokensEnd).toHaveBeenCalledTimes(1);
+      expect(onMoveToken).not.toHaveBeenCalled();
+    });
+
+    it("draws tokens someone else is dragging at their live position", () => {
+      const arc = globalThis.__canvasContext.arc;
+      arc.mockClear();
+      render(<MapCanvas state={{ ...state, visibleTokens: [token] }} remoteDragPositions={new Map([["token", { x: 5, y: 5 }]])} />);
+      expect(arc).toHaveBeenCalledWith(120, 120, 12, 0, Math.PI * 2);
+      expect(arc).not.toHaveBeenCalledWith(24, 24, 12, 0, Math.PI * 2);
+    });
+  });
+
   it("moves structures only when tabletop structure editing is enabled", () => {
     const moveStructure = vi.fn();
     const { container, rerender } = render(

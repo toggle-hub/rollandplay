@@ -2,7 +2,7 @@ import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { ArrowLeft, Circle, Eye, EyeSlash, MapTrifold, Trash, UsersThree } from "@phosphor-icons/react";
 import { apiFetch, connectRoomSocket, patchJSON, postJSON, requestId } from "../api/client";
-import type { ChatMessage, GameMap, Monster, RoomMember, ServerEnvelope, Sheet, TokenPatch, VisibleRoomState } from "../api/types";
+import type { ChatMessage, GameMap, Monster, RoomMember, ServerEnvelope, Sheet, TokenDragFrame, TokenPatch, VisibleRoomState } from "../api/types";
 import { useSession } from "../auth/SessionContext";
 import { MapCanvas, type MapSelection } from "../components/MapCanvas";
 import { ChatPanel } from "../components/ChatPanel";
@@ -13,6 +13,7 @@ import { TokenAttacksEditor } from "../components/TokenAttacksEditor";
 import { TokenSettingsPanel } from "../components/TokenSettingsPanel";
 import { useToast } from "../components/Toast";
 import { defaultBlocksForKind, structureTypes, type StructureBlocks } from "../lib/structures";
+import { createFrameThrottle } from "../lib/frameThrottle";
 
 type Point = { x: number; y: number };
 
@@ -41,6 +42,8 @@ export function RoomPage() {
   const [placingStructure, setPlacingStructure] = useState(false);
   const [confirmRemove, setConfirmRemove] = useState(false);
   const [blankMap, setBlankMap] = useState({ name: "", width: "30", height: "30" });
+  // Tokens someone else is dragging right now, drawn at their live position until the drag ends or the move lands.
+  const [remoteDrags, setRemoteDrags] = useState<ReadonlyMap<string, Point>>(() => new Map());
   const previousMapId = useRef("");
   const toolsToggleRef = useRef<HTMLButtonElement>(null);
   const wsRef = useRef<WebSocket | null>(null);
@@ -117,7 +120,29 @@ export function RoomPage() {
         const message = event.body;
         setState((current) => current ? { ...current, chatHistory: [...(current.chatHistory ?? []), message] } : current);
       }
-      if (event.type === "token.moved" || event.type === "token.updated" || event.type === "token.removed" || event.type === "structure.moved" || event.type === "structure.updated" || event.type === "structure.created" || event.type === "structure.removed" || event.type === "map.activated" || event.type === "vision.update" || event.type === "check.changed" || event.type === "state.snapshot") void load();
+      if (event.type === "token.updated" || event.type === "token.removed" || event.type === "structure.moved" || event.type === "structure.updated" || event.type === "structure.created" || event.type === "structure.removed" || event.type === "map.activated" || event.type === "vision.update" || event.type === "check.changed" || event.type === "state.snapshot") void load();
+      if (event.type === "map.activated" || event.type === "state.snapshot") setRemoteDrags(new Map());
+      // The preview stays on the landing cell until the reloaded state has the token there.
+      if (event.type === "token.moved" && isTokenIdsBody(event.body)) {
+        const ids = event.body.token_ids;
+        void load().then(() => setRemoteDrags((current) => withoutKeys(current, ids)));
+      }
+      if (event.type === "token.dragging" && isDragFrame(event.body)) {
+        const frame = event.body;
+        setRemoteDrags((current) => {
+          const next = new Map(current);
+          frame.moves.forEach((move) => next.set(move.token_id, { x: move.x, y: move.y }));
+          return next;
+        });
+      }
+      if (event.type === "token.drag.ended" && isTokenIdsBody(event.body)) {
+        const ids = event.body.token_ids;
+        setRemoteDrags((current) => withoutKeys(current, ids));
+      }
+      if (event.type === "token.removed" && isTokenIdBody(event.body)) {
+        const id = event.body.token_id;
+        setRemoteDrags((current) => withoutKeys(current, [id]));
+      }
       if (event.type === "ruler.result" && isMetersBody(event.body)) setRuler(Number(event.body.meters));
       if (event.type === "error" && isErrorBody(event.body)) {
         toast({ kind: "error", message: event.body.message });
@@ -131,9 +156,11 @@ export function RoomPage() {
     };
     ws.onclose = () => {
       setConnected(false);
+      setRemoteDrags(new Map());
     };
     ws.onerror = () => toast({ kind: "error", message: "The live connection was interrupted. Reload this room to reconnect." });
     return () => {
+      dragFrames.cancel();
       ws.onopen = null;
       ws.onclose = null;
       ws.onerror = null;
@@ -154,6 +181,15 @@ export function RoomPage() {
     } catch (err) {
       toast({ kind: "error", message: err instanceof Error ? err.message : "Could not send the map action." });
       return false;
+    }
+  }
+
+  // Live drag frames are best effort.
+  function trySend(type: string, body: unknown) {
+    try {
+      send(type, body);
+    } catch {
+      // The drop or the next action reports a lost connection.
     }
   }
 
@@ -186,6 +222,9 @@ export function RoomPage() {
   }
   // Dropped tokens stay where they landed; a rejected move answers with an error, which reloads the room.
   function moveRoomTokens(type: string, body: unknown, moves: { tokenId: string; to: Point }[]) {
+    // A last live frame at the landing cell shows the table the drop before the move is stored.
+    dragFrames.cancel();
+    trySend("token.drag", { moves });
     if (!sendMap(type, body)) return;
     setState((current) => current ? {
       ...current,
@@ -197,6 +236,7 @@ export function RoomPage() {
   }
 
   const measure = useMemo(() => throttlePoint((from: Point, to: Point) => sendMap("ruler.measure", { from, to }), 100), [roomId]);
+  const dragFrames = useMemo(() => createFrameThrottle((moves: { tokenId: string; to: Point }[]) => trySend("token.drag", { moves }), 50), [roomId]);
 
   async function update(action: () => Promise<unknown>) {
     setBusy(true);
@@ -420,6 +460,12 @@ export function RoomPage() {
             onSelect={setMapSelection}
             onMoveToken={(tokenId, to, path) => moveRoomTokens("token.move", { tokenId, to, path }, [{ tokenId, to }])}
             onMoveTokens={(moves) => moveRoomTokens("tokens.move", { moves }, moves)}
+            remoteDragPositions={remoteDrags}
+            onDragTokens={(moves) => dragFrames.push(moves)}
+            onDragTokensEnd={() => {
+              dragFrames.cancel();
+              trySend("token.drag.end", {});
+            }}
             onMoveStructure={moveRoomStructure}
             onMeasure={measure}
             onAttack={(sourceTokenId, targetTokenId, attackId) => sendMap("attack.resolve", { sourceTokenId, targetTokenId, attackId })}
@@ -468,6 +514,25 @@ function isChatMessage(body: unknown): body is ChatMessage {
 
 function isMetersBody(body: unknown): body is { meters: number } {
   return !!body && typeof body === "object" && "meters" in body && typeof body.meters === "number";
+}
+
+function isTokenIdsBody(body: unknown): body is { token_ids: string[] } {
+  return !!body && typeof body === "object" && "token_ids" in body && Array.isArray(body.token_ids);
+}
+
+function isTokenIdBody(body: unknown): body is { token_id: string } {
+  return !!body && typeof body === "object" && "token_id" in body && typeof body.token_id === "string";
+}
+
+function isDragFrame(body: unknown): body is TokenDragFrame {
+  return !!body && typeof body === "object" && "moves" in body && Array.isArray(body.moves);
+}
+
+function withoutKeys(map: ReadonlyMap<string, Point>, ids: readonly string[]): ReadonlyMap<string, Point> {
+  if (!ids.some((id) => map.has(id))) return map;
+  const next = new Map(map);
+  ids.forEach((id) => next.delete(id));
+  return next;
 }
 
 function isErrorBody(body: unknown): body is { message: string } {

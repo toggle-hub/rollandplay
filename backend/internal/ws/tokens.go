@@ -1,9 +1,11 @@
 package ws
 
 import (
+	"context"
 	"encoding/json"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"rollandplay/backend/internal/game"
 )
@@ -22,4 +24,22 @@ func ScanToken(row pgx.Row) (game.Token, error) {
 	_ = json.Unmarshal(attrs, &t.Attributes)
 	_ = json.Unmarshal(stats, &t.Stats)
 	return t, nil
+}
+
+// LoadActiveTokens lists the tokens on the room's active map.
+func LoadActiveTokens(ctx context.Context, pool *pgxpool.Pool, roomID string) ([]game.Token, error) {
+	rows, err := pool.Query(ctx, TokenSelectSQL+` where rm.room_id=$1 and rm.is_active`, roomID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []game.Token
+	for rows.Next() {
+		t, err := ScanToken(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
 }

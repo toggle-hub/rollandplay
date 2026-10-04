@@ -65,6 +65,27 @@ func ComputeVisibility(input VisibilityInput) VisibilityResult {
 	return r
 }
 
+// TokenVisibleTo reports whether a player sees target, by the same rule as the room state:
+// tokens they may move always; otherwise non-hidden tokens within the vision range of one of
+// their own non-hidden tokens.
+func TokenVisibleTo(userID string, target Token, tokens []Token) bool {
+	if userID == "" {
+		return false
+	}
+	if target.MovableBy(userID, false) {
+		return true
+	}
+	if target.IsHidden {
+		return false
+	}
+	for _, t := range tokens {
+		if t.OwnerUserID == userID && !t.IsHidden && inRange(Point{t.X, t.Y}, Point{target.X, target.Y}, t.VisionRangeM) {
+			return true
+		}
+	}
+	return false
+}
+
 func inRange(origin, p Point, rangeM float64) bool { return DistanceMeters(origin, p) <= rangeM+1e-9 }
 
 func structureVisible(origin Point, tok Token, st Structure) bool {

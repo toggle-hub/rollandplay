@@ -25,6 +25,12 @@ type Props = {
   placingStructure?: { kind: string } | null;
   onPlaceStructure?: (geometry: Point[]) => void;
   onCancelPlacement?: () => void;
+  /** Where tokens dragged by someone else at the table are right now. */
+  remoteDragPositions?: ReadonlyMap<string, Point>;
+  /** Live positions of the tokens being dragged, before they are dropped. */
+  onDragTokens?: (moves: { tokenId: string; to: Point }[]) => void;
+  /** The live drag ended without a move: cancelled, or dropped where it started. */
+  onDragTokensEnd?: () => void;
 };
 type TokenDrag = {
   /** Every token moving together; the grabbed one leads and snaps to the grid. */
@@ -70,6 +76,9 @@ export function MapCanvas({
   placingStructure,
   onPlaceStructure,
   onCancelPlacement,
+  remoteDragPositions,
+  onDragTokens,
+  onDragTokensEnd,
 }: Props) {
   const ref = useRef<HTMLCanvasElement>(null);
   const fogLayer = useRef<HTMLCanvasElement | null>(null);
@@ -78,6 +87,12 @@ export function MapCanvas({
   const pointerActive = useRef(false);
   const rightGesture = useRef<{ from: Point; clientX: number; clientY: number; moved: boolean } | null>(null);
   const [drag, setDrag] = useState<TokenDrag | null>(null);
+  // Whether the table has been sent live frames of the current drag that a move or end must close.
+  const streaming = useRef(false);
+  const dragEnd = useRef(onDragTokensEnd);
+  useEffect(() => {
+    dragEnd.current = onDragTokensEnd;
+  });
   const [marquee, setMarquee] = useState<Marquee | null>(null);
   const [structureDrag, setStructureDrag] = useState<
     | { action: "move"; structure: MapStructure; from: Point; currentGeometry: Point[] }
@@ -115,7 +130,7 @@ export function MapCanvas({
   const mapHeight = n(active?.height_m, 30);
   const isMovable = (token: RoomToken) => movableTokenIds?.has(token.id) ?? true;
   // Where each dragged token lands: the grabbed token snaps to the grid and the rest keep their offsets to it.
-  function dragPositions(tokenDrag: TokenDrag, pointer: Point) {
+  function landingPositions(tokenDrag: TokenDrag, pointer: Point) {
     const target = snapTokenCenter(
       { x: pointer.x - tokenDrag.grabOffset.x, y: pointer.y - tokenDrag.grabOffset.y },
       n(tokenDrag.grabbed.size_m, 1),
@@ -129,6 +144,23 @@ export function MapCanvas({
       token.id,
       token.id === tokenDrag.grabbed.id
         ? target
+        : clampTokenCenter({ x: n(token.x_m) + dx, y: n(token.y_m) + dy }, n(token.size_m, 1), mapWidth, mapHeight),
+    ]));
+  }
+  // Where each dragged token is drawn mid-drag: the grabbed token stays under the pointer and the rest keep their offsets to it.
+  function followPositions(tokenDrag: TokenDrag, pointer: Point) {
+    const lead = clampTokenCenter(
+      { x: pointer.x - tokenDrag.grabOffset.x, y: pointer.y - tokenDrag.grabOffset.y },
+      n(tokenDrag.grabbed.size_m, 1),
+      mapWidth,
+      mapHeight,
+    );
+    const dx = lead.x - tokenDrag.from.x;
+    const dy = lead.y - tokenDrag.from.y;
+    return new Map(tokenDrag.tokens.map((token) => [
+      token.id,
+      token.id === tokenDrag.grabbed.id
+        ? lead
         : clampTokenCenter({ x: n(token.x_m) + dx, y: n(token.y_m) + dy }, n(token.size_m, 1), mapWidth, mapHeight),
     ]));
   }
@@ -183,7 +215,7 @@ export function MapCanvas({
     }
     let positions: Map<string, Point> | undefined;
     if (drag?.moved) {
-      positions = dragPositions(drag, drag.current);
+      positions = followPositions(drag, drag.current);
       // Dashed outlines mark where the dragged tokens started.
       ctx.strokeStyle = "#80738e";
       ctx.lineWidth = 2;
@@ -195,10 +227,22 @@ export function MapCanvas({
         ctx.stroke();
       });
       ctx.setLineDash([]);
+      // Dashed lavender ghosts mark the cells the dragged tokens snap to when dropped.
+      const landing = landingPositions(drag, drag.current);
+      ctx.strokeStyle = "#be8cff";
+      ctx.lineWidth = 2;
+      ctx.setLineDash([4, 4]);
+      drag.tokens.forEach((token) => {
+        const center = toCanvas(landing.get(token.id)!);
+        ctx.beginPath();
+        ctx.arc(center.x, center.y, (n(token.size_m, 1) * scale) / 2, 0, Math.PI * 2);
+        ctx.stroke();
+      });
+      ctx.setLineDash([]);
     }
     state.visibleTokens.forEach((t) => {
       const image = t.image_asset_id ? images.current.get(t.image_asset_id) : undefined;
-      drawToken(ctx, t, positions?.get(t.id) ?? tokenCenter(t), scale, !!selectedTokenIds?.includes(t.id), image);
+      drawToken(ctx, t, positions?.get(t.id) ?? remoteDragPositions?.get(t.id) ?? tokenCenter(t), scale, !!selectedTokenIds?.includes(t.id), image);
     });
     const framed = canMoveStructures ? structureDrag?.structure ?? selectedStructure : undefined;
     if (framed) {
@@ -281,7 +325,7 @@ export function MapCanvas({
         ctx.fillText(`${rulerDistanceMeters.toFixed(2)} m`, b.x + 8, b.y - 8);
       }
     }
-  }, [state, selectedTokenIds, selectedStructureId, canMoveStructures, rulerDistanceMeters, drag, marquee, structureDrag, ruler, rangePreview, targeting, placingKind, placementPoint, gridSize, imageVersion]);
+  }, [state, selectedTokenIds, selectedStructureId, canMoveStructures, rulerDistanceMeters, drag, remoteDragPositions, marquee, structureDrag, ruler, rangePreview, targeting, placingKind, placementPoint, gridSize, imageVersion]);
   useEffect(() => {
     state.visibleTokens.forEach((token) => {
       const id = token.image_asset_id;
@@ -341,7 +385,13 @@ export function MapCanvas({
     const { handle } = structureFrame(selectedStructure.geometry, scale);
     return Math.hypot(point.x - handle.x, point.y - handle.y) <= rotationHandleHitRadiusPx / scale;
   }
+  function endStreaming() {
+    if (!streaming.current) return;
+    streaming.current = false;
+    dragEnd.current?.();
+  }
   function cancelPointerAction() {
+    endStreaming();
     rightGesture.current = null;
     pointerActive.current = false;
     setDrag(null);
@@ -365,7 +415,7 @@ export function MapCanvas({
         className="block h-auto w-full max-w-full touch-none rounded-xl border border-[var(--paper)]/15 bg-[var(--surface)] focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)]"
         role="img"
         tabIndex={0}
-        aria-label="Interactive tabletop map. Drag a structure to move it. Drag the round handle above the selected structure to rotate it; hold Shift to snap rotation to 15 degrees. Drag a token to move it; it snaps to the grid. Drag across empty space to select several tokens, then drag one of them to move the group. Click a token you control without dragging to choose an attack, then click a target. Hold the right mouse button and drag to measure distance; release to hide the ruler. Press Escape to cancel a drag. While placing a structure, click the map to place it; press Escape to stop."
+        aria-label="Interactive tabletop map. Drag a structure to move it. Drag the round handle above the selected structure to rotate it; hold Shift to snap rotation to 15 degrees. Drag a token to move it; it snaps to the grid when dropped, and everyone at the table sees it move. Drag across empty space to select several tokens, then drag one of them to move the group. Click a token you control without dragging to choose an attack, then click a target. Hold the right mouse button and drag to measure distance; release to hide the ruler. Press Escape to cancel a drag. While placing a structure, click the map to place it; press Escape to stop."
         onContextMenu={(event) => event.preventDefault()}
         onPointerDown={(event) => {
           if ((event.button !== 0 && event.button !== 2) || pointerActive.current) return;
@@ -478,7 +528,13 @@ export function MapCanvas({
             return;
           }
           if (drag) {
-            setDrag({ ...drag, current: point, moved: drag.moved || Math.hypot(event.clientX - drag.clientX, event.clientY - drag.clientY) >= 4 });
+            const next = { ...drag, current: point, moved: drag.moved || Math.hypot(event.clientX - drag.clientX, event.clientY - drag.clientY) >= 4 };
+            setDrag(next);
+            if (next.moved && onDragTokens) {
+              const follow = followPositions(next, point);
+              streaming.current = true;
+              onDragTokens(next.tokens.map((token) => ({ tokenId: token.id, to: follow.get(token.id)! })));
+            }
             return;
           }
           if (marquee) {
@@ -515,12 +571,18 @@ export function MapCanvas({
           }
           if (!pointerActive.current) return;
           if (drag) {
+            let moving = false;
             if (drag.moved || Math.hypot(event.clientX - drag.clientX, event.clientY - drag.clientY) >= 4) {
-              const positions = dragPositions(drag, eventPoint(event));
+              const positions = landingPositions(drag, eventPoint(event));
               const to = positions.get(drag.grabbed.id)!;
               if (to.x !== drag.from.x || to.y !== drag.from.y) {
-                if (drag.tokens.length === 1) onMoveToken?.(drag.grabbed.id, to, [drag.from, to]);
-                else onMoveTokens?.(drag.tokens.map((token) => ({ tokenId: token.id, to: positions.get(token.id)! })));
+                if (drag.tokens.length === 1 && onMoveToken) {
+                  onMoveToken(drag.grabbed.id, to, [drag.from, to]);
+                  moving = true;
+                } else if (drag.tokens.length > 1 && onMoveTokens) {
+                  onMoveTokens(drag.tokens.map((token) => ({ tokenId: token.id, to: positions.get(token.id)! })));
+                  moving = true;
+                }
               }
             } else {
               // A click on one token of a group selects just that token.
@@ -532,6 +594,9 @@ export function MapCanvas({
                 setRangePreview(firstAttack ? { tokenId: drag.grabbed.id, rangeM: firstAttack.range_m } : null);
               }
             }
+            // The move itself closes the live drag for the table; anything else ends it here.
+            if (moving) streaming.current = false;
+            else endStreaming();
           } else if (marquee) {
             if (marquee.moved || Math.hypot(event.clientX - marquee.clientX, event.clientY - marquee.clientY) >= 4) {
               const to = eventPoint(event);

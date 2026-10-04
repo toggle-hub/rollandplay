@@ -24,7 +24,8 @@ export function CharacterValues({ fields, onChange, list = false }: { fields: Fi
     setNewName("");
     setError("");
   }
-  return <div className={`grid min-w-0 grid-flow-dense gap-4 ${list ? "grid-cols-1" : "sm:grid-cols-2"}`}>
+  // No dense packing: a field after a full-width group must not jump above it to fill a gap.
+  return <div className={`grid min-w-0 gap-4 ${list ? "grid-cols-1" : "sm:grid-cols-2"}`}>
     {fields.map((field, index) => {
       const label = list ? `Item ${index + 1}` : fieldLabel(field.name);
       const container = field.type === "group" || field.type === "list";

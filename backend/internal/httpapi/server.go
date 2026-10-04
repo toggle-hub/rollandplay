@@ -618,7 +618,12 @@ func (s *Server) handleFriendDelete(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(204)
 }
 
-const ruleBookJSON = `jsonb_build_object('id',id::text,'owner_id',owner_id::text,'name',name,'is_public',is_public,'attributes',attributes,'creation_rules',creation_rules,'monsters',monsters)`
+const ruleBookJSON = `jsonb_build_object('id',id::text,'owner_id',owner_id::text,'name',name,'is_public',is_public,'attributes',attributes,'creation_rules',creation_rules,'monsters',monsters,'key_order',key_order)`
+
+const sheetJSON = `jsonb_build_object('id',id::text,'rule_book_id',rule_book_id::text,'user_id',user_id::text,'name',name,'data',data,'is_public',is_public,'creation',creation,'key_order',key_order)`
+
+// ruleBookOrderedFields are the rule book fields whose author key order is kept in key_order.
+var ruleBookOrderedFields = []string{"attributes", "creation_rules", "monsters"}
 
 // requestMonsters validates req["monsters"] (a missing value is an empty list) and returns it as JSON.
 func requestMonsters(req map[string]any) ([]byte, error) {
@@ -642,8 +647,8 @@ func (s *Server) handleRuleBookCreate(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	var req map[string]any
-	if err := ReadJSON(r, &req); err != nil {
+	req, raw, err := readJSONWithRaw(r)
+	if err != nil {
 		WriteError(w, 400, "bad_json", "invalid JSON")
 		return
 	}
@@ -667,7 +672,12 @@ func (s *Server) handleRuleBookCreate(w http.ResponseWriter, r *http.Request) {
 		WriteError(w, 400, "invalid_monsters", err.Error())
 		return
 	}
-	row, err := s.oneJSON(r.Context(), `insert into rule_books(id,owner_id,name,is_public,attributes,creation_rules,monsters) values($1,$2,$3,$4,$5,$6,$7) returning `+ruleBookJSON, uuid.New().String(), u.ID, str(req, "name", "Untitled Rule Book"), boolv(req, "is_public", false), jsonRaw(attributes), rulesJSON, monsters)
+	order, err := requestKeyOrders(raw, ruleBookOrderedFields...)
+	if err != nil {
+		WriteError(w, 400, "bad_json", err.Error())
+		return
+	}
+	row, err := s.oneJSON(r.Context(), `insert into rule_books(id,owner_id,name,is_public,attributes,creation_rules,monsters,key_order) values($1,$2,$3,$4,$5,$6,$7,$8) returning `+ruleBookJSON, uuid.New().String(), u.ID, str(req, "name", "Untitled Rule Book"), boolv(req, "is_public", false), jsonRaw(attributes), rulesJSON, monsters, order)
 	respondRawStatus(w, row, err, 201)
 }
 func (s *Server) handleRuleBookGet(w http.ResponseWriter, r *http.Request) {
@@ -689,9 +699,15 @@ func (s *Server) handleRuleBookPatch(w http.ResponseWriter, r *http.Request) {
 		WriteError(w, 403, "forbidden", "rule book edit permission required")
 		return
 	}
-	var req map[string]any
-	if err := ReadJSON(r, &req); err != nil {
+	req, raw, err := readJSONWithRaw(r)
+	if err != nil {
 		WriteError(w, 400, "bad_json", "invalid JSON")
+		return
+	}
+	// Fields the patch does not send keep their stored order.
+	order, err := requestKeyOrders(raw, ruleBookOrderedFields...)
+	if err != nil {
+		WriteError(w, 400, "bad_json", err.Error())
 		return
 	}
 	tx, err := s.Pool.Begin(r.Context())
@@ -733,7 +749,7 @@ func (s *Server) handleRuleBookPatch(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	var row json.RawMessage
-	err = tx.QueryRow(r.Context(), `update rule_books set name=coalesce($2,name),is_public=coalesce($3,is_public),attributes=$4,creation_rules=$5,monsters=coalesce($6,monsters),updated_at=now() where id=$1 returning `+ruleBookJSON, id, nullableString(req, "name"), nullableBool(req, "is_public"), jsonRaw(attributes), rulesJSON, monsters).Scan(&row)
+	err = tx.QueryRow(r.Context(), `update rule_books set name=coalesce($2,name),is_public=coalesce($3,is_public),attributes=$4,creation_rules=$5,monsters=coalesce($6,monsters),key_order=key_order||$7,updated_at=now() where id=$1 returning `+ruleBookJSON, id, nullableString(req, "name"), nullableBool(req, "is_public"), jsonRaw(attributes), rulesJSON, monsters, order).Scan(&row)
 	if err == nil {
 		err = tx.Commit(r.Context())
 	}
@@ -766,7 +782,7 @@ func (s *Server) handleSheetsList(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	rows, err := s.queryJSON(r.Context(), `select jsonb_build_object('id',id::text,'rule_book_id',rule_book_id::text,'user_id',user_id::text,'name',name,'data',data,'is_public',is_public,'creation',creation) from sheets where user_id=$1 or is_public order by created_at desc`, u.ID)
+	rows, err := s.queryJSON(r.Context(), `select `+sheetJSON+` from sheets where user_id=$1 or is_public order by created_at desc`, u.ID)
 	respondRows(w, rows, err)
 }
 func (s *Server) handleSheetCreate(w http.ResponseWriter, r *http.Request) {
@@ -774,8 +790,8 @@ func (s *Server) handleSheetCreate(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	var req map[string]any
-	if err := ReadJSON(r, &req); err != nil {
+	req, raw, err := readJSONWithRaw(r)
+	if err != nil {
 		WriteError(w, 400, "bad_json", "invalid JSON")
 		return
 	}
@@ -795,8 +811,8 @@ func (s *Server) handleSheetCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var attributes map[string]any
-	var rulesJSON json.RawMessage
-	err = s.Pool.QueryRow(r.Context(), `select attributes,creation_rules from rule_books where id=$1 and `+ruleBookReadable("$2"), rb, u.ID).Scan(&attributes, &rulesJSON)
+	var rulesJSON, bookOrderJSON json.RawMessage
+	err = s.Pool.QueryRow(r.Context(), `select attributes,creation_rules,coalesce(key_order->'attributes','null'::jsonb) from rule_books where id=$1 and `+ruleBookReadable("$2"), rb, u.ID).Scan(&attributes, &rulesJSON, &bookOrderJSON)
 	if err != nil {
 		respondRaw(w, nil, err)
 		return
@@ -811,7 +827,12 @@ func (s *Server) handleSheetCreate(w http.ResponseWriter, r *http.Request) {
 		WriteError(w, 400, "invalid_creation", err.Error())
 		return
 	}
-	row, err := s.oneJSON(r.Context(), `insert into sheets(id,rule_book_id,user_id,name,data,is_public,creation) values($1,$2,$3,$4,$5,$6,$7) returning jsonb_build_object('id',id::text,'rule_book_id',rule_book_id::text,'user_id',user_id::text,'name',name,'data',data,'is_public',is_public,'creation',creation)`, uuid.New().String(), rb, u.ID, str(req, "name", "Untitled Sheet"), jsonRaw(data), boolv(req, "is_public", false), jsonRaw(metadata))
+	order, err := sheetKeyOrder(raw["data"], bookOrderJSON)
+	if err != nil {
+		WriteError(w, 400, "invalid_data", err.Error())
+		return
+	}
+	row, err := s.oneJSON(r.Context(), `insert into sheets(id,rule_book_id,user_id,name,data,is_public,creation,key_order) values($1,$2,$3,$4,$5,$6,$7,$8) returning `+sheetJSON, uuid.New().String(), rb, u.ID, str(req, "name", "Untitled Sheet"), jsonRaw(data), boolv(req, "is_public", false), jsonRaw(metadata), order)
 	respondRawStatus(w, row, err, 201)
 }
 func (s *Server) handleSheetGet(w http.ResponseWriter, r *http.Request) {
@@ -819,7 +840,7 @@ func (s *Server) handleSheetGet(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	rows, err := s.queryJSON(r.Context(), `select jsonb_build_object('id',id::text,'rule_book_id',rule_book_id::text,'user_id',user_id::text,'name',name,'data',data,'is_public',is_public,'creation',creation) from sheets where id=$1 and (user_id=$2 or is_public)`, r.PathValue("sheetID"), u.ID)
+	rows, err := s.queryJSON(r.Context(), `select `+sheetJSON+` from sheets where id=$1 and (user_id=$2 or is_public)`, r.PathValue("sheetID"), u.ID)
 	respondOne(w, rows, err)
 }
 func (s *Server) handleSheetPatch(w http.ResponseWriter, r *http.Request) {
@@ -827,9 +848,13 @@ func (s *Server) handleSheetPatch(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	var req map[string]any
-	_ = ReadJSON(r, &req)
-	row, err := s.oneJSON(r.Context(), `update sheets set name=coalesce($3,name),data=coalesce($4,data),is_public=coalesce($5,is_public),updated_at=now() where id=$1 and user_id=$2 returning jsonb_build_object('id',id::text,'rule_book_id',rule_book_id::text,'user_id',user_id::text,'name',name,'data',data,'is_public',is_public,'creation',creation)`, r.PathValue("sheetID"), u.ID, nullableString(req, "name"), nullableJSON(req, "data"), nullableBool(req, "is_public"))
+	req, raw, _ := readJSONWithRaw(r)
+	order, err := requestKeyOrders(raw, "data")
+	if err != nil {
+		WriteError(w, 400, "bad_json", err.Error())
+		return
+	}
+	row, err := s.oneJSON(r.Context(), `update sheets set name=coalesce($3,name),data=coalesce($4,data),is_public=coalesce($5,is_public),key_order=key_order||$6,updated_at=now() where id=$1 and user_id=$2 returning `+sheetJSON, r.PathValue("sheetID"), u.ID, nullableString(req, "name"), nullableJSON(req, "data"), nullableBool(req, "is_public"), order)
 	respondRaw(w, row, err)
 }
 
@@ -861,7 +886,7 @@ func (s *Server) handleMapGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id := r.PathValue("mapID")
-	rows, err := s.queryJSON(r.Context(), `select jsonb_build_object('id',id::text,'owner_id',owner_id::text,'name',name,'is_public',is_public,'width_m',width_m,'height_m',height_m,'grid_size_m',grid_size_m,'background_asset_id',background_asset_id::text,'structures',coalesce((select jsonb_agg(jsonb_build_object('id',ms.id::text,'map_id',ms.map_id::text,'kind',ms.kind,'geometry',ms.geometry,'blocks_vision',ms.blocks_vision,'blocks_movement',ms.blocks_movement,'blocks_attacks',ms.blocks_attacks,'cover_bonus',ms.cover_bonus,'pass_rules',ms.pass_rules)) from map_structures ms where ms.map_id=maps.id and ms.room_map_id is null),'[]'::jsonb)) from maps where id=$1 and (owner_id=$2 or is_public or exists(select 1 from map_editors where map_id=$1 and user_id=$2))`, id, u.ID)
+	rows, err := s.queryJSON(r.Context(), `select jsonb_build_object('id',id::text,'owner_id',owner_id::text,'name',name,'is_public',is_public,'width_m',width_m,'height_m',height_m,'grid_size_m',grid_size_m,'background_asset_id',background_asset_id::text,'structures',coalesce((select jsonb_agg(jsonb_build_object('id',ms.id::text,'map_id',ms.map_id::text,'kind',ms.kind,'geometry',ms.geometry,'blocks_vision',ms.blocks_vision,'blocks_movement',ms.blocks_movement,'blocks_attacks',ms.blocks_attacks,'cover_bonus',ms.cover_bonus,'pass_rules',ms.pass_rules,'z_index',ms.z_index,'group_id',ms.group_id::text) order by ms.z_index, ms.created_at, ms.id) from map_structures ms where ms.map_id=maps.id and ms.room_map_id is null),'[]'::jsonb)) from maps where id=$1 and (owner_id=$2 or is_public or exists(select 1 from map_editors where map_id=$1 and user_id=$2))`, id, u.ID)
 	respondOne(w, rows, err)
 }
 func (s *Server) handleMapPatch(w http.ResponseWriter, r *http.Request) {
@@ -960,7 +985,11 @@ func (s *Server) handleStructureCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	var req map[string]any
 	_ = ReadJSON(r, &req)
-	row, err := s.oneJSON(r.Context(), `insert into map_structures(id,map_id,kind,geometry,blocks_vision,blocks_movement,blocks_attacks,cover_bonus,pass_rules) values($1,$2,$3,$4,$5,$6,$7,$8,$9) returning jsonb_build_object('id',id::text,'map_id',map_id::text,'kind',kind,'geometry',geometry,'blocks_vision',blocks_vision,'blocks_movement',blocks_movement,'blocks_attacks',blocks_attacks,'cover_bonus',cover_bonus,'pass_rules',pass_rules)`, uuid.New().String(), mapID, str(req, "kind", "wall"), jsonRaw(req["geometry"]), boolv(req, "blocks_vision", false), boolv(req, "blocks_movement", false), boolv(req, "blocks_attacks", false), intv(req, "cover_bonus", 0), jsonRaw(req["pass_rules"]))
+	_, groupID, ok := structureGroupID(w, req)
+	if !ok {
+		return
+	}
+	row, err := s.oneJSON(r.Context(), `insert into map_structures(id,map_id,kind,geometry,blocks_vision,blocks_movement,blocks_attacks,cover_bonus,pass_rules,z_index,group_id) values($1,$2,$3,$4,$5,$6,$7,$8,$9,coalesce($10,(select coalesce(max(z_index),0)+1 from map_structures where map_id=$2)),$11::uuid) returning jsonb_build_object('id',id::text,'map_id',map_id::text,'kind',kind,'geometry',geometry,'blocks_vision',blocks_vision,'blocks_movement',blocks_movement,'blocks_attacks',blocks_attacks,'cover_bonus',cover_bonus,'pass_rules',pass_rules,'z_index',z_index,'group_id',group_id::text)`, uuid.New().String(), mapID, str(req, "kind", "wall"), jsonRaw(req["geometry"]), boolv(req, "blocks_vision", false), boolv(req, "blocks_movement", false), boolv(req, "blocks_attacks", false), intv(req, "cover_bonus", 0), jsonRaw(req["pass_rules"]), nullableInt(req, "z_index"), groupID)
 	respondRawStatus(w, row, err, 201)
 	s.bumpMapRooms(context.Background(), mapID)
 }
@@ -976,7 +1005,11 @@ func (s *Server) handleStructurePatch(w http.ResponseWriter, r *http.Request) {
 	}
 	var req map[string]any
 	_ = ReadJSON(r, &req)
-	row, err := s.oneJSON(r.Context(), `update map_structures set kind=coalesce($3,kind),geometry=coalesce($4,geometry),blocks_vision=coalesce($5,blocks_vision),blocks_movement=coalesce($6,blocks_movement),blocks_attacks=coalesce($7,blocks_attacks),cover_bonus=coalesce($8,cover_bonus),pass_rules=coalesce($9,pass_rules) where id=$1 and map_id=$2 and room_map_id is null returning jsonb_build_object('id',id::text,'map_id',map_id::text,'kind',kind,'geometry',geometry,'blocks_vision',blocks_vision,'blocks_movement',blocks_movement,'blocks_attacks',blocks_attacks,'cover_bonus',cover_bonus,'pass_rules',pass_rules)`, r.PathValue("structureID"), mapID, nullableString(req, "kind"), nullableJSON(req, "geometry"), nullableBool(req, "blocks_vision"), nullableBool(req, "blocks_movement"), nullableBool(req, "blocks_attacks"), nullableInt(req, "cover_bonus"), nullableJSON(req, "pass_rules"))
+	hasGroup, groupID, ok := structureGroupID(w, req)
+	if !ok {
+		return
+	}
+	row, err := s.oneJSON(r.Context(), `update map_structures set kind=coalesce($3,kind),geometry=coalesce($4,geometry),blocks_vision=coalesce($5,blocks_vision),blocks_movement=coalesce($6,blocks_movement),blocks_attacks=coalesce($7,blocks_attacks),cover_bonus=coalesce($8,cover_bonus),pass_rules=coalesce($9,pass_rules),z_index=coalesce($10,z_index),group_id=case when $11 then $12::uuid else group_id end where id=$1 and map_id=$2 and room_map_id is null returning jsonb_build_object('id',id::text,'map_id',map_id::text,'kind',kind,'geometry',geometry,'blocks_vision',blocks_vision,'blocks_movement',blocks_movement,'blocks_attacks',blocks_attacks,'cover_bonus',cover_bonus,'pass_rules',pass_rules,'z_index',z_index,'group_id',group_id::text)`, r.PathValue("structureID"), mapID, nullableString(req, "kind"), nullableJSON(req, "geometry"), nullableBool(req, "blocks_vision"), nullableBool(req, "blocks_movement"), nullableBool(req, "blocks_attacks"), nullableInt(req, "cover_bonus"), nullableJSON(req, "pass_rules"), nullableInt(req, "z_index"), hasGroup, groupID)
 	respondRaw(w, row, err)
 	s.bumpMapRooms(context.Background(), mapID)
 }
@@ -1523,7 +1556,7 @@ func (s *Server) visibleState(ctx context.Context, roomID, userID string) (map[s
 	}
 	isDM := s.isDM(ctx, userID, roomID)
 	structures, _ := s.loadStructures(ctx, roomID)
-	tokens, _ := s.loadTokens(ctx, roomID)
+	tokens, _ := ws.LoadActiveTokens(ctx, s.Pool, roomID)
 	width, height := 30.0, 30.0
 	var amap map[string]any
 	_ = json.Unmarshal(active, &amap)
@@ -1606,7 +1639,7 @@ func (s *Server) visibleChecks(ctx context.Context, roomID, userID string, isDM 
 }
 
 func (s *Server) loadStructures(ctx context.Context, roomID string) ([]game.Structure, error) {
-	rows, err := s.Pool.Query(ctx, `select ms.id::text,ms.kind,coalesce(rmss.geometry,ms.geometry),ms.blocks_vision,ms.blocks_movement,ms.blocks_attacks,ms.cover_bonus,ms.pass_rules,coalesce(rmss.is_hidden,false) from map_structures ms join room_maps rm on rm.map_id=ms.map_id left join room_map_structure_states rmss on rmss.room_map_id=rm.id and rmss.structure_id=ms.id where rm.room_id=$1 and rm.is_active and (ms.room_map_id is null or ms.room_map_id=rm.id) and not coalesce(rmss.is_removed,false)`, roomID)
+	rows, err := s.Pool.Query(ctx, `select ms.id::text,ms.kind,coalesce(rmss.geometry,ms.geometry),ms.blocks_vision,ms.blocks_movement,ms.blocks_attacks,ms.cover_bonus,ms.pass_rules,coalesce(rmss.is_hidden,false) from map_structures ms join room_maps rm on rm.map_id=ms.map_id left join room_map_structure_states rmss on rmss.room_map_id=rm.id and rmss.structure_id=ms.id where rm.room_id=$1 and rm.is_active and (ms.room_map_id is null or ms.room_map_id=rm.id) and not coalesce(rmss.is_removed,false) order by ms.z_index, ms.created_at, ms.id`, roomID)
 	if err != nil {
 		return nil, err
 	}
@@ -1623,22 +1656,6 @@ func (s *Server) loadStructures(ctx context.Context, roomID string) ([]game.Stru
 		structure := game.ParseStructure(id, kind, geom, pr, bv, bm, ba, cover)
 		structure.IsHidden = hidden
 		out = append(out, structure)
-	}
-	return out, rows.Err()
-}
-func (s *Server) loadTokens(ctx context.Context, roomID string) ([]game.Token, error) {
-	rows, err := s.Pool.Query(ctx, ws.TokenSelectSQL+` where rm.room_id=$1 and rm.is_active`, roomID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []game.Token
-	for rows.Next() {
-		t, err := ws.ScanToken(rows)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, t)
 	}
 	return out, rows.Err()
 }
@@ -1787,6 +1804,26 @@ func nullableInt(m map[string]any, k string) *int {
 		return &iv
 	}
 	return nil
+}
+
+// structureGroupID reads the optional "group_id" of a structure request. present reports whether
+// the key was sent at all; a null value clears the group. Writes a 400 and returns ok=false when
+// the value is not a UUID.
+func structureGroupID(w http.ResponseWriter, req map[string]any) (present bool, groupID *string, ok bool) {
+	raw, present := req["group_id"]
+	if !present || raw == nil {
+		return present, nil, true
+	}
+	value, isString := raw.(string)
+	if !isString {
+		WriteError(w, 400, "invalid_group_id", "group_id must be a UUID")
+		return present, nil, false
+	}
+	if _, err := uuid.Parse(value); err != nil {
+		WriteError(w, 400, "invalid_group_id", "group_id must be a UUID")
+		return present, nil, false
+	}
+	return present, &value, true
 }
 func nullableJSON(m map[string]any, k string) any {
 	if v, ok := m[k]; ok {

@@ -1,9 +1,12 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type MouseEvent, type PointerEvent, type ReactNode } from "react";
 import type { GameMap, MapStructure } from "../api/types";
 import { rotateGeometry, scaleGeometry, type Point } from "../lib/geometryTransforms";
-import { structureLabel } from "../lib/structures";
+import { expandToGroups } from "../lib/structureGroups";
+import { stampGeometry, structureLabel } from "../lib/structures";
+import { EditorContextMenu, type EditorAction } from "./EditorContextMenu";
 
-type DraftStructure = Omit<MapStructure, "id" | "map_id"> & { id?: string; map_id?: string };
+export type EditorTool = "select" | "place";
+export type StampSettings = { kind: string; rotationDeg: number; scalePercent: number };
 type HoverState = { structure: MapStructure; canvasX: number; canvasY: number };
 export type TransformAction = "move" | "resize" | "rotate";
 export type StructureGeometryChange = { id: string; geometry: Point[] };
@@ -17,7 +20,6 @@ type GeometryFrame = {
 };
 type TransformState = {
   action: TransformAction;
-  draft: boolean;
   from: Point;
   original: StructureGeometryChange[];
   current: StructureGeometryChange[];
@@ -47,30 +49,31 @@ type MarqueeState = {
 type Props = {
   map: GameMap;
   structures: MapStructure[];
-  draftStructure?: DraftStructure | null;
-  /** Saved structures in the current selection. With none selected, the draft is the transform target. */
   selectedStructureIds?: string[];
+  /** "select" picks and transforms structures; "place" stamps `stamp` wherever the map is clicked. */
+  tool?: EditorTool;
+  stamp?: StampSettings;
+  /** Entries of the right-click menu opened over the selection. */
+  contextActions?: EditorAction[];
   controls?: ReactNode;
   selector?: ReactNode;
   disabled?: boolean;
   onSelectStructures?: (structureIds: string[]) => void;
   onTransformStructures?: (changes: StructureGeometryChange[], action: TransformAction) => void;
-  onTransformDraft?: (geometry: Point[], action: TransformAction) => void;
-  onTransformDraftEnd?: (originalGeometry: Point[], nextGeometry: Point[], action: TransformAction) => void;
-  onMoveDraft?: (point: Point) => void;
-  onDeleteSelection?: () => void;
+  onPlace?: (point: Point) => void;
+  onContextAction?: (id: string) => void;
 };
 
 const scale = 24;
 const defaultViewport = { width: 720, height: 420 };
 const initialCamera = { x: 72, y: 72 };
-const draftId = "__draft__";
 const dragThreshold = 3;
 /** Screen pixels between the top of the selection frame and the rotation handle. */
 const rotateHandleOffset = 28;
 const rotateHandleRadius = 7;
 const handleHitRadius = 12;
 const noSelection: string[] = [];
+const noActions: EditorAction[] = [];
 const n = (value: number | string | undefined, fallback = 0) =>
   typeof value === "number" ? value : value ? Number(value) : fallback;
 const toCanvas = (point: Point) => ({ x: point.x * scale, y: point.y * scale });
@@ -80,17 +83,17 @@ const round = (value: number) => Math.round(value * 100) / 100;
 export function MapEditorCanvas({
   map,
   structures,
-  draftStructure,
   selectedStructureIds = noSelection,
+  tool = "select",
+  stamp,
+  contextActions = noActions,
   controls,
   selector,
   disabled = false,
   onSelectStructures,
   onTransformStructures,
-  onTransformDraft,
-  onTransformDraftEnd,
-  onMoveDraft,
-  onDeleteSelection,
+  onPlace,
+  onContextAction,
 }: Props) {
   const ref = useRef<HTMLCanvasElement>(null);
   const viewportRef = useRef<HTMLDivElement>(null);
@@ -106,21 +109,24 @@ export function MapEditorCanvas({
   const [zoom, setZoom] = useState(0.85);
   const [camera, setCamera] = useState(initialCamera);
   const [viewportSize, setViewportSize] = useState(defaultViewport);
+  const [placePoint, setPlacePoint] = useState<Point | null>(null);
+  const [contextMenu, setContextMenu] = useState<Point | null>(null);
+  const selecting = tool === "select";
   const items = useMemo(() => {
-    const transformed = transform ? new Map(transform.current.map((change) => [change.id, change.geometry])) : null;
-    const saved = structures.map((structure) => {
-      const geometry = transform && !transform.draft ? transformed?.get(structure.id) : undefined;
+    if (!transform) return structures;
+    const transformed = new Map(transform.current.map((change) => [change.id, change.geometry]));
+    return structures.map((structure) => {
+      const geometry = transformed.get(structure.id);
       return geometry ? { ...structure, geometry } : structure;
     });
-    if (!draftStructure?.geometry.length) return saved;
-    const draftGeometry = transform?.draft ? transform.current[0].geometry : draftStructure.geometry;
-    return [...saved, { ...draftStructure, id: draftId, geometry: draftGeometry } as MapStructure];
-  }, [draftStructure, structures, transform]);
+  }, [structures, transform]);
   const selectedIds = useMemo(() => new Set(selectedStructureIds), [selectedStructureIds]);
-  const selectedItems = useMemo(() => items.filter((structure) => structure.id !== draftId && selectedIds.has(structure.id)), [items, selectedIds]);
-  const draftItem = items.find((structure) => structure.id === draftId);
-  const targets = selectedItems.length > 0 ? selectedItems : draftItem ? [draftItem] : [];
-  const targetFrame = targets.length > 0 ? geometryFrame(targets.flatMap((structure) => structure.geometry)) : null;
+  const selectedItems = useMemo(() => items.filter((structure) => selectedIds.has(structure.id)), [items, selectedIds]);
+  const targetFrame = selecting && selectedItems.length > 0 ? geometryFrame(selectedItems.flatMap((structure) => structure.geometry)) : null;
+  const ghost = useMemo(
+    () => !selecting && stamp && placePoint ? stampGeometry(stamp.kind, placePoint, n(map.grid_size_m, 1), stamp.rotationDeg, stamp.scalePercent) : null,
+    [selecting, stamp?.kind, stamp?.rotationDeg, stamp?.scalePercent, placePoint, map.grid_size_m],
+  );
   const marqueeIds = useMemo(() => {
     if (!marquee?.moved) return null;
     const rect = rectFromPoints(marquee.from, marquee.to);
@@ -166,7 +172,7 @@ export function MapEditorCanvas({
     const canvas = ref.current;
     if (!canvas) return;
     const handleWheel = (event: WheelEvent) => {
-      if (!event.ctrlKey || event.deltaY === 0) return;
+      if (event.deltaY === 0) return;
       event.preventDefault();
       const rect = canvas.getBoundingClientRect();
       const pointer = { x: event.clientX - rect.left, y: event.clientY - rect.top };
@@ -251,19 +257,35 @@ export function MapEditorCanvas({
     ctx.stroke();
     ctx.setLineDash([]);
 
-    const highlighted = new Set(targets.map((structure) => structure.id));
+    const highlighted = new Set(selecting ? selectedItems.map((structure) => structure.id) : []);
     marqueeIds?.forEach((id) => highlighted.add(id));
     items.forEach((structure) => drawStructure(ctx, structure, highlighted.has(structure.id)));
+    if (ghost) drawGhost(ctx, ghost);
     if (transform?.action === "rotate") drawSelectionFrame(ctx, transform.frame, zoom, transform.degrees);
     else if (targetFrame) drawSelectionFrame(ctx, targetFrame, zoom, 0);
     if (marquee?.moved) drawMarquee(ctx, marquee, zoom);
-  }, [camera, items, map.grid_size_m, map.height_m, map.width_m, marquee, marqueeIds, targetFrame?.minX, targetFrame?.minY, targetFrame?.maxX, targetFrame?.maxY, targets.length, transform, viewportSize, zoom]);
+  }, [camera, ghost, items, map.grid_size_m, map.height_m, map.width_m, marquee, marqueeIds, selecting, selectedItems, targetFrame?.minX, targetFrame?.minY, targetFrame?.maxX, targetFrame?.maxY, transform, viewportSize, zoom]);
+
+  useEffect(() => {
+    if (!contextMenu) return;
+    const close = () => setContextMenu(null);
+    window.addEventListener("pointerdown", close);
+    return () => window.removeEventListener("pointerdown", close);
+  }, [contextMenu]);
+
+  const hasSelection = selectedStructureIds.length > 0;
+  // The menu acts on the selection: drop it when the tool changes or the selection goes away (e.g. Delete).
+  useEffect(() => {
+    if (!selecting || !hasSelection) setContextMenu(null);
+  }, [selecting, hasSelection]);
 
   const pickTarget = (point: Point) =>
     pickStructure(selectedItems, point) ?? pickStructure([...items].reverse(), point);
+  /** Every selection the canvas emits includes whole groups. Returns the expanded ids. */
   const select = (ids: string[]) => {
-    if (ids.length === selectedStructureIds.length && ids.every((id) => selectedIds.has(id))) return;
-    onSelectStructures?.(ids);
+    const next = expandToGroups(ids, structures);
+    if (next.length !== selectedStructureIds.length || !next.every((id) => selectedIds.has(id))) onSelectStructures?.(next);
+    return next;
   };
   const updateTransform = (next: TransformState | null) => {
     transformRef.current = next;
@@ -279,18 +301,12 @@ export function MapEditorCanvas({
     updateMarquee(null);
     panRef.current = null;
   };
-  const cancelPointerAction = () => {
-    const activeTransform = transformRef.current;
-    if (activeTransform?.draft && activeTransform.moved) onTransformDraft?.(activeTransform.original[0].geometry, activeTransform.action);
-    clearPointerAction();
-  };
   const beginTransform = (action: TransformAction, transformTargets: MapStructure[], point: Point, hit?: HandleHit) => {
     const original = transformTargets.map((structure) => ({ id: structure.id, geometry: structure.geometry }));
     const frame = geometryFrame(original.flatMap((change) => change.geometry));
     const anchor = hit?.kind === "resize" ? hit.anchor : frame.center;
     updateTransform({
       action,
-      draft: transformTargets[0]?.id === draftId,
       from: point,
       original,
       current: original,
@@ -305,25 +321,41 @@ export function MapEditorCanvas({
   };
   const cursorAt = (point: Point) => {
     if (spaceHeld.current) return "grab";
+    if (!selecting) return "crosshair";
     if (targetFrame) {
-      const hit = hitSelectionHandle(targets, targetFrame, point, zoom);
+      const hit = hitSelectionHandle(selectedItems, targetFrame, point, zoom);
       if (hit) return cursorForHandle(hit);
     }
     if (pickTarget(point) || (targetFrame && pointInFrame(targetFrame, point, zoom))) return "move";
     return "default";
   };
+  const openContextMenu = (event: PointerEvent<HTMLCanvasElement>) => {
+    if (contextActions.length === 0) return;
+    const picked = pickTarget(canvasPoint(event));
+    if (!picked) return;
+    if (!selectedIds.has(picked.id)) select([picked.id]);
+    setContextMenu(shellPixels(event));
+  };
+  const closeContextMenu = () => {
+    setContextMenu(null);
+    ref.current?.focus({ preventScroll: true });
+  };
 
   useEffect(() => {
     if (!disabled) return;
-    cancelPointerAction();
+    clearPointerAction();
   }, [disabled]);
 
   const helpText = transform
     ? "Esc cancels the drag · Shift snaps rotation to 15° or locks moves to an axis"
-    : "Drag to move · corner squares resize · round handle rotates · drag empty space to select an area · Shift-click adds · Delete removes · right-drag or Space-drag pans";
-  const selectionLabel = selectedItems.length > 1
-    ? `${selectedItems.length} structures selected`
-    : selectedItems.length === 1 ? `${structureLabel(selectedItems[0].kind)} selected` : draftItem ? "Draft selected" : "Nothing selected";
+    : selecting
+      ? "Drag to move · corners resize · round handle rotates · drag empty space to select · right-click for actions · right/middle-drag or Space-drag pans · scroll zooms"
+      : "Click to place · Q/E rotate · [ ] resize · Esc or V returns to Select";
+  const selectionLabel = !selecting
+    ? `Placing ${structureLabel(stamp?.kind ?? "wall")}`
+    : selectedItems.length > 1
+      ? `${selectedItems.length} structures selected`
+      : selectedItems.length === 1 ? `${structureLabel(selectedItems[0].kind)} selected` : "Nothing selected";
 
   return (
     <div ref={shellRef} className="relative overflow-hidden rounded-2xl border border-[var(--accent)]/25 bg-[var(--input)] shadow-[0_24px_80px_rgba(0,0,0,0.35)]" data-testid="map-editor-shell">
@@ -366,13 +398,20 @@ export function MapEditorCanvas({
           role="img"
           tabIndex={0}
           aria-describedby="map-editor-transform-help"
-          aria-label="Infinite live map canvas. Click a structure to select it, Shift-click to add or remove it from the selection, or drag across empty space to select every structure in an area. Selected structures move, resize and rotate together: drag inside the dashed frame to move, drag a square corner handle to resize, drag the round handle above the frame to rotate (Shift snaps to 15 degrees). Press Delete to remove the selection and Escape to clear it. Click empty space with nothing selected to place the draft. Drag with the right or middle mouse button, or hold Space and drag, to pan; hold Control and scroll to zoom."
+          aria-label={selecting
+            ? "Infinite live map canvas, Select tool. Click a structure to select it (grouped structures select together), Shift-click to add or remove it, or drag across empty space to select every structure in an area. Selected structures move, resize and rotate together: drag inside the dashed frame to move, drag a square corner handle to resize, drag the round handle above the frame to rotate (Shift snaps to 15 degrees). Right-click a structure for actions. Drag with the right or middle mouse button, or hold Space and drag, to pan; scroll to zoom."
+            : "Infinite live map canvas, Place tool. Click to place the stamp shown under the pointer; Q and E rotate it, [ and ] resize it, Escape or V returns to the Select tool. Drag with the right or middle mouse button, or hold Space and drag, to pan; scroll to zoom."}
           onContextMenu={(event) => event.preventDefault()}
           onPointerDown={(event) => {
+            setContextMenu(null);
             if (disabled || pointerActive.current) return;
             const panGesture = event.button === 1 || event.button === 2 || (event.button === 0 && spaceHeld.current);
             if (!panGesture && event.button !== 0) return;
             event.currentTarget.focus({ preventScroll: true });
+            if (!panGesture && !selecting) {
+              onPlace?.(canvasPoint(event));
+              return;
+            }
             event.currentTarget.setPointerCapture?.(event.pointerId);
             pointerActive.current = true;
             setHover(null);
@@ -383,38 +422,36 @@ export function MapEditorCanvas({
             }
             const point = canvasPoint(event);
             if (targetFrame) {
-              const hit = hitSelectionHandle(targets, targetFrame, point, zoom);
+              const hit = hitSelectionHandle(selectedItems, targetFrame, point, zoom);
               if (hit) {
-                beginTransform(hit.kind === "rotate" ? "rotate" : "resize", targets, point, hit);
+                beginTransform(hit.kind === "rotate" ? "rotate" : "resize", selectedItems, point, hit);
                 event.currentTarget.style.cursor = hit.kind === "rotate" ? "grabbing" : cursorForHandle(hit);
                 return;
               }
             }
             const picked = pickTarget(point);
             if (picked && (event.shiftKey || event.ctrlKey || event.metaKey)) {
-              if (picked.id !== draftId) {
-                select(selectedIds.has(picked.id)
-                  ? selectedStructureIds.filter((id) => id !== picked.id)
-                  : [...selectedStructureIds, picked.id]);
+              if (selectedIds.has(picked.id)) {
+                const group = new Set(expandToGroups([picked.id], structures));
+                select(selectedStructureIds.filter((id) => !group.has(id)));
+              } else {
+                select([...selectedStructureIds, picked.id]);
               }
               pointerActive.current = false;
               return;
             }
             if (picked) {
-              let transformTargets = targets;
-              if (picked.id === draftId) {
-                select([]);
-                transformTargets = [picked];
-              } else if (!selectedIds.has(picked.id)) {
-                select([picked.id]);
-                transformTargets = [picked];
+              let transformTargets = selectedItems;
+              if (!selectedIds.has(picked.id)) {
+                const group = new Set(select([picked.id]));
+                transformTargets = items.filter((structure) => group.has(structure.id));
               }
               beginTransform("move", transformTargets, point);
               event.currentTarget.style.cursor = "grabbing";
               return;
             }
             if (targetFrame && pointInFrame(targetFrame, point, zoom)) {
-              beginTransform("move", targets, point);
+              beginTransform("move", selectedItems, point);
               event.currentTarget.style.cursor = "grabbing";
               return;
             }
@@ -448,7 +485,6 @@ export function MapEditorCanvas({
               }
               const current = activeTransform.original.map((change) => ({ id: change.id, geometry: transformGeometry(change.geometry) }));
               updateTransform({ ...activeTransform, current, degrees, moved: true });
-              if (activeTransform.draft) onTransformDraft?.(current[0].geometry, activeTransform.action);
               return;
             }
             const activePan = panRef.current;
@@ -467,7 +503,12 @@ export function MapEditorCanvas({
               return;
             }
             event.currentTarget.style.cursor = cursorAt(point);
-            const picked = targetFrame && hitSelectionHandle(targets, targetFrame, point, zoom) ? null : pickTarget(point);
+            if (!selecting) {
+              setPlacePoint(point);
+              setHover(null);
+              return;
+            }
+            const picked = targetFrame && hitSelectionHandle(selectedItems, targetFrame, point, zoom) ? null : pickTarget(point);
             if (!picked) {
               setHover(null);
               return;
@@ -479,15 +520,9 @@ export function MapEditorCanvas({
             if (disabled || !pointerActive.current) return;
             const activeTransform = transformRef.current;
             const activeMarquee = marqueeRef.current;
+            const activePan = panRef.current;
             if (activeTransform?.moved) {
-              if (activeTransform.draft) {
-                const [original] = activeTransform.original;
-                const [current] = activeTransform.current;
-                onTransformDraft?.(current.geometry, activeTransform.action);
-                onTransformDraftEnd?.(original.geometry, current.geometry, activeTransform.action);
-              } else {
-                onTransformStructures?.(activeTransform.current, activeTransform.action);
-              }
+              onTransformStructures?.(activeTransform.current, activeTransform.action);
             } else if (activeMarquee?.moved) {
               const base = activeMarquee.additive ? selectedStructureIds : [];
               const inside = structures
@@ -496,18 +531,21 @@ export function MapEditorCanvas({
               select([...base, ...inside.filter((id) => !base.includes(id))]);
             } else if (activeMarquee && !activeMarquee.additive) {
               if (selectedStructureIds.length > 0) select([]);
-              else onMoveDraft?.(activeMarquee.from);
+            } else if (activePan && !activePan.moved && event.button === 2 && selecting) {
+              openContextMenu(event);
             }
             clearPointerAction();
             event.currentTarget.style.cursor = cursorAt(canvasPoint(event));
           }}
           onPointerCancel={(event) => {
-            cancelPointerAction();
+            clearPointerAction();
             setHover(null);
             event.currentTarget.style.cursor = "default";
           }}
           onPointerLeave={() => {
-            if (!pointerActive.current) setHover(null);
+            if (pointerActive.current) return;
+            setHover(null);
+            setPlacePoint(null);
           }}
           onBlur={() => {
             spaceHeld.current = false;
@@ -522,16 +560,10 @@ export function MapEditorCanvas({
               if (!pointerActive.current) event.currentTarget.style.cursor = "grab";
               return;
             }
-            if (event.key === "Escape") {
+            if (event.key === "Escape" && pointerActive.current) {
               event.preventDefault();
-              if (pointerActive.current) cancelPointerAction();
-              else select([]);
+              clearPointerAction();
               event.currentTarget.style.cursor = "default";
-              return;
-            }
-            if ((event.key === "Delete" || event.key === "Backspace") && !disabled && !pointerActive.current && selectedItems.length > 0) {
-              event.preventDefault();
-              onDeleteSelection?.();
             }
           }}
         />
@@ -546,18 +578,27 @@ export function MapEditorCanvas({
         <span aria-hidden="true">·</span>
         <span className="hidden truncate md:inline">{helpText}</span>
       </div>
-      {hover && !transform && !marquee?.moved && <StructureTooltip hover={hover} viewportSize={viewportSize} />}
+      {hover && selecting && !transform && !marquee?.moved && <StructureTooltip hover={hover} viewportSize={viewportSize} />}
+      {contextMenu && <EditorContextMenu
+        x={contextMenu.x}
+        y={contextMenu.y}
+        actions={contextActions}
+        onClose={closeContextMenu}
+        onAction={(id) => {
+          closeContextMenu();
+          onContextAction?.(id);
+        }}
+      />}
     </div>
   );
 }
 
 function drawStructure(ctx: CanvasRenderingContext2D, structure: MapStructure, selected: boolean) {
   if (structure.geometry.length === 0) return;
-  const isDraft = structure.id === draftId;
   const color = structure.kind === "terrain" ? "#d9ffb5" : structure.kind === "door" ? "#ffb887" : structure.kind === "window" ? "#ebc7ff" : structure.kind === "cover" ? "#ffa9a9" : "#be8cff";
-  ctx.strokeStyle = isDraft ? "#ffb887" : selected ? "#f6effa" : color;
+  ctx.strokeStyle = selected ? "#f6effa" : color;
   ctx.lineWidth = selected ? 4 : structure.blocks_vision ? 4 : 2;
-  ctx.setLineDash(isDraft ? [8, 5] : []);
+  ctx.setLineDash([]);
   ctx.beginPath();
   structure.geometry.forEach((point, index) => {
     const canvasPoint = toCanvas(point);
@@ -568,6 +609,22 @@ function drawStructure(ctx: CanvasRenderingContext2D, structure: MapStructure, s
     ctx.fillStyle = selected ? "rgba(217,255,181,0.28)" : "rgba(217,255,181,0.16)";
     ctx.fill();
   }
+  ctx.stroke();
+  ctx.setLineDash([]);
+}
+
+/** The Place tool's stamp preview under the pointer. */
+function drawGhost(ctx: CanvasRenderingContext2D, geometry: Point[]) {
+  if (geometry.length === 0) return;
+  ctx.strokeStyle = "#ffb887";
+  ctx.lineWidth = 3;
+  ctx.setLineDash([8, 5]);
+  ctx.beginPath();
+  geometry.forEach((point, index) => {
+    const canvasPoint = toCanvas(point);
+    if (index === 0) ctx.moveTo(canvasPoint.x, canvasPoint.y);
+    else ctx.lineTo(canvasPoint.x, canvasPoint.y);
+  });
   ctx.stroke();
   ctx.setLineDash([]);
 }
@@ -768,7 +825,7 @@ function StructureTooltip({ hover, viewportSize }: { hover: HoverState; viewport
       style={{ left, top }}
       role="status"
     >
-      <p className="font-semibold capitalize tracking-[-0.01em] text-[var(--ink)]">{structure.id === draftId ? "Draft" : structure.kind}</p>
+      <p className="font-semibold capitalize tracking-[-0.01em] text-[var(--ink)]">{structure.kind}</p>
       <dl className="mt-3 grid gap-2">
         <div className="flex items-center justify-between gap-3">
           <dt className="text-[var(--line)]">Vision</dt><dd className="shrink-0 rounded-full bg-[var(--ink)] px-2.5 py-0.5 text-xs font-medium text-[var(--paper)]">{structure.blocks_vision ? "blocks" : "open"}</dd>

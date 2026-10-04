@@ -1,3 +1,4 @@
+import { restoreKeyOrder } from "./keyOrder";
 import type { ServerEnvelope } from "./types";
 
 const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL ?? "").replace(
@@ -58,7 +59,7 @@ export async function apiFetch<T>(
     throw new ApiError(res.status, message);
   }
   if (res.status === 204) return undefined as T;
-  return res.json() as Promise<T>;
+  return restoreKeyOrder(await res.json()) as T;
 }
 export const postJSON = <T>(path: string, body: unknown) =>
   apiFetch<T>(path, { method: "POST", body: JSON.stringify(body) });

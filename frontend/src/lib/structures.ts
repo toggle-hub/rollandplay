@@ -1,4 +1,4 @@
-import type { Point } from "./geometryTransforms";
+import { geometryCenter, rotateGeometry, scaleGeometry, type Point } from "./geometryTransforms";
 
 export type StructureBlocks = { blocks_vision: boolean; blocks_movement: boolean; blocks_attacks: boolean };
 
@@ -30,6 +30,17 @@ export function templateGeometry(kind: string, point: Point, gridSize: number): 
   if (kind === "cover") return [{ x: placed(x - halfMedium), y }, { x: placed(x + halfMedium), y }];
   return [{ x: placed(x - halfLong), y }, { x: placed(x + halfLong), y }];
 }
+
+/** The structure the Place tool stamps at `point`: the kind's template, scaled then rotated about its center. */
+export function stampGeometry(kind: string, point: Point, gridSize: number, rotationDeg: number, scalePercent: number): Point[] {
+  const template = templateGeometry(kind, point, gridSize);
+  const center = geometryCenter(template);
+  return rotateGeometry(scaleGeometry(template, scalePercent / 100, center), rotationDeg, center);
+}
+
+export const clampStampScale = (value: number) => Math.min(1000, Math.max(10, Math.round(value)));
+
+export const normalizeDegrees = (value: number) => ((Math.round(value) % 360) + 360) % 360;
 
 export function snap(value: number, grid: number) {
   return placed(Math.round(value / grid) * grid);
