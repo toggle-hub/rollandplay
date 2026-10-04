@@ -160,7 +160,7 @@ describe("MapCanvas", () => {
     fireEvent.pointerMove(canvas, { clientX: 216, clientY: 144 });
     fireEvent.pointerUp(canvas, { clientX: 216, clientY: 144 });
     expect(move).toHaveBeenCalledWith(
-      "token", { x: 3.5, y: 2.5 }, [{ x: 1, y: 1 }, { x: 3.5, y: 2.5 }],
+      "token", { x: 3, y: 2 }, [{ x: 1, y: 1 }, { x: 3, y: 2 }],
     );
   });
   it("allows players to drag only their own character tokens", () => {
@@ -194,7 +194,7 @@ describe("MapCanvas", () => {
     fireEvent.pointerMove(canvas, { clientX: 144, clientY: 72 });
     fireEvent.pointerUp(canvas, { clientX: 144, clientY: 72 });
     expect(move).toHaveBeenCalledWith(
-      "hero", { x: 2.5, y: 1.5 }, [{ x: 1, y: 1 }, { x: 2.5, y: 1.5 }],
+      "hero", { x: 2, y: 1 }, [{ x: 1, y: 1 }, { x: 2, y: 1 }],
     );
   });
 
@@ -234,21 +234,21 @@ describe("MapCanvas", () => {
     fireEvent.pointerMove(canvas, { clientX: 144, clientY: 144 });
     fireEvent.pointerUp(canvas, { clientX: 144, clientY: 144 });
     expect(moveMany).toHaveBeenCalledExactlyOnceWith([
-      { tokenId: "a", to: { x: 2.5, y: 2.5 } },
-      { tokenId: "b", to: { x: 4.5, y: 2.5 } },
+      { tokenId: "a", to: { x: 2, y: 2 } },
+      { tokenId: "b", to: { x: 4, y: 2 } },
     ]);
     expect(moveOne).not.toHaveBeenCalled();
     expect(select).not.toHaveBeenCalled();
   });
 
-  it("snaps an even-sized token onto grid lines so it covers whole cells", () => {
+  it("snaps an even-sized token onto grid lines so it covers whole cells when Shift is held", () => {
     const move = vi.fn();
     const big = { ...tokenBase, id: "big", name: "Ogre", size_m: 2, x_m: 2, y_m: 2 };
     const { container } = render(<MapCanvas state={{ ...state, visibleTokens: [big] }} onMoveToken={move} />);
     const canvas = container.querySelector("canvas")!;
     fireEvent.pointerDown(canvas, { clientX: 2 * 72, clientY: 2 * 72, button: 0 });
-    fireEvent.pointerMove(canvas, { clientX: 3.2 * 72, clientY: 3.7 * 72 });
-    fireEvent.pointerUp(canvas, { clientX: 3.2 * 72, clientY: 3.7 * 72 });
+    fireEvent.pointerMove(canvas, { clientX: 3.2 * 72, clientY: 3.7 * 72, shiftKey: true });
+    fireEvent.pointerUp(canvas, { clientX: 3.2 * 72, clientY: 3.7 * 72, shiftKey: true });
     expect(move).toHaveBeenCalledWith("big", { x: 3, y: 4 }, [{ x: 2, y: 2 }, { x: 3, y: 4 }]);
   });
 
@@ -269,7 +269,7 @@ describe("MapCanvas", () => {
       return { canvas: container.querySelector("canvas")!, onDragTokens, onDragTokensEnd, onMoveToken };
     }
 
-    it("keeps the token under the pointer, ghosts its landing cell and snaps it on drop", () => {
+    it("keeps the token under the pointer and drops it there, to the hundredth of a meter", () => {
       const { canvas, onDragTokens, onDragTokensEnd, onMoveToken } = renderDrag();
       const arc = globalThis.__canvasContext.arc;
       arc.mockClear();
@@ -277,11 +277,28 @@ describe("MapCanvas", () => {
       fireEvent.pointerMove(canvas, { clientX: 216, clientY: 144 });
       expect(onDragTokens).toHaveBeenLastCalledWith([{ tokenId: "token", to: { x: 3, y: 2 } }]);
       expect(arc).toHaveBeenCalledWith(72, 48, 12, 0, Math.PI * 2);
-      expect(arc).toHaveBeenCalledWith(84, 60, 12, 0, Math.PI * 2);
-      fireEvent.pointerUp(canvas, { clientX: 216, clientY: 144 });
-      expect(onMoveToken).toHaveBeenCalledExactlyOnceWith("token", { x: 3.5, y: 2.5 }, [{ x: 1, y: 1 }, { x: 3.5, y: 2.5 }]);
+      // No landing ghost without Shift.
+      expect(arc).not.toHaveBeenCalledWith(84, 60, 12, 0, Math.PI * 2);
+      fireEvent.pointerUp(canvas, { clientX: 217, clientY: 145 });
+      expect(onMoveToken).toHaveBeenCalledExactlyOnceWith("token", { x: 3.01, y: 2.01 }, [{ x: 1, y: 1 }, { x: 3.01, y: 2.01 }]);
       fireEvent.lostPointerCapture(canvas);
       expect(onDragTokensEnd).not.toHaveBeenCalled();
+    });
+
+    it("ghosts the landing cell while Shift is held and snaps the token to it on drop", () => {
+      const { canvas, onMoveToken } = renderDrag();
+      const arc = globalThis.__canvasContext.arc;
+      fireEvent.pointerDown(canvas, { clientX: 72, clientY: 72, button: 0 });
+      fireEvent.pointerMove(canvas, { clientX: 216, clientY: 144 });
+      arc.mockClear();
+      // Pressing Shift shows the ghost at once, without moving the pointer.
+      fireEvent.keyDown(canvas, { key: "Shift", shiftKey: true });
+      expect(arc).toHaveBeenCalledWith(84, 60, 12, 0, Math.PI * 2);
+      arc.mockClear();
+      fireEvent.keyUp(canvas, { key: "Shift" });
+      expect(arc).not.toHaveBeenCalledWith(84, 60, 12, 0, Math.PI * 2);
+      fireEvent.pointerUp(canvas, { clientX: 216, clientY: 144, shiftKey: true });
+      expect(onMoveToken).toHaveBeenCalledExactlyOnceWith("token", { x: 3.5, y: 2.5 }, [{ x: 1, y: 1 }, { x: 3.5, y: 2.5 }]);
     });
 
     it("ends the live drag without moving when Escape cancels it", () => {
@@ -295,13 +312,13 @@ describe("MapCanvas", () => {
       expect(onDragTokensEnd).toHaveBeenCalledTimes(1);
     });
 
-    it("ends the live drag without moving when the token is dropped where it started", () => {
-      // A token already centred on its cell, so dropping it where it was grabbed lands where it started.
+    it("ends the live drag without moving when the token snaps back to where it started", () => {
+      // A token already centred on its cell, so a Shift drop near where it was grabbed snaps to where it started.
       const { canvas, onDragTokensEnd, onMoveToken } = renderDrag({ ...token, x_m: 1.5, y_m: 1.5 });
       fireEvent.pointerDown(canvas, { clientX: 108, clientY: 108, button: 0 });
-      fireEvent.pointerMove(canvas, { clientX: 216, clientY: 144 });
-      fireEvent.pointerMove(canvas, { clientX: 108, clientY: 108 });
-      fireEvent.pointerUp(canvas, { clientX: 108, clientY: 108 });
+      fireEvent.pointerMove(canvas, { clientX: 216, clientY: 144, shiftKey: true });
+      fireEvent.pointerMove(canvas, { clientX: 100, clientY: 100, shiftKey: true });
+      fireEvent.pointerUp(canvas, { clientX: 100, clientY: 100, shiftKey: true });
       expect(onDragTokensEnd).toHaveBeenCalledTimes(1);
       expect(onMoveToken).not.toHaveBeenCalled();
     });

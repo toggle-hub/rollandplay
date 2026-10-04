@@ -34,7 +34,7 @@ type Props = {
   onDragTokensEnd?: () => void;
 };
 type TokenDrag = {
-  /** Every token moving together; the grabbed one leads and snaps to the grid. */
+  /** Every token moving together; the grabbed one leads and, with Shift held, snaps to the grid. */
   tokens: RoomToken[];
   grabbed: RoomToken;
   /** Pointer position relative to the grabbed token's center, so the token does not jump under the pointer. */
@@ -44,6 +44,8 @@ type TokenDrag = {
   clientX: number;
   clientY: number;
   moved: boolean;
+  /** Shift is held, so the drop snaps to the grid. */
+  snap: boolean;
 };
 type Marquee = { from: Point; to: Point; clientX: number; clientY: number; moved: boolean };
 type TransformFrame = { box: Point[]; anchor: Point; handle: Point; center: Point };
@@ -130,8 +132,12 @@ export function MapCanvas({
   const mapWidth = n(active?.width_m, 30);
   const mapHeight = n(active?.height_m, 30);
   const isMovable = (token: RoomToken) => movableTokenIds?.has(token.id) ?? true;
-  // Where each dragged token lands: the grabbed token snaps to the grid and the rest keep their offsets to it.
-  function landingPositions(tokenDrag: TokenDrag, pointer: Point) {
+  // Where each dragged token lands. A free drop stays where the token is drawn, to the hundredth of a meter the
+  // server stores; with Shift the grabbed token snaps to the grid and the rest keep their offsets to it.
+  function landingPositions(tokenDrag: TokenDrag, pointer: Point, snap: boolean) {
+    if (!snap) {
+      return new Map([...followPositions(tokenDrag, pointer)].map(([id, p]) => [id, { x: round(p.x), y: round(p.y) }]));
+    }
     const target = snapTokenCenter(
       { x: pointer.x - tokenDrag.grabOffset.x, y: pointer.y - tokenDrag.grabOffset.y },
       n(tokenDrag.grabbed.size_m, 1),
@@ -235,18 +241,20 @@ export function MapCanvas({
         ctx.stroke();
       });
       ctx.setLineDash([]);
-      // Dashed lavender ghosts mark the cells the dragged tokens snap to when dropped.
-      const landing = landingPositions(drag, drag.current);
-      ctx.strokeStyle = "#be8cff";
-      ctx.lineWidth = 2;
-      ctx.setLineDash([4, 4]);
-      drag.tokens.forEach((token) => {
-        const center = toCanvas(landing.get(token.id)!);
-        ctx.beginPath();
-        ctx.arc(center.x, center.y, (n(token.size_m, 1) * scale) / 2, 0, Math.PI * 2);
-        ctx.stroke();
-      });
-      ctx.setLineDash([]);
+      if (drag.snap) {
+        // Dashed lavender ghosts mark the cells the dragged tokens snap to when dropped.
+        const landing = landingPositions(drag, drag.current, true);
+        ctx.strokeStyle = "#be8cff";
+        ctx.lineWidth = 2;
+        ctx.setLineDash([4, 4]);
+        drag.tokens.forEach((token) => {
+          const center = toCanvas(landing.get(token.id)!);
+          ctx.beginPath();
+          ctx.arc(center.x, center.y, (n(token.size_m, 1) * scale) / 2, 0, Math.PI * 2);
+          ctx.stroke();
+        });
+        ctx.setLineDash([]);
+      }
     }
     state.visibleTokens.forEach((t) => {
       const image = t.image_asset_id ? images.current.get(t.image_asset_id) : undefined;
@@ -398,6 +406,10 @@ export function MapCanvas({
     streaming.current = false;
     dragEnd.current?.();
   }
+  // Pressing or releasing Shift mid-drag toggles grid snapping without waiting for the pointer to move.
+  function setDragSnap(snap: boolean) {
+    setDrag((current) => current && current.snap !== snap ? { ...current, snap } : current);
+  }
   function cancelPointerAction() {
     endStreaming();
     rightGesture.current = null;
@@ -423,7 +435,7 @@ export function MapCanvas({
         className="block h-auto w-full max-w-full touch-none rounded-xl border border-[var(--paper)]/15 bg-[var(--surface)] focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)]"
         role="img"
         tabIndex={0}
-        aria-label="Interactive tabletop map. Drag a structure to move it. Drag the round handle above the selected structure to rotate it; hold Shift to snap rotation to 15 degrees. Drag a token to move it; it snaps to the grid when dropped, and everyone at the table sees it move. Drag across empty space to select several tokens, then drag one of them to move the group. Click a token you control without dragging to choose an attack, then click a target. Hold the right mouse button and drag to measure distance; release to hide the ruler. Press Escape to cancel a drag. While placing a structure, click the map to place it; press Escape to stop."
+        aria-label="Interactive tabletop map. Drag a structure to move it. Drag the round handle above the selected structure to rotate it; hold Shift to snap rotation to 15 degrees. Drag a token to move it freely; hold Shift to snap it to the grid when dropped. Everyone at the table sees it move. Drag across empty space to select several tokens, then drag one of them to move the group. Click a token you control without dragging to choose an attack, then click a target. Hold the right mouse button and drag to measure distance; release to hide the ruler. Press Escape to cancel a drag. While placing a structure, click the map to place it; press Escape to stop."
         onContextMenu={(event) => event.preventDefault()}
         onPointerDown={(event) => {
           if ((event.button !== 0 && event.button !== 2) || pointerActive.current) return;
@@ -488,6 +500,7 @@ export function MapCanvas({
               clientX: event.clientX,
               clientY: event.clientY,
               moved: false,
+              snap: event.shiftKey,
             });
             if (!group) onSelect?.({ kind: "tokens", ids: [token.id] });
             return;
@@ -536,7 +549,7 @@ export function MapCanvas({
             return;
           }
           if (drag) {
-            const next = { ...drag, current: point, moved: drag.moved || Math.hypot(event.clientX - drag.clientX, event.clientY - drag.clientY) >= 4 };
+            const next = { ...drag, current: point, snap: event.shiftKey, moved: drag.moved || Math.hypot(event.clientX - drag.clientX, event.clientY - drag.clientY) >= 4 };
             setDrag(next);
             if (next.moved && onDragTokens) {
               const follow = followPositions(next, point);
@@ -581,7 +594,7 @@ export function MapCanvas({
           if (drag) {
             let moving = false;
             if (drag.moved || Math.hypot(event.clientX - drag.clientX, event.clientY - drag.clientY) >= 4) {
-              const positions = landingPositions(drag, eventPoint(event));
+              const positions = landingPositions(drag, eventPoint(event), event.shiftKey);
               const to = positions.get(drag.grabbed.id)!;
               if (to.x !== drag.from.x || to.y !== drag.from.y) {
                 if (drag.tokens.length === 1 && onMoveToken) {
@@ -640,11 +653,15 @@ export function MapCanvas({
         onLostPointerCapture={cancelPointerAction}
         onBlur={cancelPointerAction}
         onKeyDown={(event) => {
+          if (event.key === "Shift") setDragSnap(true);
           if (event.key !== "Escape") return;
           if (placingKind) onCancelPlacement?.();
           closeAttackMenu();
           setTargeting(null);
           cancelPointerAction();
+        }}
+        onKeyUp={(event) => {
+          if (event.key === "Shift") setDragSnap(false);
         }}
       />
       {attackMenu && attackMenuToken && <TokenAttackMenu

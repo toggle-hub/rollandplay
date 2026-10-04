@@ -122,7 +122,7 @@ export function RoomPage() {
       }
       if (event.type === "token.updated" || event.type === "token.removed" || event.type === "structure.moved" || event.type === "structure.updated" || event.type === "structure.created" || event.type === "structure.removed" || event.type === "map.activated" || event.type === "vision.update" || event.type === "check.changed" || event.type === "state.snapshot") void load();
       if (event.type === "map.activated" || event.type === "state.snapshot") setRemoteDrags(new Map());
-      // The preview stays on the landing cell until the reloaded state has the token there.
+      // The preview stays on the landing position until the reloaded state has the token there.
       if (event.type === "token.moved" && isTokenIdsBody(event.body)) {
         const ids = event.body.token_ids;
         void load().then(() => setRemoteDrags((current) => withoutKeys(current, ids)));
@@ -222,7 +222,7 @@ export function RoomPage() {
   }
   // Dropped tokens stay where they landed; a rejected move answers with an error, which reloads the room.
   function moveRoomTokens(type: string, body: unknown, moves: { tokenId: string; to: Point }[]) {
-    // A last live frame at the landing cell shows the table the drop before the move is stored.
+    // A last live frame at the landing position shows the table the drop before the move is stored.
     dragFrames.cancel();
     trySend("token.drag", { moves });
     if (!sendMap(type, body)) return;
@@ -420,7 +420,7 @@ export function RoomPage() {
       </div>
       <section className="col-start-1 row-start-2 min-w-0 space-y-3 md:col-start-2 md:row-start-1" aria-label="Tabletop">
           <div className="flex flex-wrap items-center justify-between gap-2"><h2 className="text-xl">{state.activeMap?.name ?? "The tabletop"}</h2><p className="text-muted text-xs">{state.metersPerGrid} m per grid square</p></div>
-          <p className="text-muted text-xs">{isDM ? "Left-drag a structure to move it. Drag the round handle above the selected structure to rotate it; hold Shift to snap to 15°. Drag a token to move it; it snaps to the grid. Drag across empty space to select several tokens, then drag one of them to move the group. Click any token without dragging to pick one of its attacks, then click a target. Select an object to hide it from or reveal it to players. Hold the right mouse button and drag to measure distance; release to hide the ruler. Use Place structure to add walls, doors, windows, cover or terrain to this room's map, and select a structure to remove it; these changes stay in this room and never alter the saved map." : "Drag a token to move it; it snaps to the grid. Drag across empty space to select several tokens, then drag one of them to move the group. Click a token you control without dragging to pick an attack and see its range, then click a highlighted target; the dice roll automatically. Walls and other attack-blocking structures stop attacks unless they let attacks pass. Hold the right mouse button and drag to measure distance; release to hide the ruler."}</p>
+          <p className="text-muted text-xs">{isDM ? "Left-drag a structure to move it. Drag the round handle above the selected structure to rotate it; hold Shift to snap to 15°. Drag a token to move it freely; hold Shift to snap it to the grid. Drag across empty space to select several tokens, then drag one of them to move the group. Click any token without dragging to pick one of its attacks, then click a target. Select an object to hide it from or reveal it to players. Hold the right mouse button and drag to measure distance; release to hide the ruler. Use Place structure to add walls, doors, windows, cover or terrain to this room's map, and select a structure to remove it; these changes stay in this room and never alter the saved map." : "Drag a token to move it freely; hold Shift to snap it to the grid. Drag across empty space to select several tokens, then drag one of them to move the group. Click a token you control without dragging to pick an attack and see its range, then click a highlighted target; the dice roll automatically. Walls and other attack-blocking structures stop attacks unless they let attacks pass. Hold the right mouse button and drag to measure distance; release to hide the ruler."}</p>
           <div className="grid grid-cols-1 items-center gap-3 rounded-lg border border-[var(--paper)]/10 bg-[var(--input)] px-3 py-2 sm:grid-cols-[minmax(0,1fr)_auto]" role="group" aria-label="Selected tabletop object">
             {selectedTokens.length === 1
               ? <p className="min-w-0 truncate text-sm text-[var(--paper)]"><span className="text-muted mr-2 text-xs uppercase tracking-[0.12em]">token</span>{selectedTokens[0].name}{isDM && <span className="text-muted ml-2 text-xs">{selectedTokens[0].is_hidden ? "Hidden" : "Visible"}</span>}</p>
