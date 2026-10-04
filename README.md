@@ -8,9 +8,16 @@ The public `/` page introduces Rollandplay with responsive editorial layouts, bu
 
 The shared frontend palette uses pink `#ffa9a9` for alerts and headline highlights, green `#d9ffb5` for success and terrain, peach `#ffb887` for warm accents and doors, purple `#be8cff` for primary actions and walls, and lavender `#ebc7ff` for secondary accents and windows. Map cover uses pink. Dark neutral surfaces and contrasting text keep pastel controls readable; theme variables live in `frontend/src/index.css`.
 
-Rooms, friends, rule books, character sheets, maps, and map editors are available only after `/api/me` confirms a session. While that check is pending or fails, neither feature navigation nor feature screens mount. Connection failures offer a retry; protected API responses with status `401` remove the workspace and return to sign-in. Backend authorization remains the security boundary.
+Rooms, friends, rule books, character sheets, maps, and map editors are available only after `/api/me` confirms a session. While that check is pending or fails, neither feature navigation nor feature screens mount. Connection failures offer a retry; a protected API response with status `401` that a token refresh can't fix removes the workspace and returns to sign-in. Backend authorization remains the security boundary.
 
 Sign-in uses an email magic link. A protected URL opened before sign-in is remembered in the current tab and restored afterward; otherwise sign-in opens `/rooms`. Sign out revokes the session and returns to the public landing page. On smaller screens, authenticated navigation is available through the menu button.
+
+A sign-in is two httpOnly cookies:
+
+- **Access token** (`SESSION_COOKIE_NAME`, path `/`, `SameSite=Lax`): sent with every request and websocket connection. It lasts `ACCESS_TOKEN_TTL_MINUTES` (default 15).
+- **Refresh token** (`<SESSION_COOKIE_NAME>_refresh`, path `/api/auth`, `SameSite=Strict`): sent only to `POST /api/auth/refresh` and `POST /api/auth/logout`. It lasts `SESSION_TTL_HOURS` (default 720) since its last use.
+
+`POST /api/auth/refresh` issues a new access token, rotates the refresh token and answers `{"access_expires_in": seconds}`. While signed in, the frontend refreshes a minute before the access token expires, so images and new websocket connections keep working; any request that still gets a `401` is refreshed once and repeated. A refresh token that was already rotated still works for 30 seconds, so tabs refreshing at the same moment don't sign each other out. Used later than that, it counts as stolen: the whole sign-in is revoked and every tab returns to sign-in. `POST /api/auth/logout` revokes the sign-in through either cookie and clears both. Both cookies are `Secure` when `PUBLIC_BASE_URL` is `https://`. Migration `013_refresh_tokens.sql` removes existing sessions, so everyone signs in again once after deploying it.
 
 Workspace forms expose loading, empty, and error states. JSON editors report malformed input without discarding it. The map editor works like a stamp-and-arrange tool with two tools. The Place tool (B) shows the active brush as a dashed ghost under the pointer, and every click saves one structure; Q/E rotate the stamp by 15°, [ and ] resize it by 10%, and the Place panel's Stamp rotation (°) and Stamp scale (%) inputs set it exactly. The Select tool (V) picks structures: click one, Shift-click (or Ctrl/Cmd-click) to add or remove it, or drag across empty space to select every structure the area touches. Grouped structures (Ctrl/Cmd+G groups the selection, Ctrl/Cmd+Shift+G ungroups it) are always selected and transformed together. The selection shows a dashed frame with square corner handles and a round rotation handle above it: drag inside the frame to move it (Shift locks to one axis), drag a corner to scale around the opposite corner, or drag the round handle to rotate around the frame center (Shift snaps to 15°). A lone two-point wall stretches from the grabbed endpoint. The Selection panel edits type, blocking flags, rotation, scale, flips, grouping and draw order; right-clicking a structure opens the same actions (duplicate, copy, bring to front, send to back, group, ungroup, delete). Keyboard shortcuts: Ctrl/Cmd+C/V/D copy, paste (offset by one grid square per paste) and duplicate; Ctrl/Cmd+A selects everything; arrow keys nudge by 0.1 m (Shift: one grid square); Q/E and [ ] rotate and scale the selection; Delete or Backspace removes it; Escape returns to Select or clears the selection; Ctrl/Cmd+Z undoes and Ctrl/Cmd+Shift+Z (or Ctrl/Cmd+Y) redoes, also from the toolbar's History buttons. Scroll to zoom around the pointer, and drag with the right or middle mouse button (or hold Space and drag) to pan. Structures keep a draw order (`z_index`, higher draws on top, new structures go on top) and an optional `group_id`; both are accepted by `POST`/`PATCH /api/maps/{mapID}/structures`, and `"group_id": null` clears a group. The "Add from JSON" form saves a structure from pasted or imported geometry, and the whole map exports as JSON. Map owners can delete a map from the map list or the editor's Map settings after confirming (`DELETE /api/maps/{mapID}`); editors cannot, and a map still attached to a room is refused with `409 map_in_use`. Rooms let game masters attach an active map, and DM token placement does not require a character sheet. The tabletop canvas supports pointer interaction at responsive sizes, and game-master controls use the signed-in user identity rather than a fixed local user.
 
@@ -275,7 +282,8 @@ DATABASE_URL='postgres://USER:PASSWORD@HOST:5432/DBNAME?sslmode=require'
 REDIS_ADDR='HOST:6379'
 REDIS_PASSWORD='REDIS_PASSWORD_IF_ANY'
 SESSION_COOKIE_NAME='rollandplay_session'
-SESSION_TTL_HOURS='720'
+SESSION_TTL_HOURS='720'          # sign-in lifetime since the last refresh
+ACCESS_TOKEN_TTL_MINUTES='15'    # access cookie lifetime; the frontend refreshes before it ends
 MAGIC_LINK_TTL_MINUTES='15'
 SMTP_ADDR='smtp.provider.example:587'
 SMTP_FROM='Rollandplay <no-reply@your-domain.example>'
@@ -347,7 +355,7 @@ The proxy must preserve:
 - `Upgrade`
 - `Connection`
 
-Cookie auth uses httpOnly `SameSite=Lax` cookies. Use HTTPS in production.
+Sign-in uses httpOnly cookies: a short-lived access token (`SameSite=Lax`) and a refresh token limited to `/api/auth` (`SameSite=Strict`). Both are `Secure` when `PUBLIC_BASE_URL` is `https://`. Use HTTPS in production.
 
 ## How to run locally
 

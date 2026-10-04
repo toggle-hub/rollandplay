@@ -1,6 +1,6 @@
 import { createContext, useCallback, useContext, useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
-import { ApiError, apiFetch, onSessionExpired } from "../api/client";
+import { ApiError, apiFetch, keepSessionFresh, onSessionExpired } from "../api/client";
 import type { User } from "../api/types";
 
 type Session =
@@ -62,6 +62,9 @@ export function SessionProvider({ children }: { children: ReactNode }) {
     setSession({ status: "anonymous", reason: "unauthorized" });
   }), []);
 
+  const signedIn = session.status === "authenticated";
+  useEffect(() => signedIn ? keepSessionFresh() : undefined, [signedIn]);
+
   useEffect(() => {
     let active = true;
     const current = revision.current;
@@ -78,11 +81,7 @@ export function SessionProvider({ children }: { children: ReactNode }) {
   }, [attempt]);
 
   const signOut = useCallback(async () => {
-    try {
-      await apiFetch<void>("/api/logout", { method: "POST" });
-    } catch (error) {
-      if (!(error instanceof ApiError && error.status === 401)) throw error;
-    }
+    await apiFetch<void>("/api/auth/logout", { method: "POST" });
     revision.current += 1;
     clearDestination();
     setSession({ status: "anonymous", reason: "signed-out" });

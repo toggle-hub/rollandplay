@@ -19,7 +19,8 @@ type Config struct {
 	RedisAddr         string
 	RedisPassword     string
 	SessionCookieName string
-	SessionTTL        time.Duration
+	SessionTTL        time.Duration // how long a sign-in lasts without use: the refresh token's lifetime
+	AccessTTL         time.Duration // lifetime of the access token sent with every request
 	MagicLinkTTL      time.Duration
 	SMTPAddr          string
 	SMTPFrom          string
@@ -69,11 +70,16 @@ func Load() (Config, error) {
 	if err != nil {
 		return c, fmt.Errorf("SESSION_TTL_HOURS: %w", err)
 	}
+	at, err := strconv.Atoi(env("ACCESS_TOKEN_TTL_MINUTES", "15"))
+	if err != nil || at <= 0 {
+		return c, fmt.Errorf("ACCESS_TOKEN_TTL_MINUTES must be a positive number of minutes")
+	}
 	ml, err := strconv.Atoi(env("MAGIC_LINK_TTL_MINUTES", "15"))
 	if err != nil {
 		return c, fmt.Errorf("MAGIC_LINK_TTL_MINUTES: %w", err)
 	}
 	c.SessionTTL = time.Duration(sh) * time.Hour
+	c.AccessTTL = time.Duration(at) * time.Minute
 	c.MagicLinkTTL = time.Duration(ml) * time.Minute
 	pt, err := strconv.Atoi(env("S3_PRESIGN_TTL_MINUTES", "15"))
 	if err != nil {

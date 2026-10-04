@@ -53,7 +53,8 @@ describe("session boundary", () => {
     expect(screen.queryByRole("navigation", { name: "Workspace" })).not.toBeInTheDocument();
     expect(screen.getByLabelText("Current path")).toHaveTextContent("/login");
     expect(loginDestination()).toBe(path);
-    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual(["/api/me"]);
+    // Only a refresh attempt follows the rejected session check; no protected data is fetched.
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual(["/api/me", "/api/auth/refresh"]);
   });
 
   it.each(["network", "server"])("keeps tools hidden on a %s failure and supports retry", async (failure) => {
@@ -90,14 +91,14 @@ describe("session boundary", () => {
   });
 
   it("removes the workspace after a successful sign-out", async () => {
-    const fetchMock = vi.fn().mockImplementation((path: string) => Promise.resolve(response(path === "/api/logout" ? 204 : 200, path === "/api/me" ? user : [])));
+    const fetchMock = vi.fn().mockImplementation((path: string) => Promise.resolve(response(path === "/api/auth/logout" ? 204 : 200, path === "/api/me" ? user : [])));
     vi.stubGlobal("fetch", fetchMock);
     openApp("/rooms");
     fireEvent.click(await screen.findByRole("button", { name: "Sign out" }));
     expect(await screen.findByText("Public story")).toBeInTheDocument();
     expect(screen.queryByRole("navigation", { name: "Workspace" })).not.toBeInTheDocument();
     expect(screen.queryByLabelText("Room name")).not.toBeInTheDocument();
-    expect(fetchMock).toHaveBeenCalledWith("/api/logout", expect.objectContaining({ method: "POST", credentials: "include" }));
+    expect(fetchMock).toHaveBeenCalledWith("/api/auth/logout", expect.objectContaining({ method: "POST", credentials: "include" }));
   });
 
   it("clears protected UI when a feature request reports an expired session", async () => {

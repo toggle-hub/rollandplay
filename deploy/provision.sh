@@ -94,6 +94,7 @@ DATABASE_URL=postgres://rollandplay:${db_password}@127.0.0.1:5432/rollandplay?ss
 REDIS_ADDR=127.0.0.1:6379
 SESSION_COOKIE_NAME=rollandplay_session
 SESSION_TTL_HOURS=720
+ACCESS_TOKEN_TTL_MINUTES=15
 MAGIC_LINK_TTL_MINUTES=15
 # Required for login emails. Replace, then: systemctl restart rollandplay-backend
 SMTP_ADDR=CHANGE_ME_smtp.provider.example:587

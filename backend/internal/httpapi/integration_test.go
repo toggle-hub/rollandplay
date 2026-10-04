@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 
 	"rollandplay/backend/internal/auth"
@@ -31,6 +32,7 @@ import (
 type testApp struct {
 	server  *httptest.Server
 	poolURL string
+	pool    *pgxpool.Pool
 	redis   *redis.Client
 	cfg     config.Config
 }
@@ -80,7 +82,7 @@ func newTestApp(t *testing.T) *testApp {
 	}
 	srv := httptest.NewServer(api.Handler())
 	t.Cleanup(func() { srv.Close(); rdb.Close(); pool.Close() })
-	return &testApp{server: srv, redis: rdb, cfg: cfg}
+	return &testApp{server: srv, pool: pool, redis: rdb, cfg: cfg}
 }
 func (a *testApp) client(t *testing.T) *http.Client {
 	jar, _ := cookiejar.New(nil)
@@ -401,6 +403,135 @@ func TestAuthMagicLinkCookieAndReuse(t *testing.T) {
 	defer res.Body.Close()
 	if res.StatusCode != 401 {
 		t.Fatalf("reused token status=%d", res.StatusCode)
+	}
+}
+
+func TestAuthRefreshTokens(t *testing.T) {
+	a := newTestApp(t)
+	ctx := context.Background()
+	accessName, refreshName := a.cfg.SessionCookieName, a.cfg.SessionCookieName+"_refresh"
+	signIn := func(email string) (access, refresh string) {
+		t.Helper()
+		c, _ := login(t, a, email)
+		base, _ := url.Parse(a.server.URL)
+		authURL, _ := url.Parse(a.server.URL + "/api/auth/refresh")
+		for _, ck := range c.Jar.Cookies(base) {
+			if ck.Name == refreshName {
+				t.Fatal("the refresh cookie should only be sent to /api/auth")
+			}
+			if ck.Name == accessName {
+				access = ck.Value
+			}
+		}
+		for _, ck := range c.Jar.Cookies(authURL) {
+			if ck.Name == refreshName {
+				refresh = ck.Value
+			}
+		}
+		if access == "" || refresh == "" {
+			t.Fatalf("sign-in should set both cookies: access=%q refresh=%q", access, refresh)
+		}
+		return access, refresh
+	}
+	// send makes a request carrying exactly the given cookies and returns the cookies it set.
+	send := func(method, path string, cookies map[string]string) (int, map[string]*http.Cookie, map[string]any) {
+		t.Helper()
+		req, _ := http.NewRequest(method, a.server.URL+path, nil)
+		for name, value := range cookies {
+			req.AddCookie(&http.Cookie{Name: name, Value: value})
+		}
+		res, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer res.Body.Close()
+		set := map[string]*http.Cookie{}
+		for _, ck := range res.Cookies() {
+			set[ck.Name] = ck
+		}
+		var body map[string]any
+		_ = json.NewDecoder(res.Body).Decode(&body)
+		return res.StatusCode, set, body
+	}
+	me := func(access string) int {
+		t.Helper()
+		status, _, _ := send("GET", "/api/me", map[string]string{accessName: access})
+		return status
+	}
+	refreshWith := func(refresh string) (int, map[string]*http.Cookie) {
+		t.Helper()
+		status, set, body := send("POST", "/api/auth/refresh", map[string]string{refreshName: refresh})
+		if status == 200 && body["access_expires_in"] != a.cfg.AccessTTL.Seconds() {
+			t.Fatalf("refresh should report the access lifetime: %+v", body)
+		}
+		return status, set
+	}
+
+	access1, refresh1 := signIn("refresh@example.com")
+	if me(access1) != 200 {
+		t.Fatal("a fresh access token should sign requests in")
+	}
+
+	// Refreshing rotates the refresh token and issues a new access token.
+	status, set := refreshWith(refresh1)
+	access2, refresh2 := set[accessName], set[refreshName]
+	if status != 200 || access2 == nil || refresh2 == nil || refresh2.Value == refresh1 {
+		t.Fatalf("refresh should rotate both cookies: status=%d cookies=%+v", status, set)
+	}
+	if !access2.HttpOnly || access2.Path != "/" || access2.MaxAge != int(a.cfg.AccessTTL.Seconds()) {
+		t.Fatalf("access cookie attributes: %+v", access2)
+	}
+	if !refresh2.HttpOnly || refresh2.Path != "/api/auth" || refresh2.SameSite != http.SameSiteStrictMode || refresh2.MaxAge != int(a.cfg.SessionTTL.Seconds()) {
+		t.Fatalf("refresh cookie attributes: %+v", refresh2)
+	}
+	if me(access2.Value) != 200 {
+		t.Fatal("the refreshed access token should sign requests in")
+	}
+
+	// A tab refreshing with the just-rotated token gets access, and keeps the newer refresh cookie.
+	status, set = refreshWith(refresh1)
+	if status != 200 || set[accessName] == nil || set[refreshName] != nil || me(set[accessName].Value) != 200 {
+		t.Fatalf("a concurrent refresh should get access only: status=%d cookies=%+v", status, set)
+	}
+
+	// Once the access token expires, requests fail until the client refreshes.
+	if _, err := a.pool.Exec(ctx, `update session_access_tokens set expires_at=now()-interval '1 second'`); err != nil {
+		t.Fatal(err)
+	}
+	if me(access2.Value) != 401 {
+		t.Fatal("an expired access token should be rejected")
+	}
+	status, set = refreshWith(refresh2.Value)
+	if status != 200 || me(set[accessName].Value) != 200 {
+		t.Fatalf("refresh after expiry: status=%d", status)
+	}
+	access3, refresh3 := set[accessName].Value, set[refreshName].Value
+
+	// Replaying a rotated-away token after the grace period revokes the whole sign-in.
+	if _, err := a.pool.Exec(ctx, `update sessions set refreshed_at=now()-interval '1 minute'`); err != nil {
+		t.Fatal(err)
+	}
+	if status, _ := refreshWith(refresh2.Value); status != 401 {
+		t.Fatalf("a replayed refresh token should be rejected, got %d", status)
+	}
+	if status, _ := refreshWith(refresh3); status != 401 || me(access3) != 401 {
+		t.Fatal("a replayed refresh token should revoke the sign-in's current tokens")
+	}
+
+	// Signing out works with only the refresh cookie and ends the sign-in.
+	access4, refresh4 := signIn("refresh-logout@example.com")
+	if _, err := a.pool.Exec(ctx, `update session_access_tokens set expires_at=now()-interval '1 second'`); err != nil {
+		t.Fatal(err)
+	}
+	status, set, _ = send("POST", "/api/auth/logout", map[string]string{refreshName: refresh4})
+	if status != 204 || set[accessName] == nil || set[accessName].MaxAge >= 0 || set[refreshName] == nil || set[refreshName].MaxAge >= 0 {
+		t.Fatalf("logout should clear both cookies: status=%d cookies=%+v", status, set)
+	}
+	if status, _ := refreshWith(refresh4); status != 401 || me(access4) != 401 {
+		t.Fatal("a signed-out refresh token should be rejected")
+	}
+	if status, _, _ := send("POST", "/api/auth/logout", nil); status != 204 {
+		t.Fatalf("logout without cookies should still succeed, got %d", status)
 	}
 }
 

@@ -61,9 +61,10 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /api/auth/magic-link", s.handleMagicLink)
 	mux.HandleFunc("POST /api/auth/consume", s.handleConsume)
+	mux.HandleFunc("POST /api/auth/refresh", s.handleRefresh)
+	mux.HandleFunc("POST /api/auth/logout", s.handleLogout)
 	mux.HandleFunc("GET /api/me", s.handleMe)
 	mux.HandleFunc("PATCH /api/me", s.handleMePatch)
-	mux.HandleFunc("POST /api/logout", s.handleLogout)
 	mux.HandleFunc("GET /api/rooms", s.handleRoomsList)
 	mux.HandleFunc("POST /api/rooms", s.handleRoomsCreate)
 	mux.HandleFunc("GET /api/rooms/{roomID}", s.handleRoomGet)
@@ -254,13 +255,37 @@ func (s *Server) handleConsume(w http.ResponseWriter, r *http.Request) {
 		WriteError(w, 400, "bad_json", "invalid JSON")
 		return
 	}
-	sess, u, err := auth.ConsumeMagicLink(r.Context(), req.Token)
+	tokens, u, err := auth.ConsumeMagicLink(r.Context(), req.Token)
 	if err != nil {
 		WriteError(w, 401, "invalid_token", "token is invalid or expired")
 		return
 	}
-	http.SetCookie(w, &http.Cookie{Name: auth.CookieName(), Value: sess.Token, Path: "/", HttpOnly: true, SameSite: http.SameSiteLaxMode, MaxAge: auth.SessionMaxAge()})
+	auth.SetCookies(w, tokens)
 	WriteJSON(w, 200, map[string]any{"user": u})
+}
+
+// handleRefresh renews the access cookie from the refresh cookie and rotates the refresh cookie.
+// The response says how many seconds the new access token lasts, so clients refresh in time.
+func (s *Server) handleRefresh(w http.ResponseWriter, r *http.Request) {
+	c, err := r.Cookie(auth.RefreshCookieName())
+	if err != nil || c.Value == "" {
+		WriteError(w, 401, "unauthorized", "sign in required")
+		return
+	}
+	tokens, err := auth.Refresh(r.Context(), c.Value)
+	if errors.Is(err, auth.ErrRefreshReused) {
+		s.Logger.Warn("refresh token reused; sign-in revoked")
+	}
+	if errors.Is(err, auth.ErrUnauthorized) || errors.Is(err, auth.ErrRefreshReused) {
+		WriteError(w, 401, "unauthorized", "sign in required")
+		return
+	}
+	if err != nil {
+		WriteError(w, 500, "db", "could not refresh the sign-in")
+		return
+	}
+	auth.SetCookies(w, tokens)
+	WriteJSON(w, 200, map[string]any{"access_expires_in": int(auth.AccessTTL().Seconds())})
 }
 func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
 	u, _, ok := s.requireUser(w, r)
@@ -296,12 +321,14 @@ func (s *Server) handleMePatch(w http.ResponseWriter, r *http.Request) {
 	respondRaw(w, row, err)
 }
 
+// handleLogout ends the sign-in behind either cookie and removes both, even when the access token
+// has already expired.
 func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
-	_, sess, ok := s.requireUser(w, r)
-	if ok {
-		_ = auth.RevokeSession(r.Context(), sess.ID)
+	if err := auth.RevokeRequestSession(r); err != nil {
+		WriteError(w, 500, "db", "could not sign out")
+		return
 	}
-	http.SetCookie(w, &http.Cookie{Name: auth.CookieName(), Value: "", Path: "/", HttpOnly: true, SameSite: http.SameSiteLaxMode, MaxAge: -1})
+	auth.ClearCookies(w)
 	w.WriteHeader(204)
 }
 
