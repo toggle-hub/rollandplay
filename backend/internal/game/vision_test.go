@@ -11,11 +11,14 @@ func TestVisionWallClipsAndDMSeesAll(t *testing.T) {
 	near := Token{ID: "near", OwnerUserID: "u2", X: -3, Y: 0, VisionRangeM: 10}
 	far := Token{ID: "far", OwnerUserID: "u2", X: 11, Y: 0, VisionRangeM: 10}
 	player := ComputeVisibility(VisibilityInput{UserID: "u1", MapWidthM: 20, MapHeightM: 20, Tokens: []Token{tok, near, far}, Structures: []Structure{wall}})
-	if !player.Fog || len(player.VisiblePolygons) != 1 || len(player.VisiblePolygons[0]) == 0 {
+	if !player.Fog || len(player.VisionAreas) != 1 || len(player.VisionAreas[0].Polygon) == 0 {
 		t.Fatalf("expected one vision polygon under fog: %+v", player)
 	}
+	if area := player.VisionAreas[0]; area.TokenID != "t1" || area.Origin != (Point{0, 0}) {
+		t.Fatalf("expected the area to name its token and origin: %+v", area)
+	}
 	clipped, behind := false, false
-	for _, p := range player.VisiblePolygons[0] {
+	for _, p := range player.VisionAreas[0].Polygon {
 		if p.X <= 5.01 && p.X >= 4.9 && p.Y >= -2 && p.Y <= 2 {
 			clipped = true
 		}
@@ -24,16 +27,16 @@ func TestVisionWallClipsAndDMSeesAll(t *testing.T) {
 		}
 	}
 	if !clipped {
-		t.Fatalf("expected wall clipping in vision polygon: %+v", player.VisiblePolygons[0])
+		t.Fatalf("expected wall clipping in vision polygon: %+v", player.VisionAreas[0].Polygon)
 	}
 	if !behind {
-		t.Fatalf("expected vision to reach behind the token: %+v", player.VisiblePolygons[0])
+		t.Fatalf("expected vision to reach behind the token: %+v", player.VisionAreas[0].Polygon)
 	}
 	if !slices.Contains(player.VisibleTokenIDs, "near") || slices.Contains(player.VisibleTokenIDs, "far") {
 		t.Fatalf("expected only tokens within the vision radius: %+v", player.VisibleTokenIDs)
 	}
 	dm := ComputeVisibility(VisibilityInput{IsDM: true, MapWidthM: 20, MapHeightM: 20, Tokens: []Token{tok}, Structures: []Structure{wall}})
-	if dm.Fog || len(dm.VisiblePolygons) != 0 || len(dm.VisibleTokenIDs) != 1 || len(dm.VisibleStructureIDs) != 1 {
+	if dm.Fog || len(dm.VisionAreas) != 0 || len(dm.VisibleTokenIDs) != 1 || len(dm.VisibleStructureIDs) != 1 {
 		t.Fatalf("DM should see full map: %+v", dm)
 	}
 }
@@ -47,9 +50,9 @@ func TestHiddenStructureDoesNotBlockOrRevealToPlayers(t *testing.T) {
 	if len(player.VisibleStructureIDs) != 0 {
 		t.Fatalf("hidden structure should not be visible: %+v", player.VisibleStructureIDs)
 	}
-	for _, point := range player.VisiblePolygons[0] {
+	for _, point := range player.VisionAreas[0].Polygon {
 		if point.X > 4.9 && point.X < 5.01 && point.Y >= -2 && point.Y <= 2 {
-			t.Fatalf("hidden structure should not clip vision: %+v", player.VisiblePolygons[0])
+			t.Fatalf("hidden structure should not clip vision: %+v", player.VisionAreas[0].Polygon)
 		}
 	}
 

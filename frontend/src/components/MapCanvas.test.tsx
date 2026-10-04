@@ -313,6 +313,38 @@ describe("MapCanvas", () => {
       expect(arc).toHaveBeenCalledWith(120, 120, 12, 0, Math.PI * 2);
       expect(arc).not.toHaveBeenCalledWith(24, 24, 12, 0, Math.PI * 2);
     });
+
+    it("moves the viewer's fog of war with their token while dragging and after the drop", () => {
+      // Off the grid lines, which also start with moveTo.
+      const area = { tokenId: "token", origin: { x: 1, y: 1 }, polygon: [{ x: 0.5, y: 0.25 }, { x: 1, y: 0.25 }, { x: 0.5, y: 1 }] };
+      const fogged = (visibleTokens = [token], visionAreas = [area]) => ({
+        ...state, visibleTokens, visibility: { fog: true, visionAreas, visibleTokenIds: ["token"], visibleStructureIds: [] },
+      });
+      const moveTo = globalThis.__canvasContext.moveTo;
+      moveTo.mockClear();
+      const { container, rerender } = render(<MapCanvas state={fogged()} onMoveToken={vi.fn()} />);
+      const canvas = container.querySelector("canvas")!;
+      // At rest the server's polygon is drawn as sent.
+      expect(moveTo).toHaveBeenCalledWith(12, 6);
+
+      fireEvent.pointerDown(canvas, { clientX: 72, clientY: 72, button: 0 });
+      moveTo.mockClear();
+      fireEvent.pointerMove(canvas, { clientX: 216, clientY: 144 });
+      // Recast around the token under the pointer at (3, 2): its first ray ends 10 m east.
+      expect(moveTo).toHaveBeenCalledWith(13 * 24, 2 * 24);
+      expect(moveTo).not.toHaveBeenCalledWith(12, 6);
+      fireEvent.pointerUp(canvas, { clientX: 216, clientY: 144 });
+
+      // The dropped token sits on its landing cell before the server recasts its vision.
+      moveTo.mockClear();
+      const landed = { ...token, x_m: 3.5, y_m: 2.5 };
+      rerender(<MapCanvas state={fogged([landed])} onMoveToken={vi.fn()} />);
+      expect(moveTo).toHaveBeenCalledWith(13.5 * 24, 2.5 * 24);
+
+      moveTo.mockClear();
+      rerender(<MapCanvas state={fogged([landed], [{ ...area, origin: { x: 3.5, y: 2.5 } }])} onMoveToken={vi.fn()} />);
+      expect(moveTo).toHaveBeenCalledWith(12, 6);
+    });
   });
 
   it("moves structures only when tabletop structure editing is enabled", () => {

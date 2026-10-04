@@ -14,15 +14,22 @@ type VisibilityInput struct {
 	Structures []Structure
 }
 type VisibilityResult struct {
-	Fog                 bool      `json:"fog"`
-	VisiblePolygons     [][]Point `json:"visiblePolygons"`
-	VisibleTokenIDs     []string  `json:"visibleTokenIds"`
-	VisibleStructureIDs []string  `json:"visibleStructureIds"`
+	Fog                 bool         `json:"fog"`
+	VisionAreas         []VisionArea `json:"visionAreas"`
+	VisibleTokenIDs     []string     `json:"visibleTokenIds"`
+	VisibleStructureIDs []string     `json:"visibleStructureIds"`
+}
+
+// VisionArea is what one of the viewer's tokens sees from Origin, its position when cast.
+type VisionArea struct {
+	TokenID string  `json:"tokenId"`
+	Origin  Point   `json:"origin"`
+	Polygon []Point `json:"polygon"`
 }
 
 func ComputeVisibility(input VisibilityInput) VisibilityResult {
 	if input.IsDM {
-		r := VisibilityResult{VisiblePolygons: [][]Point{}}
+		r := VisibilityResult{VisionAreas: []VisionArea{}}
 		for _, t := range input.Tokens {
 			r.VisibleTokenIDs = append(r.VisibleTokenIDs, t.ID)
 		}
@@ -31,13 +38,13 @@ func ComputeVisibility(input VisibilityInput) VisibilityResult {
 		}
 		return r
 	}
-	r := VisibilityResult{Fog: true, VisiblePolygons: [][]Point{}}
+	r := VisibilityResult{Fog: true, VisionAreas: []VisionArea{}}
 	visibleStruct := map[string]bool{}
 	visibleTok := map[string]bool{}
 	for _, t := range input.Tokens {
 		if t.OwnerUserID == input.UserID && !t.IsHidden {
 			origin := Point{t.X, t.Y}
-			r.VisiblePolygons = append(r.VisiblePolygons, castVision(origin, t.VisionRangeM, input.Structures))
+			r.VisionAreas = append(r.VisionAreas, VisionArea{TokenID: t.ID, Origin: origin, Polygon: castVision(origin, t.VisionRangeM, input.Structures)})
 			visibleTok[t.ID] = true
 			for _, s := range input.Structures {
 				if structureVisible(origin, t, s) {

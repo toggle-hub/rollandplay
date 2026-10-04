@@ -5,6 +5,7 @@ import { attackTargetStatus, type AttackTargetStatus } from "../lib/attacks";
 import { geometryCenter, rotateGeometry, type Point } from "../lib/geometryTransforms";
 import { structureLabel, templateGeometry } from "../lib/structures";
 import { clampTokenCenter, snapTokenCenter } from "../lib/tokenGrid";
+import { castVision } from "../lib/vision";
 import { TokenAttackMenu } from "./TokenAttackMenu";
 
 export type MapSelection = { kind: "tokens"; ids: string[] } | { kind: "structure"; id: string };
@@ -189,6 +190,9 @@ export function MapCanvas({
       ctx.lineTo(w, y);
       ctx.stroke();
     }
+    // Tokens being dragged here or by someone else at the table are drawn, and see, from where they are now.
+    const positions = drag?.moved ? followPositions(drag, drag.current) : undefined;
+    const livePosition = (token: RoomToken) => positions?.get(token.id) ?? remoteDragPositions?.get(token.id) ?? tokenCenter(token);
     drawStructures(ctx, state.structures, scale, selectedStructureId, structureDrag);
     if (state.visibility?.fog) {
       // Cut every token's sight out of an opaque layer, then lay that layer over the map.
@@ -200,9 +204,15 @@ export function MapCanvas({
       fog.fillRect(0, 0, w, h);
       fog.globalCompositeOperation = "destination-out";
       fog.fillStyle = "#000";
-      state.visibility.visiblePolygons.forEach((polygon) => {
+      state.visibility.visionAreas.forEach(({ tokenId, origin, polygon }) => {
+        // The server cast this area from origin; a token since dragged or dropped elsewhere is recast where it is.
+        const token = findToken(tokenId);
+        const at = token ? livePosition(token) : origin;
+        const points = token && Math.hypot(at.x - origin.x, at.y - origin.y) > 1e-6
+          ? castVision(at, n(token.vision_range_m), state.structures)
+          : polygon;
         fog.beginPath();
-        polygon.forEach((p, i) => {
+        points.forEach((p, i) => {
           const q = toCanvas(p);
           if (i === 0) fog.moveTo(q.x, q.y);
           else fog.lineTo(q.x, q.y);
@@ -213,9 +223,7 @@ export function MapCanvas({
       fog.globalCompositeOperation = "source-over";
       ctx.drawImage(layer, 0, 0);
     }
-    let positions: Map<string, Point> | undefined;
     if (drag?.moved) {
-      positions = followPositions(drag, drag.current);
       // Dashed outlines mark where the dragged tokens started.
       ctx.strokeStyle = "#80738e";
       ctx.lineWidth = 2;
@@ -242,7 +250,7 @@ export function MapCanvas({
     }
     state.visibleTokens.forEach((t) => {
       const image = t.image_asset_id ? images.current.get(t.image_asset_id) : undefined;
-      drawToken(ctx, t, positions?.get(t.id) ?? remoteDragPositions?.get(t.id) ?? tokenCenter(t), scale, !!selectedTokenIds?.includes(t.id), image);
+      drawToken(ctx, t, livePosition(t), scale, !!selectedTokenIds?.includes(t.id), image);
     });
     const framed = canMoveStructures ? structureDrag?.structure ?? selectedStructure : undefined;
     if (framed) {

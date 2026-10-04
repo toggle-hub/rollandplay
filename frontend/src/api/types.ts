@@ -232,7 +232,8 @@ export type VisibleRoomState = {
   visibility?: {
     /** Players see fog everywhere outside their tokens' vision; game masters see no fog. */
     fog: boolean;
-    visiblePolygons: { x: number; y: number }[][];
+    /** What each of the viewer's tokens sees, cast from origin (the token's position at the time). */
+    visionAreas: { tokenId: string; origin: { x: number; y: number }; polygon: { x: number; y: number }[] }[];
     visibleTokenIds: string[];
     visibleStructureIds: string[];
   };

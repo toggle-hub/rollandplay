@@ -38,7 +38,7 @@ Game masters can also place and remove structures during play. Use **Place struc
 
 Token controls:
 
-- **Fog of war:** each player sees a full circle around each of their tokens, cut by vision-blocking structures. The radius is per token (`vision_range_m`, default 12 m). Game masters see the whole map.
+- **Fog of war:** each player sees a full circle around each of their tokens, cut by vision-blocking structures. The radius is per token (`vision_range_m`, default 12 m). Game masters see the whole map. The room state's `visibility.visionAreas` lists `{tokenId, origin, polygon}` per token; while one of those tokens is dragged (by anyone) or has just been dropped, the client recasts its area at the token's current position, so the fog moves with it. That preview is clipped only by structures the player already knows about; the server's recast replaces it once the move is stored.
 - **One character per map:** a player can place one token on the active map; a second `POST /api/rooms/{roomID}/tokens` returns `409 token_limit`. Remove the token to bring a different character.
 - **Removing:** the token's owner or the game master selects it and chooses **Remove token**, then confirms (websocket `token.remove` with `{tokenId}`, broadcast as `token.removed`).
 - **Token settings:** selecting a single token opens a settings card in the sidebar. Game masters set current/max HP, the vision radius and which other players may also move the token. The owner and the game master can upload an image that is drawn inside the token. These save through `PATCH /api/rooms/{roomID}/tokens/{tokenID}` with any of `{hit_points, max_hit_points, vision_range_m, mover_user_ids, image_asset_id}` (`image_asset_id: null` clears it; the image must be one the caller uploaded).
