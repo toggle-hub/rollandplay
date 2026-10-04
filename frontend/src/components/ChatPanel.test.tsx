@@ -69,6 +69,72 @@ describe("ChatPanel", () => {
     expect(screen.getByText("total 7")).toBeInTheDocument();
   });
 
+  it("renders an action roll with each target's result and the change to its hit points", () => {
+    const d20 = (value: number, modifier: number) => ({ expression: `1d20+${modifier}`, dice: [{ count: 1, sides: 20, values: [value] }], modifier, total: value + modifier });
+    render(
+      <ChatPanel
+        isDM={false}
+        members={[]}
+        onSend={vi.fn()}
+        messages={[
+          {
+            id: "m5",
+            room_id: "r",
+            sender_user_id: "u",
+            kind: "roll",
+            body: "Hero attacks Goblin with Sword",
+            created_at: "now",
+            roll: { action: {
+              name: "Sword", kind: "attack", source: "attack", source_token_id: "hero", damage_type: "slashing",
+              effect: { expression: "1d8+3", dice: [{ count: 1, sides: 8, values: [4] }], modifier: 3, total: 7 },
+              targets: [{ token_id: "goblin", name: "Goblin", roll: d20(12, 5), result: "hit", damage: 7, down: true }],
+            } },
+          },
+          {
+            id: "m6",
+            room_id: "r",
+            sender_user_id: "u",
+            kind: "roll",
+            body: "Hero uses Burst",
+            created_at: "now",
+            roll: { action: {
+              name: "Burst", kind: "save", source: "action", source_token_id: "hero", dc: 13, save_ability: "dexterity", damage_type: "fire", uses_left: 0,
+              effect: { expression: "2d6", dice: [{ count: 2, sides: 6, values: [1, 2] }], modifier: 0, total: 3 },
+              targets: [{ token_id: "orc", name: "Orc", roll: d20(15, 1), result: "saved", damage: 1, defense: "resistant" }],
+            } },
+          },
+        ]}
+      />,
+    );
+    const [attack, burst] = screen.getAllByRole("article");
+    expect(within(attack).getByText("Sword · slashing")).toBeInTheDocument();
+    expect(within(attack).getByText("Damage · 1d8+3")).toBeInTheDocument();
+    expect(within(attack).getByText("Hit")).toBeInTheDocument();
+    expect(within(attack).getByText("-7")).toBeInTheDocument();
+    expect(within(attack).getByText("Down")).toBeInTheDocument();
+    expect(within(burst).getByText("Burst · Dexterity save DC 13 · fire")).toBeInTheDocument();
+    expect(within(burst).getByText("Saved")).toBeInTheDocument();
+    expect(within(burst).getByText("-1")).toBeInTheDocument();
+    expect(within(burst).getByText("resistant")).toBeInTheDocument();
+    expect(within(burst).getByText("0 uses left")).toBeInTheDocument();
+  });
+
+  it("says so when an area action catches no creatures", () => {
+    render(
+      <ChatPanel
+        isDM={false}
+        members={[]}
+        onSend={vi.fn()}
+        messages={[{
+          id: "m7", room_id: "r", sender_user_id: "u", kind: "roll", body: "Cleric uses Mass heal", created_at: "now",
+          roll: { action: { name: "Mass heal", kind: "heal", source: "action", source_token_id: "c", effect: { expression: "1d8", dice: [{ count: 1, sides: 8, values: [5] }], modifier: 0, total: 5 }, targets: [] } },
+        }]}
+      />,
+    );
+    expect(screen.getByText("Healing · 1d8")).toBeInTheDocument();
+    expect(screen.getByText("No creatures in the area")).toBeInTheDocument();
+  });
+
   it("marks prompted check rolls as success or failure against their DC", () => {
     const check = (success: boolean, total: number) => ({
       expression: "1d20+5",

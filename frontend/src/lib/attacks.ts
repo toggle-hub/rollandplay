@@ -32,5 +32,5 @@ export function formatModifier(n: number): string {
 
 export function attackSummary(a: ResolvedTokenAttack): string {
   const toHit = a.to_hit === 0 ? "+0" : formatModifier(a.to_hit);
-  return `${toHit} to hit · ${a.damage}${formatModifier(a.damage_modifier)} · ${a.range_m} m`;
+  return `${toHit} to hit · ${a.damage}${formatModifier(a.damage_modifier)}${a.damage_type ? ` ${a.damage_type}` : ""} · ${a.range_m} m`;
 }

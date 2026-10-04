@@ -26,7 +26,8 @@ type Monster struct {
 }
 
 // ParseMonsters validates and normalizes a rule book's monsters list. Stats are free-form
-// like character data, but stats.attacks must be valid attacks so placed monsters can fight.
+// like character data, but stats.attacks, stats.actions and stats.items must be valid so placed
+// monsters can fight.
 func ParseMonsters(raw []byte) ([]Monster, error) {
 	trimmed := bytes.TrimSpace(raw)
 	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
@@ -69,6 +70,18 @@ func ParseMonsters(raw []byte) ([]Monster, error) {
 		if attacks, ok := m.Stats["attacks"]; ok {
 			b, _ := json.Marshal(attacks)
 			if _, err := ParseAttacks(b); err != nil {
+				return nil, fmt.Errorf("monster %q: %w", m.Name, err)
+			}
+		}
+		if actions, ok := m.Stats["actions"]; ok {
+			b, _ := json.Marshal(actions)
+			if _, err := ParseActions(b); err != nil {
+				return nil, fmt.Errorf("monster %q: %w", m.Name, err)
+			}
+		}
+		if items, ok := m.Stats["items"]; ok {
+			b, _ := json.Marshal(items)
+			if _, err := ParseItems(b); err != nil {
 				return nil, fmt.Errorf("monster %q: %w", m.Name, err)
 			}
 		}

@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"io"
+	"maps"
 	"mime/multipart"
 	"net/http"
 	"net/http/cookiejar"
@@ -990,7 +991,7 @@ func TestRoomWebsocketMovementAndChat(t *testing.T) {
 	_ = du
 }
 
-func TestRoomTokenAttacks(t *testing.T) {
+func TestRoomTokenActions(t *testing.T) {
 	a := newTestApp(t)
 	dm, _ := login(t, a, "attack-dm@example.com")
 	player, _ := login(t, a, "attack-player@example.com")
@@ -1006,48 +1007,92 @@ func TestRoomTokenAttacks(t *testing.T) {
 	goblin := post[map[string]any](t, dm, a.server.URL, roomPath+"/tokens", map[string]any{"name": "Goblin", "x_m": 2, "y_m": 1})
 	orc := post[map[string]any](t, dm, a.server.URL, roomPath+"/tokens", map[string]any{"name": "Orc", "x_m": 4, "y_m": 1})
 	troll := post[map[string]any](t, dm, a.server.URL, roomPath+"/tokens", map[string]any{"name": "Troll", "x_m": 6, "y_m": 1})
-	heroAttacks := roomPath + "/tokens/" + hero["id"].(string) + "/attacks"
-	goblinAttacks := roomPath + "/tokens/" + goblin["id"].(string) + "/attacks"
+	heroID, goblinID, orcID := hero["id"].(string), goblin["id"].(string), orc["id"].(string)
+	heroActions := roomPath + "/tokens/" + heroID + "/actions"
+	goblinActions := roomPath + "/tokens/" + goblinID + "/actions"
 
-	heroList := []map[string]any{
-		{"id": "sword", "name": "Sword", "range_m": 1.5, "ability": "strength", "proficient": true, "attack_bonus": 0, "damage": "1d8", "damage_bonus": 0},
-		{"id": "bow", "name": "Bow", "range_m": 20, "ability": "dexterity", "proficient": true, "attack_bonus": 0, "damage": "1d6", "damage_bonus": 0},
+	heroLists := map[string]any{
+		"attacks": []map[string]any{
+			{"id": "sword", "name": "Sword", "range_m": 1.5, "ability": "strength", "proficient": true, "attack_bonus": 0, "damage": "1d8", "damage_bonus": 0, "damage_type": "slashing"},
+			{"id": "bow", "name": "Bow", "range_m": 20, "ability": "dexterity", "proficient": true, "attack_bonus": 0, "damage": "1d6", "damage_bonus": 0},
+		},
+		"actions": []map[string]any{
+			{"id": "cure", "name": "Cure", "kind": "heal", "range_m": 1.5, "dice": "1d8", "ability": "dexterity", "ability_to_dice": true},
+			{"id": "burst", "name": "Burst", "kind": "save", "range_m": 20, "area_radius_m": 2, "save_ability": "dexterity", "half_on_save": true, "dice": "2d6", "damage_type": "fire", "uses": map[string]any{"max": 1, "remaining": 1}},
+		},
+		"items": []map[string]any{{"id": "potion", "name": "Potion", "kind": "heal", "range_m": 1.5, "dice": "2d4", "dice_bonus": 2, "quantity": 1}},
 	}
-	saved := patch[map[string]any](t, player, a.server.URL, heroAttacks, map[string]any{"attacks": heroList})
+	saved := patch[map[string]any](t, player, a.server.URL, heroActions, heroLists)
 	sword := saved["attacks"].([]any)[0].(map[string]any)
-	if sword["to_hit"] != float64(5) || sword["damage_modifier"] != float64(3) {
-		t.Fatalf("hero sword should resolve to +5 / +3: %+v", sword)
+	burst := saved["actions"].([]any)[1].(map[string]any)
+	cure := saved["actions"].([]any)[0].(map[string]any)
+	potion := saved["items"].([]any)[0].(map[string]any)
+	if sword["to_hit"] != float64(5) || sword["damage_modifier"] != float64(3) || burst["save_dc"] != float64(8) || cure["dice_modifier"] != float64(1) || potion["quantity"] != float64(1) {
+		t.Fatalf("hero lists should resolve: %+v", saved)
 	}
-	if status := statusOf(t, player, "PATCH", a.server.URL+goblinAttacks, map[string]any{"attacks": []any{}}); status != 403 {
-		t.Fatalf("player edited NPC attacks: %d", status)
+	empty := map[string]any{"attacks": []any{}, "actions": []any{}, "items": []any{}}
+	if status := statusOf(t, player, "PATCH", a.server.URL+goblinActions, empty); status != 403 {
+		t.Fatalf("player edited NPC actions: %d", status)
 	}
-	if status := statusOf(t, dm, "PATCH", a.server.URL+heroAttacks, map[string]any{"attacks": []any{}}); status != 403 {
-		t.Fatalf("DM edited a player's sheet attacks: %d", status)
+	if status := statusOf(t, dm, "PATCH", a.server.URL+heroActions, empty); status != 403 {
+		t.Fatalf("DM edited a player's sheet actions: %d", status)
 	}
-	banana := []map[string]any{{"id": "x", "name": "Fruit", "range_m": 1, "damage": "banana"}}
-	if status := statusOf(t, player, "PATCH", a.server.URL+heroAttacks, map[string]any{"attacks": banana}); status != 400 {
+	banana := map[string]any{"attacks": []map[string]any{{"id": "x", "name": "Fruit", "range_m": 1, "damage": "banana"}}, "actions": []any{}, "items": []any{}}
+	if status := statusOf(t, player, "PATCH", a.server.URL+heroActions, banana); status != 400 {
 		t.Fatalf("invalid damage accepted: %d", status)
 	}
-	scimitar := []map[string]any{{"id": "scimitar", "name": "Scimitar", "range_m": 1.5, "ability": "", "proficient": false, "attack_bonus": 4, "damage": "1d6", "damage_bonus": 2}}
-	patch[map[string]any](t, dm, a.server.URL, goblinAttacks, map[string]any{"attacks": scimitar})
+	if status := statusOf(t, player, "PATCH", a.server.URL+heroActions, map[string]any{"attacks": []any{}}); status != 400 {
+		t.Fatalf("missing actions and items accepted: %d", status)
+	}
+	patch[map[string]any](t, dm, a.server.URL, goblinActions, map[string]any{"attacks": []map[string]any{{"id": "scimitar", "name": "Scimitar", "range_m": 1.5, "ability": "", "proficient": false, "attack_bonus": 4, "damage": "1d6", "damage_bonus": 2}}, "actions": []any{}, "items": []any{}})
+
+	// Defenses and health are game master fields.
+	tokenPath := func(id string) string { return a.server.URL + roomPath + "/tokens/" + id }
+	if status := statusOf(t, player, "PATCH", tokenPath(goblinID), map[string]any{"armor_class": 5}); status != 403 {
+		t.Fatalf("player set armor class: %d", status)
+	}
+	for _, bad := range []map[string]any{{"armor_class": 101}, {"resistances": []string{"banana"}}} {
+		if status := statusOf(t, dm, "PATCH", tokenPath(goblinID), bad); status != 400 {
+			t.Fatalf("invalid defenses %v accepted: %d", bad, status)
+		}
+	}
+	for id, body := range map[string]map[string]any{
+		goblinID: {"hit_points": 50, "max_hit_points": 50, "armor_class": 1},
+		orcID:    {"hit_points": 30, "max_hit_points": 30, "resistances": []string{"fire", "fire"}},
+		heroID:   {"hit_points": 5, "max_hit_points": 10},
+	} {
+		if status := statusOf(t, dm, "PATCH", tokenPath(id), body); status != 204 {
+			t.Fatalf("DM token patch %v: %d", body, status)
+		}
+	}
 
 	playerState := get[map[string]any](t, player, a.server.URL, roomPath+"/state")
-	if h := entityByID(t, playerState["visibleTokens"], hero["id"].(string)); len(h["attacks"].([]any)) != 2 || h["attacks_editable"] != true {
-		t.Fatalf("player should see and edit hero attacks: %+v", h)
+	h := entityByID(t, playerState["visibleTokens"], heroID)
+	if len(h["attacks"].([]any)) != 2 || len(h["actions"].([]any)) != 2 || len(h["items"].([]any)) != 1 || h["actions_editable"] != true || h["can_act"] != true ||
+		h["death_saves"] == nil || h["defenses"] == nil {
+		t.Fatalf("player should see, edit and act with the hero: %+v", h)
 	}
-	g := entityByID(t, playerState["visibleTokens"], goblin["id"].(string))
-	if _, leaked := g["attacks"]; leaked {
-		t.Fatalf("player received NPC attacks: %+v", g)
+	g := entityByID(t, playerState["visibleTokens"], goblinID)
+	for _, key := range []string{"attacks", "actions", "items", "can_act", "defenses", "hit_points"} {
+		if _, leaked := g[key]; leaked {
+			t.Fatalf("player received NPC %s: %+v", key, g)
+		}
 	}
 	if _, leaked := g["attributes"].(map[string]any)["attacks"]; leaked {
 		t.Fatalf("player received raw NPC attacks: %+v", g)
 	}
-	dmState := get[map[string]any](t, dm, a.server.URL, roomPath+"/state")
-	if g := entityByID(t, dmState["visibleTokens"], goblin["id"].(string)); len(g["attacks"].([]any)) != 1 || g["attacks_editable"] != true {
+	dmToken := func(id string) map[string]any {
+		t.Helper()
+		return entityByID(t, get[map[string]any](t, dm, a.server.URL, roomPath+"/state")["visibleTokens"], id)
+	}
+	if g := dmToken(goblinID); len(g["attacks"].([]any)) != 1 || g["actions_editable"] != true || g["can_act"] != true {
 		t.Fatalf("DM should see and edit goblin attacks: %+v", g)
 	}
-	if h := entityByID(t, dmState["visibleTokens"], hero["id"].(string)); len(h["attacks"].([]any)) != 2 || h["attacks_editable"] != nil {
-		t.Fatalf("DM should see but not edit hero attacks: %+v", h)
+	if h := dmToken(heroID); len(h["attacks"].([]any)) != 2 || h["actions_editable"] != nil || h["attributes"].(map[string]any)["actions"] != nil {
+		t.Fatalf("DM should see but not edit hero actions: %+v", h)
+	}
+	if d := dmToken(orcID)["defenses"].(map[string]any); d["armor_class"] != nil || len(d["resistances"].([]any)) != 1 {
+		t.Fatalf("orc defenses: %+v", d)
 	}
 
 	dmWS := dialWS(t, a, dm, room["id"].(string))
@@ -1056,42 +1101,145 @@ func TestRoomTokenAttacks(t *testing.T) {
 	defer pWS.Close()
 	readType(t, dmWS, "state.snapshot")
 	readType(t, pWS, "state.snapshot")
-	expectError := func(id, code string, body map[string]any) {
+	expectError := func(typ, id, code string, body map[string]any) {
 		t.Helper()
-		sendWS(t, pWS, "attack.resolve", id, body)
+		sendWS(t, pWS, typ, id, body)
 		ev := readType(t, pWS, "error")
 		if ev["requestId"] != id || ev["body"].(map[string]any)["code"] != code {
 			t.Fatalf("%s: want %s, got %+v", id, code, ev)
 		}
 	}
-	expectError("orc-out-of-range", "out_of_range", map[string]any{"sourceTokenId": hero["id"], "targetTokenId": orc["id"], "attackId": "sword"})
-	expectError("troll-behind-wall", "blocked_target", map[string]any{"sourceTokenId": hero["id"], "targetTokenId": troll["id"], "attackId": "bow"})
-	expectError("goblin-not-yours", "forbidden", map[string]any{"sourceTokenId": goblin["id"], "targetTokenId": hero["id"], "attackId": "scimitar"})
-	expectError("unknown-attack", "unknown_attack", map[string]any{"sourceTokenId": hero["id"], "targetTokenId": goblin["id"], "attackId": "axe"})
+	act := func(source, id string, extra map[string]any) map[string]any {
+		body := map[string]any{"sourceTokenId": heroID, "source": source, "actionId": id}
+		maps.Copy(body, extra)
+		return body
+	}
+	expectError("action.resolve", "orc-out-of-range", "out_of_range", act("attack", "sword", map[string]any{"targetTokenId": orcID}))
+	expectError("action.resolve", "troll-behind-wall", "blocked_target", act("attack", "bow", map[string]any{"targetTokenId": troll["id"]}))
+	expectError("action.resolve", "goblin-not-yours", "forbidden", map[string]any{"sourceTokenId": goblinID, "source": "attack", "actionId": "scimitar", "targetTokenId": heroID})
+	expectError("action.resolve", "unknown-attack", "unknown_action", act("attack", "axe", map[string]any{"targetTokenId": goblinID}))
+	expectError("action.resolve", "sword-self", "invalid_target", act("attack", "sword", map[string]any{"targetTokenId": heroID}))
+	expectError("action.resolve", "no-target", "invalid_target", act("attack", "sword", nil))
+	expectError("action.resolve", "no-point", "no_point", act("action", "burst", nil))
+	expectError("action.resolve", "bad-source", "bad_json", act("spell", "burst", nil))
+	expectError("death.save", "not-dying", "not_dying", map[string]any{"tokenId": heroID})
+	expectError("check.quick", "bad-check", "invalid_check", map[string]any{"tokenId": heroID, "kind": "attribute", "key": "speed_m"})
 
 	// Every roll is broadcast, so drain it from both sockets to keep them in step.
-	expectRoll := func(body, attackExpr, damageExpr string, minTotal, maxTotal, minDamage, maxDamage float64) {
+	roll := func(conn *websocket.Conn, typ, id string, body map[string]any) (string, map[string]any) {
 		t.Helper()
-		for _, conn := range []*websocket.Conn{dmWS, pWS} {
-			ev := readType(t, conn, "roll.result")
-			b := ev["body"].(map[string]any)
-			roll := b["roll"].(map[string]any)
-			damage := roll["damage"].(map[string]any)
-			total, damageTotal := roll["total"].(float64), damage["total"].(float64)
-			if b["body"] != body || roll["expression"] != attackExpr || damage["expression"] != damageExpr || b["created_at"] == nil ||
-				total < minTotal || total > maxTotal || damageTotal < minDamage || damageTotal > maxDamage {
-				t.Fatalf("unexpected attack roll: %s", fmtBody(ev))
+		sendWS(t, conn, typ, id, body)
+		var out map[string]any
+		for _, c := range []*websocket.Conn{dmWS, pWS} {
+			ev := readType(t, c, "roll.result")
+			if ev["requestId"] != id {
+				t.Fatalf("%s: unexpected roll %s", id, fmtBody(ev))
 			}
+			out = ev["body"].(map[string]any)
 		}
+		r := out["roll"].(map[string]any)
+		if action, ok := r["action"].(map[string]any); ok {
+			return out["body"].(string), action
+		}
+		return out["body"].(string), r
 	}
-	sendWS(t, pWS, "attack.resolve", "hero-sword", map[string]any{"sourceTokenId": hero["id"], "targetTokenId": goblin["id"], "attackId": "sword"})
-	expectRoll("Hero attacks Goblin with Sword", "1d20+5", "1d8+3", 6, 25, 4, 11)
-	sendWS(t, dmWS, "attack.resolve", "goblin-scimitar", map[string]any{"sourceTokenId": goblin["id"], "targetTokenId": hero["id"], "attackId": "scimitar"})
-	expectRoll("Goblin attacks Hero with Scimitar", "1d20+4", "1d6+2", 5, 24, 3, 8)
+	hp := func(id string) float64 { t.Helper(); return dmToken(id)["hit_points"].(float64) }
+	num := func(m map[string]any, key string) float64 { v, _ := m[key].(float64); return v }
 
+	body, action := roll(pWS, "check.quick", "stealth", map[string]any{"tokenId": heroID, "kind": "skill", "key": "stealth"})
+	if body != "Hero: Stealth check" || action["expression"] != "1d20+1" {
+		t.Fatalf("quick check: %q %+v", body, action)
+	}
+
+	body, action = roll(pWS, "action.resolve", "hero-sword", act("attack", "sword", map[string]any{"targetTokenId": goblinID}))
+	target := action["targets"].([]any)[0].(map[string]any)
+	if body != "Hero attacks Goblin with Sword" || action["source"] != "attack" || target["roll"].(map[string]any)["expression"] != "1d20+5" {
+		t.Fatalf("sword: %q %+v", body, action)
+	}
+	goblinHP := 50.0
+	switch target["result"] {
+	case "hit", "critical":
+		if action["effect"] == nil || num(target, "damage") != num(action["effect"].(map[string]any), "total") {
+			t.Fatalf("hit should report its damage roll: %+v", action)
+		}
+		goblinHP -= num(target, "damage")
+	case "miss":
+		if target["roll"].(map[string]any)["dice"].([]any)[0].(map[string]any)["values"].([]any)[0] != float64(1) {
+			t.Fatalf("only a natural 1 misses armor class 1: %+v", target)
+		}
+	default:
+		t.Fatalf("unexpected sword result: %+v", target)
+	}
+	if got := hp(goblinID); got != goblinHP {
+		t.Fatalf("goblin HP %v, want %v after %+v", got, goblinHP, target)
+	}
+
+	body, action = roll(pWS, "action.resolve", "burst", act("action", "burst", map[string]any{"point": map[string]float64{"x": 3, "y": 1.5}}))
+	targets := action["targets"].([]any)
+	if body != "Hero uses Burst" || len(targets) != 2 || action["dc"] != float64(8) || action["uses_left"] != float64(0) || action["effect"] == nil {
+		t.Fatalf("burst should catch the goblin and the orc: %q %+v", body, action)
+	}
+	first, second := targets[0].(map[string]any), targets[1].(map[string]any)
+	if first["name"] != "Goblin" || second["name"] != "Orc" || second["defense"] != "resistant" || first["defense"] != nil {
+		t.Fatalf("burst targets: %+v", targets)
+	}
+	if got := hp(goblinID); got != goblinHP-num(first, "damage") {
+		t.Fatalf("goblin HP %v after burst %+v", got, first)
+	}
+	if got := hp(orcID); got != 30-num(second, "damage") {
+		t.Fatalf("orc HP %v after burst %+v", got, second)
+	}
+	expectError("action.resolve", "burst-again", "no_uses", act("action", "burst", map[string]any{"point": map[string]float64{"x": 3, "y": 1.5}}))
+
+	_, action = roll(pWS, "action.resolve", "potion", act("item", "potion", map[string]any{"targetTokenId": heroID}))
+	target = action["targets"].([]any)[0].(map[string]any)
+	if target["result"] != "healed" || action["quantity_left"] != float64(0) || hp(heroID) != 5+num(target, "healing") || num(target, "healing") < 4 {
+		t.Fatalf("potion should heal the hero: %+v", action)
+	}
+	expectError("action.resolve", "potion-gone", "unknown_action", act("item", "potion", map[string]any{"targetTokenId": heroID}))
+	_, action = roll(pWS, "action.resolve", "cure-self", act("action", "cure", map[string]any{"targetTokenId": heroID}))
+	if action["targets"].([]any)[0].(map[string]any)["result"] != "healed" || action["uses_left"] != nil {
+		t.Fatalf("a heal may target its caster: %+v", action)
+	}
+
+	body, action = roll(dmWS, "action.resolve", "goblin-scimitar", map[string]any{"sourceTokenId": goblinID, "source": "attack", "actionId": "scimitar", "targetTokenId": heroID})
+	if body != "Goblin attacks Hero with Scimitar" || action["targets"].([]any)[0].(map[string]any)["roll"].(map[string]any)["expression"] != "1d20+4" {
+		t.Fatalf("goblin scimitar: %q %+v", body, action)
+	}
 	patch[map[string]any](t, dm, a.server.URL, "/api/maps/"+gm["id"].(string)+"/structures/"+wall["id"].(string), map[string]any{"pass_rules": map[string]bool{"attacks": true}})
-	sendWS(t, pWS, "attack.resolve", "troll-through-wall", map[string]any{"sourceTokenId": hero["id"], "targetTokenId": troll["id"], "attackId": "bow"})
-	expectRoll("Hero attacks Troll with Bow", "1d20+3", "1d6+1", 4, 23, 2, 7)
+	body, _ = roll(pWS, "action.resolve", "troll-through-wall", act("attack", "bow", map[string]any{"targetTokenId": troll["id"]}))
+	if body != "Hero attacks Troll with Bow" {
+		t.Fatalf("bow through an open wall: %q", body)
+	}
+
+	// A dying hero cannot act, but makes death saves.
+	if status := statusOf(t, dm, "PATCH", tokenPath(heroID), map[string]any{"hit_points": 0, "max_hit_points": 10}); status != 204 {
+		t.Fatalf("down the hero: %d", status)
+	}
+	expectError("action.resolve", "down-sword", "source_down", act("attack", "sword", map[string]any{"targetTokenId": goblinID}))
+	body, action = roll(pWS, "death.save", "death-save", map[string]any{"tokenId": heroID})
+	target = action["targets"].([]any)[0].(map[string]any)
+	saves := dmToken(heroID)["death_saves"].(map[string]any)
+	nat := target["roll"].(map[string]any)["total"].(float64)
+	switch target["result"] {
+	case "success":
+		if nat < 10 || saves["successes"] != float64(1) {
+			t.Fatalf("success: %+v %+v", target, saves)
+		}
+	case "failure":
+		if want := map[bool]float64{true: 2, false: 1}[nat == 1]; nat >= 10 || saves["failures"] != want {
+			t.Fatalf("failure: %+v %+v", target, saves)
+		}
+	case "revived":
+		if nat != 20 || hp(heroID) != 1 {
+			t.Fatalf("revived: %+v", target)
+		}
+	default:
+		t.Fatalf("unexpected death save: %+v", target)
+	}
+	if body != "Hero makes a death saving throw" || action["kind"] != "death_save" {
+		t.Fatalf("death save: %q %+v", body, action)
+	}
 }
 
 func TestRoomStructurePlacementAndRemovalStayInRoom(t *testing.T) {
@@ -1462,7 +1610,7 @@ func TestRuleBookMonsters(t *testing.T) {
 	dmState := get[map[string]any](t, dm, a.server.URL, roomPath+"/state")
 	placed := entityByID(t, dmState["visibleTokens"], first["id"].(string))
 	attacks := placed["attacks"].([]any)
-	if placed["attributes"].(map[string]any)["hit_points"] != float64(7) || len(attacks) != 2 || attacks[0].(map[string]any)["to_hit"] != float64(4) || placed["attacks_editable"] != true {
+	if placed["attributes"].(map[string]any)["hit_points"] != float64(7) || len(attacks) != 2 || attacks[0].(map[string]any)["to_hit"] != float64(4) || placed["actions_editable"] != true {
 		t.Fatalf("DM should see the goblin's stats and resolved attacks: %+v", placed)
 	}
 	playerState := get[map[string]any](t, player, a.server.URL, roomPath+"/state")
@@ -1488,11 +1636,13 @@ func TestRuleBookMonsters(t *testing.T) {
 	dmWS := dialWS(t, a, dm, room["id"].(string))
 	defer dmWS.Close()
 	readType(t, dmWS, "state.snapshot")
-	sendWS(t, dmWS, "attack.resolve", "goblin-scimitar", map[string]any{"sourceTokenId": first["id"], "targetTokenId": heroToken["id"], "attackId": "scimitar"})
+	sendWS(t, dmWS, "action.resolve", "goblin-scimitar", map[string]any{"sourceTokenId": first["id"], "source": "attack", "actionId": "scimitar", "targetTokenId": heroToken["id"]})
 	ev := readType(t, dmWS, "roll.result")
 	body := ev["body"].(map[string]any)
-	roll := body["roll"].(map[string]any)
-	if body["body"] != "Goblin attacks Hero with Scimitar" || roll["expression"] != "1d20+4" || roll["damage"].(map[string]any)["expression"] != "1d6+2" {
+	target := body["roll"].(map[string]any)["action"].(map[string]any)["targets"].([]any)[0].(map[string]any)
+	effect, _ := body["roll"].(map[string]any)["action"].(map[string]any)["effect"].(map[string]any)
+	if body["body"] != "Goblin attacks Hero with Scimitar" || target["roll"].(map[string]any)["expression"] != "1d20+4" ||
+		effect != nil && effect["expression"] != "1d6+2" && effect["expression"] != "2d6+2" {
 		t.Fatalf("placed goblin should attack with its SRD scimitar: %s", fmtBody(ev))
 	}
 }

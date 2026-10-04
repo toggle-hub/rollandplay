@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"slices"
 	"strings"
 	"unicode/utf8"
 )
@@ -22,6 +23,7 @@ type Attack struct {
 	AttackBonus int     `json:"attack_bonus"`
 	Damage      string  `json:"damage"` // dice expression, e.g. "1d8"
 	DamageBonus int     `json:"damage_bonus"`
+	DamageType  string  `json:"damage_type"` // "" or one of DamageTypes
 }
 
 // ResolvedAttack is an attack with the character's stats folded into its modifiers.
@@ -29,12 +31,6 @@ type ResolvedAttack struct {
 	Attack
 	ToHit          int `json:"to_hit"`
 	DamageModifier int `json:"damage_modifier"`
-}
-
-// AttackRoll is the attack roll plus its damage roll, stored as one chat roll.
-type AttackRoll struct {
-	RollResult
-	Damage RollResult `json:"damage"`
 }
 
 func ParseAttacks(raw []byte) ([]Attack, error) {
@@ -60,6 +56,7 @@ func ParseAttacks(raw []byte) ([]Attack, error) {
 		a.Name = strings.TrimSpace(a.Name)
 		a.Ability = strings.TrimSpace(a.Ability)
 		a.Damage = strings.ReplaceAll(strings.TrimSpace(a.Damage), " ", "")
+		a.DamageType = strings.TrimSpace(a.DamageType)
 		if _, dup := seen[a.ID]; a.ID == "" || len(a.ID) > 64 || dup {
 			return nil, fmt.Errorf("attack %d needs a unique id", i+1)
 		}
@@ -79,6 +76,9 @@ func ParseAttacks(raw []byte) ([]Attack, error) {
 		if ValidateExpression(a.Damage) != nil {
 			return nil, fmt.Errorf("attack %q damage must be a dice expression such as 1d8+2", a.Name)
 		}
+		if a.DamageType != "" && !slices.Contains(DamageTypes, a.DamageType) {
+			return nil, fmt.Errorf("attack %q damage type must be one of %s", a.Name, strings.Join(DamageTypes, ", "))
+		}
 	}
 	return attacks, nil
 }
@@ -87,18 +87,8 @@ func ParseAttacks(raw []byte) ([]Attack, error) {
 func AbilityModifier(score float64) int { return int(math.Floor((score - 10) / 2)) }
 
 func ResolveAttack(a Attack, stats map[string]any) ResolvedAttack {
-	mod, prof := 0, 0
-	if a.Ability != "" {
-		if score, ok := stats[a.Ability].(float64); ok {
-			mod = AbilityModifier(score)
-		}
-	}
-	if a.Proficient {
-		if bonus, ok := stats["proficiency_bonus"].(float64); ok {
-			prof = int(math.Round(bonus))
-		}
-	}
-	return ResolvedAttack{Attack: a, ToHit: mod + prof + a.AttackBonus, DamageModifier: mod + a.DamageBonus}
+	r := ResolveAction(a.AsAction(), stats)
+	return ResolvedAttack{Attack: a, ToHit: r.ToHit, DamageModifier: r.DiceModifier}
 }
 
 func ResolveAttacks(attacks []Attack, stats map[string]any) []ResolvedAttack {
@@ -133,8 +123,9 @@ func (t Token) AttackList() ([]Attack, error) {
 	return ParseAttacks(raw)
 }
 
-// CanEditAttacks: sheet-backed tokens belong to the sheet owner; sheetless tokens to the DM.
-func (t Token) CanEditAttacks(userID string, isDM bool) bool {
+// CanEditActions covers attacks, actions and items: sheet-backed tokens belong to the sheet
+// owner; sheetless tokens to the DM.
+func (t Token) CanEditActions(userID string, isDM bool) bool {
 	if t.SheetID != "" {
 		return t.SheetOwnerUserID == userID
 	}

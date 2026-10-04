@@ -1,7 +1,7 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MapCanvas } from "./MapCanvas";
-import type { VisibleRoomState } from "../api/types";
+import type { ResolvedTokenAction, RoomToken, VisibleRoomState } from "../api/types";
 
 const state: VisibleRoomState = {
   room: {
@@ -45,19 +45,32 @@ function dragStructure(canvas: HTMLCanvasElement, from: [number, number], to: [n
 }
 
 const tokenBase = { size_m: 1, rotation_deg: 0, vision_range_m: 10, is_hidden: false, attributes: {} };
-const attackBase = { ability: "strength", proficient: true, attack_bonus: 0, damage_bonus: 0, to_hit: 5, damage_modifier: 3 };
-const hero = {
-  ...tokenBase, id: "hero", owner_user_id: "player", name: "Hero", x_m: 1, y_m: 1,
+const attackBase = { ability: "strength", proficient: true, attack_bonus: 0, damage_bonus: 0, damage_type: "", to_hit: 5, damage_modifier: 3 };
+const actionBase: Omit<ResolvedTokenAction, "id" | "name" | "kind" | "range_m" | "dice"> = {
+  area_radius_m: 0, ability: "wisdom", proficient: false, bonus: 0, save_ability: "", half_on_save: false,
+  dice_bonus: 0, ability_to_dice: true, damage_type: "", to_hit: 0, save_dc: 0, dice_modifier: 3,
+};
+const hero: RoomToken = {
+  ...tokenBase, id: "hero", owner_user_id: "player", name: "Hero", x_m: 1, y_m: 1, can_act: true,
   attacks: [
     { ...attackBase, id: "sword", name: "Sword", range_m: 1.5, damage: "1d8" },
     { ...attackBase, id: "bow", name: "Bow", range_m: 20, ability: "dexterity", damage: "1d6" },
   ],
+  actions: [
+    { ...actionBase, id: "cure", name: "Cure wounds", kind: "heal", range_m: 1.5, dice: "1d8" },
+    {
+      ...actionBase, id: "burst", name: "Fire burst", kind: "save", range_m: 20, area_radius_m: 1, save_ability: "dexterity",
+      half_on_save: true, dice: "2d6", damage_type: "fire", save_dc: 13, dice_modifier: 0, uses: { max: 2, remaining: 1 },
+    },
+    { ...actionBase, id: "smite", name: "Smite", kind: "attack", range_m: 1.5, dice: "2d8", uses: { max: 1, remaining: 0 } },
+  ],
+  items: [{ ...actionBase, id: "potion", name: "Potion of healing", kind: "heal", range_m: 1.5, dice: "2d4", ability: "", ability_to_dice: false, dice_bonus: 2, dice_modifier: 2, quantity: 3 }],
 };
-const goblin = {
+const goblin: RoomToken = {
   ...tokenBase, id: "goblin", owner_user_id: "dm", name: "Goblin", x_m: 2.5, y_m: 1,
   attacks: [{ ...attackBase, id: "scimitar", name: "Scimitar", range_m: 1.5, damage: "1d6" }],
 };
-const troll = { ...tokenBase, id: "troll", owner_user_id: "dm", name: "Troll", x_m: 4, y_m: 1 };
+const troll: RoomToken = { ...tokenBase, id: "troll", owner_user_id: "dm", name: "Troll", x_m: 4, y_m: 1 };
 const attackWall = { ...wall, id: "attack-wall", geometry: [{ x: 3, y: 0 }, { x: 3, y: 3 }] };
 
 function clickAt(canvas: HTMLCanvasElement, x: number, y: number) {
@@ -65,16 +78,29 @@ function clickAt(canvas: HTMLCanvasElement, x: number, y: number) {
   fireEvent.pointerUp(canvas, { clientX: x * 72, clientY: y * 72, button: 0 });
 }
 
-function renderAttackMap(onAttack = vi.fn(), onMoveToken = vi.fn()) {
+function rightClickAt(canvas: HTMLCanvasElement, x: number, y: number) {
+  fireEvent.pointerDown(canvas, { clientX: x * 72, clientY: y * 72, button: 2, buttons: 2 });
+  fireEvent.pointerUp(canvas, { clientX: x * 72, clientY: y * 72, button: 2 });
+}
+
+function renderActionMap({ onAction = vi.fn(), onMoveToken = vi.fn(), onSelect = vi.fn(), source = hero } = {}) {
   const { container } = render(
     <MapCanvas
-      state={{ ...state, structures: [attackWall], visibleTokens: [hero, goblin, troll], ownTokens: [hero] }}
+      state={{ ...state, structures: [attackWall], visibleTokens: [source, goblin, troll], ownTokens: [source] }}
       movableTokenIds={new Set(["hero"])}
       onMoveToken={onMoveToken}
-      onAttack={onAttack}
+      onSelect={onSelect}
+      onAction={onAction}
     />,
   );
   return container.querySelector("canvas")!;
+}
+
+/** Right-clicks the hero, opens a wheel category and picks one of its entries. */
+function choose(canvas: HTMLCanvasElement, category: string, entry: string | RegExp) {
+  rightClickAt(canvas, 1, 1);
+  fireEvent.click(screen.getByRole("menuitem", { name: category }));
+  fireEvent.click(screen.getByRole("menuitem", { name: entry }));
 }
 
 describe("MapCanvas", () => {
@@ -543,99 +569,276 @@ describe("MapCanvas", () => {
     expect(moveStructure).not.toHaveBeenCalled();
   });
 
-  it("opens the attack menu on a click without drag and attacks a target in range", () => {
-    const attack = vi.fn();
-    const move = vi.fn();
-    const canvas = renderAttackMap(attack, move);
+  it("opens the action wheel on a right click without drag on a token the viewer can act with", () => {
+    const select = vi.fn();
+    const measure = vi.fn();
+    const { container } = render(
+      <MapCanvas
+        state={{ ...state, structures: [attackWall], visibleTokens: [hero, goblin, troll], ownTokens: [hero] }}
+        onAction={vi.fn()}
+        onSelect={select}
+        onMeasure={measure}
+      />,
+    );
+    const canvas = container.querySelector("canvas")!;
 
-    clickAt(canvas, 1, 1);
-    expect(move).not.toHaveBeenCalled();
-    const menu = screen.getByRole("menu", { name: "Hero attacks" });
-    expect(menu).toHaveTextContent("+5 to hit · 1d8+3 · 1.5 m");
-    fireEvent.click(screen.getByRole("menuitem", { name: /Sword/ }));
+    rightClickAt(canvas, 6, 6);
+    rightClickAt(canvas, 2.5, 1);
+    expect(screen.queryByRole("menu")).not.toBeInTheDocument();
+    expect(select).not.toHaveBeenCalled();
+
+    fireEvent.pointerDown(canvas, { clientX: 72, clientY: 72, button: 2, buttons: 2 });
+    fireEvent.pointerMove(canvas, { clientX: 216, clientY: 72, buttons: 2 });
+    fireEvent.pointerUp(canvas, { clientX: 216, clientY: 72, button: 2 });
+    expect(measure).toHaveBeenCalledWith({ x: 1, y: 1 }, { x: 3, y: 1 });
+    expect(screen.queryByRole("menu")).not.toBeInTheDocument();
+
+    rightClickAt(canvas, 1, 1);
+    const wheel = screen.getByRole("menu", { name: "Hero actions" });
+    expect(select).toHaveBeenCalledExactlyOnceWith({ kind: "tokens", ids: ["hero"] });
+    expect(screen.getByRole("menuitem", { name: "Attacks" })).toHaveFocus();
+    expect(wheel).not.toHaveTextContent("Death save");
+    expect(screen.queryByRole("menuitem", { name: "Edit actions" })).not.toBeInTheDocument();
+  });
+
+  it("moves through the wheel with the keyboard and closes the entry list before the wheel on Escape", () => {
+    const canvas = renderActionMap();
+    rightClickAt(canvas, 1, 1);
+    fireEvent.keyDown(screen.getByRole("menuitem", { name: "Attacks" }), { key: "ArrowRight" });
+    expect(screen.getByRole("menuitem", { name: "Spells & abilities" })).toHaveFocus();
+    fireEvent.keyDown(screen.getByRole("menuitem", { name: "Spells & abilities" }), { key: "ArrowUp" });
+    expect(screen.getByRole("menuitem", { name: "Attacks" })).toHaveFocus();
+
+    fireEvent.click(screen.getByRole("menuitem", { name: "Attacks" }));
+    const list = screen.getByRole("menu", { name: "Hero Attacks" });
+    expect(list).toHaveTextContent("+5 to hit · 1d8+3 · 1.5 m");
+    expect(screen.getByRole("menuitem", { name: /Sword/ })).toHaveFocus();
+    fireEvent.keyDown(screen.getByRole("menuitem", { name: /Sword/ }), { key: "Escape" });
+    expect(screen.queryByRole("menu", { name: "Hero Attacks" })).not.toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: "Attacks" })).toHaveFocus();
+    fireEvent.keyDown(screen.getByRole("menuitem", { name: "Attacks" }), { key: "Escape" });
+    expect(screen.queryByRole("menu")).not.toBeInTheDocument();
+    expect(canvas).toHaveFocus();
+  });
+
+  it("attacks a target in range only after Roll on the confirm card", () => {
+    const action = vi.fn();
+    const move = vi.fn();
+    const canvas = renderActionMap({ onAction: action, onMoveToken: move });
+
+    choose(canvas, "Attacks", /Sword/);
     expect(screen.queryByRole("menu")).not.toBeInTheDocument();
     expect(screen.getByRole("status")).toHaveTextContent("Sword · 1.5 m — click a highlighted target");
 
     clickAt(canvas, 2.5, 1);
-    expect(attack).toHaveBeenCalledWith("hero", "goblin", "sword");
-    expect(move).not.toHaveBeenCalled();
     expect(screen.queryByRole("status")).not.toBeInTheDocument();
+    const dialog = screen.getByRole("dialog", { name: "Confirm Sword" });
+    expect(dialog).toHaveTextContent("Hero → Goblin");
+    expect(dialog).toHaveTextContent("Attack roll 1d20+5 vs armor class");
+    expect(action).not.toHaveBeenCalled();
+    expect(screen.getByRole("button", { name: "Roll" })).toHaveFocus();
+
+    fireEvent.click(screen.getByRole("button", { name: "Roll" }));
+    expect(action).toHaveBeenCalledExactlyOnceWith({
+      type: "action.resolve",
+      body: { sourceTokenId: "hero", source: "attack", actionId: "sword", targetTokenId: "goblin" },
+    });
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(move).not.toHaveBeenCalled();
   });
 
-  it("keeps targeting and explains why a target behind an attack-blocking wall cannot be attacked", () => {
-    const attack = vi.fn();
-    const canvas = renderAttackMap(attack);
+  it("keeps targeting and explains why a target cannot be attacked", () => {
+    const action = vi.fn();
+    const canvas = renderActionMap({ onAction: action });
 
-    clickAt(canvas, 1, 1);
-    fireEvent.click(screen.getByRole("menuitem", { name: /Bow/ }));
+    choose(canvas, "Attacks", /Bow/);
     clickAt(canvas, 4, 1);
-    expect(attack).not.toHaveBeenCalled();
     expect(screen.getByRole("status")).toHaveTextContent("Blocked by a structure");
-
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
     clickAt(canvas, 2.5, 1);
-    expect(attack).toHaveBeenCalledWith("hero", "goblin", "bow");
+    expect(screen.getByRole("dialog", { name: "Confirm Bow" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+
+    choose(canvas, "Attacks", /Sword/);
+    clickAt(canvas, 4, 1);
+    expect(screen.getByRole("status")).toHaveTextContent("Out of range");
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(action).not.toHaveBeenCalled();
   });
 
-  it("reports targets beyond the attack's range without attacking", () => {
-    const attack = vi.fn();
-    const canvas = renderAttackMap(attack);
+  it("aims an area action at a point it can reach and sends that point", () => {
+    const action = vi.fn();
+    const canvas = renderActionMap({ onAction: action });
+    const arc = globalThis.__canvasContext.arc;
+
+    choose(canvas, "Spells & abilities", /Fire burst/);
+    expect(screen.getByRole("status")).toHaveTextContent("Fire burst · 1 m radius — click where it lands");
+    arc.mockClear();
+    fireEvent.pointerMove(canvas, { clientX: 2.5 * 72, clientY: 2 * 72 });
+    expect(arc).toHaveBeenCalledWith(60, 48, 24, 0, Math.PI * 2);
+
+    clickAt(canvas, 4, 2);
+    expect(screen.getByRole("status")).toHaveTextContent("Blocked by a structure");
+    clickAt(canvas, 2.5, 2);
+    const dialog = screen.getByRole("dialog", { name: "Confirm Fire burst" });
+    expect(dialog).toHaveTextContent("Hero → area · 1 creature you can see");
+    expect(dialog).toHaveTextContent("Each creature rolls a Dexterity saving throw vs DC 13");
+    fireEvent.click(screen.getByRole("button", { name: "Roll" }));
+    expect(action).toHaveBeenCalledExactlyOnceWith({
+      type: "action.resolve",
+      body: { sourceTokenId: "hero", source: "action", actionId: "burst", point: { x: 2.5, y: 2 } },
+    });
+  });
+
+  it("offers no action whose uses are spent", () => {
+    const canvas = renderActionMap();
+    rightClickAt(canvas, 1, 1);
+    fireEvent.click(screen.getByRole("menuitem", { name: "Spells & abilities" }));
+    const smite = screen.getByRole("menuitem", { name: /Smite/ });
+    expect(smite).toHaveAttribute("aria-disabled", "true");
+    expect(smite).toHaveTextContent("No uses left");
+    fireEvent.click(smite);
+    expect(screen.queryByRole("status")).not.toBeInTheDocument();
+    expect(screen.getByRole("menu", { name: "Hero Spells & abilities" })).toBeInTheDocument();
+  });
+
+  it("lets a healing action target its own token and goes back to targeting from the confirm card", () => {
+    const action = vi.fn();
+    const canvas = renderActionMap({ onAction: action });
+
+    choose(canvas, "Items", /Potion of healing/);
+    clickAt(canvas, 1, 1);
+    expect(screen.getByRole("dialog", { name: "Confirm Potion of healing" })).toHaveTextContent("Uses one (3 left)");
+    fireEvent.click(screen.getByRole("button", { name: "Back" }));
+    expect(screen.getByRole("status")).toHaveTextContent("Potion of healing · 1.5 m — click a highlighted target");
+    clickAt(canvas, 1, 1);
+    expect(screen.getByRole("dialog", { name: "Confirm Potion of healing" })).toHaveTextContent("Hero → Hero");
+    fireEvent.click(screen.getByRole("button", { name: "Roll" }));
+    expect(action).toHaveBeenCalledExactlyOnceWith({
+      type: "action.resolve",
+      body: { sourceTokenId: "hero", source: "item", actionId: "potion", targetTokenId: "hero" },
+    });
+
+    choose(canvas, "Attacks", /Sword/);
+    clickAt(canvas, 1, 1);
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
+
+  it("rolls a quick check straight from the wheel after confirming", () => {
+    const action = vi.fn();
+    const canvas = renderActionMap({ onAction: action });
+
+    choose(canvas, "Checks", "Stealth check");
+    expect(screen.queryByRole("status")).not.toBeInTheDocument();
+    expect(screen.getByRole("dialog", { name: "Confirm Stealth check" })).toHaveTextContent("Stealth check: 1d20 plus your modifier");
+    expect(screen.queryByRole("button", { name: "Back" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Roll" }));
+    expect(action).toHaveBeenCalledExactlyOnceWith({ type: "check.quick", body: { tokenId: "hero", kind: "skill", key: "stealth" } });
+  });
+
+  it("offers a death save only to a dying character with a sheet, and nothing else while down", () => {
+    const action = vi.fn();
+    const down = { ...hero, hit_points: 0, max_hit_points: 10 };
+    const { container, rerender } = render(<MapCanvas state={{ ...state, visibleTokens: [down] }} onAction={action} />);
+    const canvas = container.querySelector("canvas")!;
+    rightClickAt(canvas, 1, 1);
+    expect(screen.queryByRole("menuitem", { name: "Death save" })).not.toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: "Attacks" })).toHaveAttribute("aria-disabled", "true");
+
+    fireEvent.keyDown(canvas, { key: "Escape" });
+    rerender(<MapCanvas state={{ ...state, visibleTokens: [{ ...down, sheet_id: "sheet" }] }} onAction={action} />);
+    rightClickAt(canvas, 1, 1);
+    for (const name of ["Attacks", "Spells & abilities", "Items", "Checks"]) {
+      expect(screen.getByRole("menuitem", { name })).toHaveAttribute("aria-disabled", "true");
+    }
+    fireEvent.click(screen.getByRole("menuitem", { name: "Checks" }));
+    expect(screen.queryByRole("menu", { name: "Hero Checks" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Death save" }));
+    fireEvent.click(screen.getByRole("button", { name: "Roll" }));
+    expect(action).toHaveBeenCalledExactlyOnceWith({ type: "death.save", body: { tokenId: "hero" } });
+
+    rerender(<MapCanvas state={{ ...state, visibleTokens: [{ ...down, sheet_id: "sheet", death_saves: { successes: 0, failures: 3, stable: false, dead: true } }] }} onAction={action} />);
+    rightClickAt(canvas, 1, 1);
+    expect(screen.getByRole("menu", { name: "Hero actions" })).toHaveTextContent("Dead");
+    expect(screen.queryByRole("menuitem", { name: "Death save" })).not.toBeInTheDocument();
+  });
+
+  it("cancels a pending action with Escape so a later click rolls nothing", () => {
+    const action = vi.fn();
+    const canvas = renderActionMap({ onAction: action });
+
+    choose(canvas, "Attacks", /Sword/);
+    clickAt(canvas, 2.5, 1);
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+    fireEvent.keyDown(canvas, { key: "Escape" });
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+
+    clickAt(canvas, 2.5, 1);
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(screen.queryByRole("status")).not.toBeInTheDocument();
+
+    choose(canvas, "Attacks", /Sword/);
+    clickAt(canvas, 2.5, 1);
+    fireEvent.keyDown(screen.getByRole("button", { name: "Roll" }), { key: "Escape" });
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(action).not.toHaveBeenCalled();
+  });
+
+  it("selects a controlled token on a left click without opening a menu", () => {
+    const select = vi.fn();
+    const move = vi.fn();
+    const canvas = renderActionMap({ onSelect: select, onMoveToken: move });
 
     clickAt(canvas, 1, 1);
-    fireEvent.click(screen.getByRole("menuitem", { name: /Sword/ }));
-    clickAt(canvas, 4, 1);
-    expect(attack).not.toHaveBeenCalled();
-    expect(screen.getByRole("status")).toHaveTextContent("Out of range");
-  });
-
-  it("opens no attack menu for tokens the player does not control", () => {
-    const canvas = renderAttackMap();
-
-    clickAt(canvas, 2.5, 1);
+    expect(select).toHaveBeenCalledExactlyOnceWith({ kind: "tokens", ids: ["hero"] });
+    expect(move).not.toHaveBeenCalled();
     expect(screen.queryByRole("menu")).not.toBeInTheDocument();
   });
 
-  it("cancels targeting with Escape so the next click on a target does not attack", () => {
-    const attack = vi.fn();
-    const canvas = renderAttackMap(attack);
-
-    clickAt(canvas, 1, 1);
-    fireEvent.click(screen.getByRole("menuitem", { name: /Sword/ }));
-    fireEvent.keyDown(canvas, { key: "Escape" });
-    expect(screen.queryByRole("status")).not.toBeInTheDocument();
-
-    clickAt(canvas, 2.5, 1);
-    expect(attack).not.toHaveBeenCalled();
-  });
-
-  it("offers attack editing only for tokens whose attacks the viewer can edit", () => {
+  it("offers action editing only for tokens whose actions the viewer can edit", () => {
     const edit = vi.fn();
     const { container, rerender } = render(
-      <MapCanvas state={{ ...state, visibleTokens: [hero] }} onAttack={vi.fn()} onEditAttacks={edit} />,
+      <MapCanvas state={{ ...state, visibleTokens: [hero] }} onAction={vi.fn()} onEditActions={edit} />,
     );
     const canvas = container.querySelector("canvas")!;
-    clickAt(canvas, 1, 1);
-    expect(screen.queryByRole("button", { name: "Edit attacks" })).not.toBeInTheDocument();
+    rightClickAt(canvas, 1, 1);
+    expect(screen.queryByRole("menuitem", { name: "Edit actions" })).not.toBeInTheDocument();
 
     fireEvent.keyDown(canvas, { key: "Escape" });
-    rerender(<MapCanvas state={{ ...state, visibleTokens: [{ ...hero, attacks_editable: true }] }} onAttack={vi.fn()} onEditAttacks={edit} />);
-    clickAt(canvas, 1, 1);
-    fireEvent.click(screen.getByRole("button", { name: "Edit attacks" }));
+    rerender(<MapCanvas state={{ ...state, visibleTokens: [{ ...hero, actions_editable: true }] }} onAction={vi.fn()} onEditActions={edit} />);
+    rightClickAt(canvas, 1, 1);
+    fireEvent.click(screen.getByRole("menuitem", { name: "Edit actions" }));
     expect(edit).toHaveBeenCalledWith("hero");
     expect(screen.queryByRole("menu")).not.toBeInTheDocument();
+  });
+
+  it("draws floating results above the tokens they belong to", () => {
+    const fillText = globalThis.__canvasContext.fillText;
+    render(
+      <MapCanvas
+        state={{ ...state, visibleTokens: [hero, goblin] }}
+        floatingResults={[
+          { id: "m:goblin", tokenId: "goblin", text: "-7", tone: "damage" },
+          { id: "m:gone", tokenId: "gone", text: "Miss", tone: "miss" },
+        ]}
+      />,
+    );
+    expect(fillText).toHaveBeenCalledWith("-7", 60, 2);
+    expect(fillText).not.toHaveBeenCalledWith("Miss", expect.any(Number), expect.any(Number));
   });
 
   it("places snapped structure templates instead of selecting or moving what is under the pointer", () => {
     const place = vi.fn();
     const select = vi.fn();
     const moveToken = vi.fn();
-    const attack = vi.fn();
+    const action = vi.fn();
     const { container } = render(
       <MapCanvas
         state={{ ...state, structures: [wall], visibleTokens: [hero, goblin], ownTokens: [] }}
         canMoveStructures
         onSelect={select}
         onMoveToken={moveToken}
-        onAttack={attack}
+        onAction={action}
         placingStructure={{ kind: "wall" }}
         onPlaceStructure={place}
       />,
@@ -650,7 +853,7 @@ describe("MapCanvas", () => {
     expect(place).toHaveBeenCalledTimes(2);
     expect(select).not.toHaveBeenCalled();
     expect(moveToken).not.toHaveBeenCalled();
-    expect(attack).not.toHaveBeenCalled();
+    expect(action).not.toHaveBeenCalled();
     expect(screen.queryByRole("menu")).not.toBeInTheDocument();
   });
 

@@ -13,6 +13,7 @@ import (
 	"mime/multipart"
 	"net"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -104,7 +105,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/rooms/{roomID}/tokens", s.handleTokenCreate)
 	mux.HandleFunc("GET /api/rooms/{roomID}/monsters", s.handleRoomMonsters)
 	mux.HandleFunc("PATCH /api/rooms/{roomID}/tokens/{tokenID}", s.handleTokenPatch)
-	mux.HandleFunc("PATCH /api/rooms/{roomID}/tokens/{tokenID}/attacks", s.handleTokenAttacksPatch)
+	mux.HandleFunc("PATCH /api/rooms/{roomID}/tokens/{tokenID}/actions", s.handleTokenActionsPatch)
 	mux.HandleFunc("GET /api/rooms/{roomID}/ws", s.Hub.Handle)
 	return telemetry.HTTPHandler(requestLogger(cors(mux), s.Logger.Named("http")))
 }
@@ -1354,7 +1355,8 @@ func (s *Server) handleRoomMonsters(w http.ResponseWriter, r *http.Request) {
 	WriteJSON(w, 200, monsters)
 }
 
-func (s *Server) handleTokenAttacksPatch(w http.ResponseWriter, r *http.Request) {
+// handleTokenActionsPatch replaces a token's attacks, spells and abilities, and items in one write.
+func (s *Server) handleTokenActionsPatch(w http.ResponseWriter, r *http.Request) {
 	u, _, ok := s.requireUser(w, r)
 	if !ok {
 		return
@@ -1377,35 +1379,47 @@ func (s *Server) handleTokenAttacksPatch(w http.ResponseWriter, r *http.Request)
 		WriteError(w, 500, "db", err.Error())
 		return
 	}
-	if !token.CanEditAttacks(u.ID, s.isDM(r.Context(), u.ID, roomID)) {
-		WriteError(w, 403, "forbidden", "only the character's owner, or the game master for tokens without a sheet, can edit attacks")
+	if !token.CanEditActions(u.ID, s.isDM(r.Context(), u.ID, roomID)) {
+		WriteError(w, 403, "forbidden", "only the character's owner, or the game master for tokens without a sheet, can edit actions")
 		return
 	}
 	var req struct {
 		Attacks json.RawMessage `json:"attacks"`
+		Actions json.RawMessage `json:"actions"`
+		Items   json.RawMessage `json:"items"`
 	}
 	if err := ReadJSON(r, &req); err != nil {
 		WriteError(w, 400, "bad_json", "invalid JSON")
 		return
 	}
-	if req.Attacks == nil {
-		WriteError(w, 400, "invalid_attacks", "attacks is required")
+	if req.Attacks == nil || req.Actions == nil || req.Items == nil {
+		WriteError(w, 400, "invalid_actions", "attacks, actions and items are required")
 		return
 	}
 	attacks, err := game.ParseAttacks(req.Attacks)
 	if err != nil {
-		WriteError(w, 400, "invalid_attacks", err.Error())
+		WriteError(w, 400, "invalid_actions", err.Error())
 		return
 	}
-	encoded, err := json.Marshal(attacks)
+	actions, err := game.ParseActions(req.Actions)
+	if err != nil {
+		WriteError(w, 400, "invalid_actions", err.Error())
+		return
+	}
+	items, err := game.ParseItems(req.Items)
+	if err != nil {
+		WriteError(w, 400, "invalid_actions", err.Error())
+		return
+	}
+	encoded, err := json.Marshal(map[string]any{"attacks": attacks, "actions": actions, "items": items})
 	if err != nil {
 		WriteError(w, 500, "encode", err.Error())
 		return
 	}
 	if token.SheetID != "" {
-		_, err = s.Pool.Exec(r.Context(), `update sheets set data=jsonb_set(data,'{attacks}',$2),updated_at=now() where id=$1`, token.SheetID, json.RawMessage(encoded))
+		_, err = s.Pool.Exec(r.Context(), `update sheets set data=data||$2::jsonb,updated_at=now() where id=$1`, token.SheetID, json.RawMessage(encoded))
 	} else {
-		_, err = s.Pool.Exec(r.Context(), `update room_tokens set attributes=jsonb_set(attributes,'{attacks}',$2),updated_at=now() where id=$1`, tokenID, json.RawMessage(encoded))
+		_, err = s.Pool.Exec(r.Context(), `update room_tokens set attributes=attributes||$2::jsonb,updated_at=now() where id=$1`, tokenID, json.RawMessage(encoded))
 	}
 	if err != nil {
 		WriteError(w, 500, "db", err.Error())
@@ -1413,11 +1427,12 @@ func (s *Server) handleTokenAttacksPatch(w http.ResponseWriter, r *http.Request)
 	}
 	s.bumpRoom(r.Context(), roomID)
 	s.Hub.PublishTokenUpdated(roomID, tokenID)
-	WriteJSON(w, 200, map[string]any{"attacks": game.ResolveAttacks(attacks, token.Stats)})
+	WriteJSON(w, 200, map[string]any{"attacks": game.ResolveAttacks(attacks, token.Stats), "actions": game.ResolveActions(actions, token.Stats), "items": game.ResolveItems(items, token.Stats)})
 }
 
-// handleTokenPatch lets the game master set a token's health, vision radius and extra movers,
-// and the owner or game master set its image. Health of a sheet-backed token is written to the sheet.
+// handleTokenPatch lets the game master set a token's health, defenses, vision radius and extra
+// movers, and the owner or game master set its image. Health and defenses of a sheet-backed token
+// are written to the sheet.
 func (s *Server) handleTokenPatch(w http.ResponseWriter, r *http.Request) {
 	u, _, ok := s.requireUser(w, r)
 	if !ok {
@@ -1442,17 +1457,22 @@ func (s *Server) handleTokenPatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		HitPoints    *int            `json:"hit_points"`
-		MaxHitPoints *int            `json:"max_hit_points"`
-		VisionRangeM *float64        `json:"vision_range_m"`
-		MoverUserIDs *[]string       `json:"mover_user_ids"`
-		ImageAssetID json.RawMessage `json:"image_asset_id"` // absent: keep; null: clear; "uuid": set
+		HitPoints       *int            `json:"hit_points"`
+		MaxHitPoints    *int            `json:"max_hit_points"`
+		ArmorClass      *int            `json:"armor_class"`
+		Resistances     *[]string       `json:"resistances"`
+		Immunities      *[]string       `json:"immunities"`
+		Vulnerabilities *[]string       `json:"vulnerabilities"`
+		VisionRangeM    *float64        `json:"vision_range_m"`
+		MoverUserIDs    *[]string       `json:"mover_user_ids"`
+		ImageAssetID    json.RawMessage `json:"image_asset_id"` // absent: keep; null: clear; "uuid": set
 	}
 	if err := ReadJSON(r, &req); err != nil {
 		WriteError(w, 400, "bad_json", "invalid JSON")
 		return
 	}
-	dmFields := req.HitPoints != nil || req.MaxHitPoints != nil || req.VisionRangeM != nil || req.MoverUserIDs != nil
+	dmFields := req.HitPoints != nil || req.MaxHitPoints != nil || req.ArmorClass != nil || req.Resistances != nil || req.Immunities != nil ||
+		req.Vulnerabilities != nil || req.VisionRangeM != nil || req.MoverUserIDs != nil
 	imageSet := req.ImageAssetID != nil
 	if !dmFields && !imageSet {
 		WriteError(w, 400, "invalid_token", "nothing to update")
@@ -1460,14 +1480,14 @@ func (s *Server) handleTokenPatch(w http.ResponseWriter, r *http.Request) {
 	}
 	isDM := s.isDM(r.Context(), u.ID, roomID)
 	if dmFields && !isDM {
-		WriteError(w, 403, "forbidden", "only the game master can change health, vision range or movers")
+		WriteError(w, 403, "forbidden", "only the game master can change health, defenses, vision range or movers")
 		return
 	}
 	if imageSet && !isDM && token.OwnerUserID != u.ID {
 		WriteError(w, 403, "forbidden", "only the token's owner or the game master can change its image")
 		return
 	}
-	health := map[string]int{}
+	health := map[string]any{}
 	for _, field := range []struct {
 		key   string
 		value *int
@@ -1480,6 +1500,32 @@ func (s *Server) handleTokenPatch(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		health[field.key] = *field.value
+	}
+	if req.ArmorClass != nil {
+		if *req.ArmorClass < 0 || *req.ArmorClass > 100 {
+			WriteError(w, 400, "invalid_token", "armor_class must be a whole number from 0 to 100")
+			return
+		}
+		health["armor_class"] = *req.ArmorClass
+	}
+	for _, field := range []struct {
+		key   string
+		value *[]string
+	}{{"resistances", req.Resistances}, {"immunities", req.Immunities}, {"vulnerabilities", req.Vulnerabilities}} {
+		if field.value == nil {
+			continue
+		}
+		list := []string{}
+		for _, damageType := range *field.value {
+			if !slices.Contains(game.DamageTypes, damageType) {
+				WriteError(w, 400, "invalid_token", field.key+" must list damage types such as fire or slashing")
+				return
+			}
+			if !slices.Contains(list, damageType) {
+				list = append(list, damageType)
+			}
+		}
+		health[field.key] = list
 	}
 	if req.VisionRangeM != nil && (*req.VisionRangeM < 0.5 || *req.VisionRangeM > 1000) {
 		WriteError(w, 400, "invalid_token", "vision_range_m must be from 0.5 to 1000")
@@ -1604,8 +1650,15 @@ func (s *Server) visibleState(ctx context.Context, roomID, userID string) (map[s
 	own := []game.Token{}
 	for _, t := range tokens {
 		t.CanMove = t.MovableBy(userID, isDM)
+		t.CanAct = isDM || t.OwnerUserID == userID
 		if isDM || t.OwnerUserID == userID || (t.SheetOwnerUserID != "" && t.SheetOwnerUserID == userID) {
 			t.HitPoints, t.MaxHitPoints = t.Health()
+			d := game.DefenseState(t.Stats)
+			t.Defenses = &d
+			if t.SheetID != "" {
+				saves := game.DeathSaveState(t.Stats)
+				t.DeathSaves = &saves
+			}
 		}
 		if !isDM {
 			t.MoverUserIDs = nil
@@ -1614,14 +1667,22 @@ func (s *Server) visibleState(ctx context.Context, roomID, userID string) (map[s
 			if attacks, err := t.AttackList(); err == nil {
 				t.Attacks = game.ResolveAttacks(attacks, t.Stats)
 			}
-			t.AttacksEditable = t.CanEditAttacks(userID, isDM)
+			if actions, err := t.ActionList(); err == nil {
+				t.Actions = game.ResolveActions(actions, t.Stats)
+			}
+			if items, err := t.ItemList(); err == nil {
+				t.Items = game.ResolveItems(items, t.Stats)
+			}
+			t.ActionsEditable = t.CanEditActions(userID, isDM)
 		}
 		// Monster stat blocks and other token attributes reach only game masters and the owner;
-		// raw attacks never travel in attributes (resolved attacks are sent separately above).
+		// raw attacks, actions and items never travel in attributes (resolved lists are sent above).
 		if !isDM && t.OwnerUserID != userID {
 			t.Attributes = map[string]any{}
 		}
 		delete(t.Attributes, "attacks")
+		delete(t.Attributes, "actions")
+		delete(t.Attributes, "items")
 		if t.OwnerUserID == userID {
 			own = append(own, t)
 		}

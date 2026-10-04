@@ -40,9 +40,10 @@ describe("attack targeting", () => {
     expect(attackTargetStatus({ x: 1, y: 1 }, { x: 2.5, y: 1 }, 1.5, [wall])).toBe("valid");
   });
 
-  it("summarises attack bonuses, damage and range", () => {
-    const sword = { id: "s", name: "Sword", range_m: 1.5, ability: "strength", proficient: true, attack_bonus: 0, damage: "1d8", damage_bonus: 0 };
+  it("summarises attack bonuses, damage, damage type and range", () => {
+    const sword = { id: "s", name: "Sword", range_m: 1.5, ability: "strength", proficient: true, attack_bonus: 0, damage: "1d8", damage_bonus: 0, damage_type: "" };
     expect(attackSummary({ ...sword, to_hit: 5, damage_modifier: 3 })).toBe("+5 to hit · 1d8+3 · 1.5 m");
     expect(attackSummary({ ...sword, to_hit: 0, damage_modifier: -1 })).toBe("+0 to hit · 1d8-1 · 1.5 m");
+    expect(attackSummary({ ...sword, damage_type: "slashing", to_hit: 5, damage_modifier: 3 })).toBe("+5 to hit · 1d8+3 slashing · 1.5 m");
   });
 });

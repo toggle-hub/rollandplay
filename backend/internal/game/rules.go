@@ -32,12 +32,17 @@ type Token struct {
 	SheetOwnerUserID string           `json:"-"`
 	Stats            map[string]any   `json:"-"` // sheet data when sheet-backed, else token attributes
 	Attacks          []ResolvedAttack `json:"attacks,omitempty"`
-	AttacksEditable  bool             `json:"attacks_editable,omitempty"`
+	Actions          []ResolvedAction `json:"actions,omitempty"`
+	Items            []ResolvedItem   `json:"items,omitempty"`
+	ActionsEditable  bool             `json:"actions_editable,omitempty"` // per viewer: attacks, actions and items
+	CanAct           bool             `json:"can_act,omitempty"`          // per viewer: DM or owner
 	ImageAssetID     string           `json:"image_asset_id,omitempty"`
 	MoverUserIDs     []string         `json:"mover_user_ids,omitempty"` // sent to game masters only
 	CanMove          bool             `json:"can_move,omitempty"`       // per viewer
 	HitPoints        *int             `json:"hit_points,omitempty"`     // per viewer: DM, owner, sheet owner
 	MaxHitPoints     *int             `json:"max_hit_points,omitempty"`
+	DeathSaves       *DeathSaves      `json:"death_saves,omitempty"` // same viewers as health, sheet-backed only
+	Defenses         *Defenses        `json:"defenses,omitempty"`    // same viewers as health
 }
 
 // MovableBy reports whether userID may move the token: its owner, the game master,
@@ -51,13 +56,20 @@ func (t Token) Health() (hp, max *int) {
 	return statInt(t.Stats, "hit_points"), statInt(t.Stats, "max_hit_points")
 }
 
+// statInt reads a whole number from stats: JSON numbers decode as float64, while patches
+// applied in memory during combat hold ints. Anything else is nil.
 func statInt(stats map[string]any, key string) *int {
-	v, ok := stats[key].(float64)
-	if !ok || math.IsNaN(v) || math.IsInf(v, 0) {
-		return nil
+	switch v := stats[key].(type) {
+	case int:
+		return &v
+	case float64:
+		if math.IsNaN(v) || math.IsInf(v, 0) {
+			return nil
+		}
+		n := int(math.Round(v))
+		return &n
 	}
-	n := int(math.Round(v))
-	return &n
+	return nil
 }
 
 func CanMove(path []Point, structures []Structure, token Token) bool {

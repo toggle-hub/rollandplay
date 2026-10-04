@@ -1,0 +1,182 @@
+import type {
+  ActionRoll,
+  ResolvedTokenAction,
+  ResolvedTokenAttack,
+  ResolvedTokenItem,
+  RollResult,
+  RoomToken,
+  TargetOutcome,
+} from "../api/types";
+import { formatModifier } from "./attacks";
+import { humanizeKey } from "./checks";
+import type { Point } from "./geometryTransforms";
+
+/** Same list and order as the server's `game.DamageTypes`. */
+export const damageTypes = [
+  "acid", "bludgeoning", "cold", "fire", "force", "lightning", "necrotic", "piercing", "poison", "psychic", "radiant", "slashing", "thunder",
+];
+
+export type QuickCheck = { kind: "ability" | "save" | "skill"; key: string };
+
+export type WheelChoice =
+  | { kind: "attack"; attack: ResolvedTokenAttack }
+  | { kind: "action"; action: ResolvedTokenAction }
+  | { kind: "item"; item: ResolvedTokenItem }
+  | { kind: "check"; check: QuickCheck }
+  | { kind: "death_save" };
+
+export type ActionRequest =
+  | { type: "action.resolve"; body: { sourceTokenId: string; source: "attack" | "action" | "item"; actionId: string; targetTokenId?: string; point?: Point } }
+  | { type: "check.quick"; body: { tokenId: string; kind: string; key: string } }
+  | { type: "death.save"; body: { tokenId: string } };
+
+export type ChoiceTargeting = { rangeM: number; areaRadiusM: number; allowSelf: boolean; tone: "damage" | "heal" };
+
+export type FloatTone = "damage" | "heal" | "miss" | "info";
+
+export function isActionRoll(roll: RollResult | ActionRoll): roll is ActionRoll {
+  return "action" in roll;
+}
+
+export function checkLabel(check: QuickCheck): string {
+  return `${humanizeKey(check.key)} ${check.kind === "save" ? "saving throw" : "check"}`;
+}
+
+function signed(n: number): string {
+  return n === 0 ? "+0" : formatModifier(n);
+}
+
+function withType(dice: string, modifier: number, damageType: string): string {
+  return `${dice}${formatModifier(modifier)}${damageType ? ` ${damageType}` : ""}`;
+}
+
+export function actionSummary(a: ResolvedTokenAction | ResolvedTokenItem): string {
+  const parts: string[] = [];
+  if (a.kind === "attack") {
+    parts.push(`${signed(a.to_hit)} to hit`, withType(a.dice, a.dice_modifier, a.damage_type));
+  } else if (a.kind === "save") {
+    parts.push(
+      `${humanizeKey(a.save_ability)} save DC ${a.save_dc}`,
+      withType(a.dice, a.dice_modifier, a.damage_type),
+      a.half_on_save ? "half on save" : "no damage on save",
+    );
+  } else {
+    parts.push(`${a.dice}${formatModifier(a.dice_modifier)} healing`);
+  }
+  if (a.area_radius_m > 0) parts.push(`${a.area_radius_m} m radius`);
+  parts.push(`${a.range_m} m`);
+  if ("quantity" in a) parts.push(`×${a.quantity}`);
+  else if (a.uses) parts.push(`${a.uses.remaining}/${a.uses.max} uses`);
+  return parts.join(" · ");
+}
+
+/** The name shown on the confirm card and in the targeting bar. */
+export function choiceTitle(choice: WheelChoice): string {
+  switch (choice.kind) {
+    case "attack": return choice.attack.name;
+    case "action": return choice.action.name;
+    case "item": return choice.item.name;
+    case "check": return checkLabel(choice.check);
+    case "death_save": return "Death save";
+  }
+}
+
+/** Targeted choices need a token or a point; checks and death saves roll straight away. */
+export function choiceTargeting(choice: WheelChoice): ChoiceTargeting | null {
+  switch (choice.kind) {
+    case "attack":
+      return { rangeM: choice.attack.range_m, areaRadiusM: 0, allowSelf: false, tone: "damage" };
+    case "action":
+    case "item": {
+      const a = choice.kind === "action" ? choice.action : choice.item;
+      return { rangeM: a.range_m, areaRadiusM: a.area_radius_m, allowSelf: a.kind === "heal", tone: a.kind === "heal" ? "heal" : "damage" };
+    }
+    default:
+      return null;
+  }
+}
+
+/** The text of the confirm card: what will be rolled and what it costs. */
+export function confirmLines(choice: WheelChoice, target?: RoomToken, areaCount?: number): string[] {
+  if (choice.kind === "check") return [`${checkLabel(choice.check)}: 1d20 plus your modifier`];
+  if (choice.kind === "death_save") return ["1d20: 10 or more succeeds, a 20 brings you back with 1 HP, a 1 counts as two failures"];
+  if (choice.kind === "attack") {
+    const a = choice.attack;
+    return [
+      `Attack roll 1d20${formatModifier(a.to_hit)} vs armor class`,
+      `Damage ${withType(a.damage, a.damage_modifier, a.damage_type)} (dice doubled on a natural 20)`,
+    ];
+  }
+  const a = choice.kind === "action" ? choice.action : choice.item;
+  const lines: string[] = [];
+  if (a.kind === "attack") {
+    lines.push(
+      `Attack roll 1d20${formatModifier(a.to_hit)} vs armor class`,
+      `Damage ${withType(a.dice, a.dice_modifier, a.damage_type)} (dice doubled on a natural 20)`,
+    );
+  } else if (a.kind === "save") {
+    const who = a.area_radius_m > 0 ? "Each creature rolls" : `${target?.name ?? "The target"} rolls`;
+    lines.push(
+      `${who} a ${humanizeKey(a.save_ability)} saving throw vs DC ${a.save_dc}`,
+      `Damage ${withType(a.dice, a.dice_modifier, a.damage_type)}, ${a.half_on_save ? "half on a save" : "no damage on a save"}`,
+    );
+  } else {
+    lines.push(`Healing ${a.dice}${formatModifier(a.dice_modifier)}`);
+  }
+  if (a.area_radius_m > 0 && areaCount === 0) lines.push("No creatures you can see are in the area");
+  if (choice.kind === "item") lines.push(`Uses one (${choice.item.quantity} left)`);
+  else if (choice.action.uses) lines.push(`Uses 1 of ${choice.action.uses.remaining}/${choice.action.uses.max} left`);
+  return lines;
+}
+
+/** Builds the websocket request the confirm card's Roll button sends. */
+export function choiceRequest(sourceTokenId: string, choice: WheelChoice, targetTokenId?: string, point?: Point): ActionRequest {
+  switch (choice.kind) {
+    case "check":
+      return { type: "check.quick", body: { tokenId: sourceTokenId, kind: choice.check.kind, key: choice.check.key } };
+    case "death_save":
+      return { type: "death.save", body: { tokenId: sourceTokenId } };
+    default: {
+      const actionId = choice.kind === "attack" ? choice.attack.id : choice.kind === "action" ? choice.action.id : choice.item.id;
+      const body: Extract<ActionRequest, { type: "action.resolve" }>["body"] = { sourceTokenId, source: choice.kind, actionId };
+      if (targetTokenId) body.targetTokenId = targetTokenId;
+      if (point) body.point = point;
+      return { type: "action.resolve", body };
+    }
+  }
+}
+
+const deathSaveText: Partial<Record<TargetOutcome["result"], { text: string; tone: FloatTone }>> = {
+  success: { text: "Success", tone: "info" },
+  failure: { text: "Failure", tone: "damage" },
+  stable: { text: "Stable", tone: "heal" },
+  dead: { text: "Dead", tone: "damage" },
+  revived: { text: "Back up!", tone: "heal" },
+};
+
+/** The short label floated above a token after an action resolves. */
+export function floatText(t: TargetOutcome): { text: string; tone: FloatTone } {
+  const damage = t.damage ?? 0;
+  let out: { text: string; tone: FloatTone };
+  const deathSave = deathSaveText[t.result];
+  if (t.result === "miss") out = { text: "Miss", tone: "miss" };
+  else if (deathSave) out = deathSave;
+  else if (t.defense === "immune") out = { text: "Immune", tone: "info" };
+  else if (t.result === "critical") out = { text: `Crit -${damage}`, tone: "damage" };
+  else if (damage > 0) out = { text: `-${damage}`, tone: "damage" };
+  else if (t.result === "saved") out = { text: "Saved", tone: "info" };
+  else if (t.result === "healed") out = { text: `+${t.healing ?? 0}`, tone: "heal" };
+  else if (t.result === "no_effect") out = { text: "No effect", tone: "info" };
+  else out = { text: humanizeKey(t.result), tone: "info" };
+  if (t.down) out = { ...out, text: `${out.text} · Down` };
+  if (t.dead && t.result !== "dead") out = { ...out, text: `${out.text} · Dead` };
+  return out;
+}
+
+export function isDown(t: RoomToken): boolean {
+  return t.hit_points === 0 && (t.max_hit_points ?? 0) > 0;
+}
+
+export function canDeathSave(t: RoomToken): boolean {
+  return !!t.sheet_id && isDown(t) && !t.death_saves?.dead && !t.death_saves?.stable;
+}

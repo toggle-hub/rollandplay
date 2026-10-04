@@ -320,8 +320,12 @@ func (c *client) handle(msg clientEnvelope) {
 		c.structureCreate(msg)
 	case "structure.remove":
 		c.structureRemove(msg)
-	case "attack.resolve":
-		c.attackResolve(msg)
+	case "action.resolve":
+		c.actionResolve(msg)
+	case "death.save":
+		c.deathSave(msg)
+	case "check.quick":
+		c.checkQuick(msg)
 	case "check.prompt":
 		c.checkPrompt(msg)
 	case "check.roll":
@@ -822,84 +826,6 @@ func (c *client) structureRemove(msg clientEnvelope) {
 	c.hub.bump(c.roomID)
 	c.hub.publish(c.roomID, envelope{Type: "structure.removed", RequestID: &msg.RequestID, Body: map[string]any{"room_id": c.roomID, "structure_id": req.StructureID}})
 	c.hub.publish(c.roomID, envelope{Type: "vision.update", RequestID: nil, Body: map[string]any{"room_id": c.roomID, "version": time.Now().UnixNano()}})
-}
-
-func (c *client) attackResolve(msg clientEnvelope) {
-	var req struct {
-		SourceTokenID string `json:"sourceTokenId"`
-		TargetTokenID string `json:"targetTokenId"`
-		AttackID      string `json:"attackId"`
-	}
-	if json.Unmarshal(msg.Body, &req) != nil {
-		c.error(msg.RequestID, "bad_json", "invalid body")
-		return
-	}
-	ctx := context.Background()
-	source, err := c.hub.loadToken(ctx, c.roomID, req.SourceTokenID)
-	if err != nil {
-		c.error(msg.RequestID, "not_found", "source token not found")
-		return
-	}
-	if !c.isDM && source.OwnerUserID != c.userID {
-		c.error(msg.RequestID, "forbidden", "token ownership required")
-		return
-	}
-	target, err := c.hub.loadToken(ctx, c.roomID, req.TargetTokenID)
-	if err != nil || !c.isDM && target.IsHidden && target.OwnerUserID != c.userID {
-		c.error(msg.RequestID, "not_found", "target token not found")
-		return
-	}
-	if source.ID == target.ID {
-		c.error(msg.RequestID, "invalid_target", "a token cannot attack itself")
-		return
-	}
-	attacks, err := source.AttackList()
-	if err != nil {
-		c.error(msg.RequestID, "invalid_attacks", "this character's attacks are invalid; edit them and try again")
-		return
-	}
-	var attack *game.Attack
-	for i := range attacks {
-		if attacks[i].ID == req.AttackID {
-			attack = &attacks[i]
-			break
-		}
-	}
-	if attack == nil {
-		c.error(msg.RequestID, "unknown_attack", "attack not found")
-		return
-	}
-	from, to := game.Point{X: source.X, Y: source.Y}, game.Point{X: target.X, Y: target.Y}
-	if !game.InAttackRange(from, to, attack.RangeM) {
-		c.error(msg.RequestID, "out_of_range", "target is out of range")
-		return
-	}
-	structures, _ := c.hub.loadStructures(ctx, c.roomID)
-	if !game.CanTarget(from, to, structures, source) {
-		c.error(msg.RequestID, "blocked_target", "target is blocked")
-		return
-	}
-	resolved := game.ResolveAttack(*attack, source.Stats)
-	atk, err := game.RollExpression(resolved.AttackExpression(), rand.Reader)
-	if err != nil {
-		c.error(msg.RequestID, "bad_roll", err.Error())
-		return
-	}
-	dmg, err := game.RollExpression(resolved.DamageExpression(), rand.Reader)
-	if err != nil {
-		c.error(msg.RequestID, "bad_roll", err.Error())
-		return
-	}
-	body := fmt.Sprintf("%s attacks %s with %s", source.Name, target.Name, attack.Name)
-	roll := game.AttackRoll{RollResult: atk, Damage: dmg}
-	id := uuid.New().String()
-	rollJSON, _ := json.Marshal(roll)
-	_, err = c.hub.pool.Exec(ctx, `insert into chat_messages(id,room_id,sender_user_id,kind,body,roll) values($1,$2,$3,'roll',$4,$5)`, id, c.roomID, c.userID, body, rollJSON)
-	if err != nil {
-		c.error(msg.RequestID, "db", err.Error())
-		return
-	}
-	c.hub.publish(c.roomID, envelope{Type: "roll.result", RequestID: &msg.RequestID, Body: map[string]any{"id": id, "room_id": c.roomID, "sender_user_id": c.userID, "kind": "roll", "body": body, "roll": roll, "recipient_user_ids": []string{}, "created_at": time.Now()}})
 }
 
 func (h *Hub) snapshot(ctx context.Context, roomID, userID string) map[string]any {

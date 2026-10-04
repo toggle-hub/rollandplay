@@ -4,16 +4,17 @@ import { ArrowLeft, Circle, Eye, EyeSlash, MapTrifold, Trash, UsersThree } from 
 import { apiFetch, connectRoomSocket, patchJSON, postJSON, requestId } from "../api/client";
 import type { ChatMessage, GameMap, Monster, RoomMember, ServerEnvelope, Sheet, TokenDragFrame, TokenPatch, VisibleRoomState } from "../api/types";
 import { useSession } from "../auth/SessionContext";
-import { MapCanvas, type MapSelection } from "../components/MapCanvas";
+import { MapCanvas, type FloatingResult, type MapSelection } from "../components/MapCanvas";
 import { ChatPanel } from "../components/ChatPanel";
 import { CheckPromptForm } from "../components/CheckPromptForm";
 import { RoomChecks } from "../components/RoomChecks";
 import { PlayerName } from "../components/PlayerName";
-import { TokenAttacksEditor } from "../components/TokenAttacksEditor";
+import { TokenActionsEditor } from "../components/TokenActionsEditor";
 import { TokenSettingsPanel } from "../components/TokenSettingsPanel";
 import { useToast } from "../components/Toast";
 import { defaultBlocksForKind, structureTypes, type StructureBlocks } from "../lib/structures";
 import { createFrameThrottle } from "../lib/frameThrottle";
+import { floatText, isActionRoll } from "../lib/actions";
 
 type Point = { x: number; y: number };
 
@@ -36,7 +37,9 @@ export function RoomPage() {
   const [monsterChoice, setMonsterChoice] = useState("");
   const [mapSelection, setMapSelection] = useState<MapSelection | null>(null);
   const [toolsOpen, setToolsOpen] = useState(false);
-  const [attackEditorTokenId, setAttackEditorTokenId] = useState<string | null>(null);
+  const [actionEditorTokenId, setActionEditorTokenId] = useState<string | null>(null);
+  // Action results floated above the tokens they hit, each removed shortly after it arrives.
+  const [floats, setFloats] = useState<FloatingResult[]>([]);
   const [structureKind, setStructureKind] = useState("wall");
   const [structureBlocks, setStructureBlocks] = useState<StructureBlocks>(() => defaultBlocksForKind("wall"));
   const [placingStructure, setPlacingStructure] = useState(false);
@@ -66,7 +69,7 @@ export function RoomPage() {
   const selectionHides = selectedTokens.length > 0 ? selectedTokens.some((token) => !token.is_hidden) : !selectedStructure?.is_hidden;
   const canManageSelectedToken = selectedTokens.length === 1 && (isDM || selectedTokens[0].owner_user_id === user?.id);
   const settingsToken = canManageSelectedToken ? selectedTokens[0] : undefined;
-  const attackEditorToken = state?.visibleTokens.find((token) => token.id === attackEditorTokenId && token.attacks_editable);
+  const actionEditorToken = state?.visibleTokens.find((token) => token.id === actionEditorTokenId && token.actions_editable);
 
   async function load() {
     if (!roomId) return;
@@ -100,7 +103,7 @@ export function RoomPage() {
 
   useEffect(() => {
     setMapSelection(null);
-    setAttackEditorTokenId(null);
+    setActionEditorTokenId(null);
     // Placing the first structure in a map-less room starts a map; keep the brush active through that.
     if (previousMapId.current) setPlacingStructure(false);
     previousMapId.current = currentMapId;
@@ -119,6 +122,15 @@ export function RoomPage() {
       if ((event.type === "chat.message" || event.type === "roll.result") && isChatMessage(event.body)) {
         const message = event.body;
         setState((current) => current ? { ...current, chatHistory: [...(current.chatHistory ?? []), message] } : current);
+        // An action already changed the targets' hit points on the server; float the results and reload the health bars.
+        const roll = message.roll;
+        if (event.type === "roll.result" && roll && isActionRoll(roll)) {
+          const results = roll.action.targets.map((target) => ({ id: `${message.id}:${target.token_id}`, tokenId: target.token_id, ...floatText(target) }));
+          const ids = results.map((result) => result.id);
+          setFloats((current) => [...current, ...results]);
+          window.setTimeout(() => setFloats((current) => current.filter((result) => !ids.includes(result.id))), 1800);
+          void load();
+        }
       }
       if (event.type === "token.updated" || event.type === "token.removed" || event.type === "structure.moved" || event.type === "structure.updated" || event.type === "structure.created" || event.type === "structure.removed" || event.type === "map.activated" || event.type === "vision.update" || event.type === "check.changed" || event.type === "state.snapshot") void load();
       if (event.type === "map.activated" || event.type === "state.snapshot") setRemoteDrags(new Map());
@@ -412,15 +424,15 @@ export function RoomPage() {
 
         {isDM && <CheckPromptForm members={members} onPrompt={(request) => sendMap("check.prompt", request)} />}
 
-        {attackEditorToken && <TokenAttacksEditor key={attackEditorToken.id} token={attackEditorToken} busy={busy}
-          onSave={(attacks) => void update(() => patchJSON(`/api/rooms/${roomId}/tokens/${attackEditorToken.id}/attacks`, { attacks }))}
-          onClose={() => setAttackEditorTokenId(null)} />}
+        {actionEditorToken && <TokenActionsEditor key={actionEditorToken.id} token={actionEditorToken} busy={busy}
+          onSave={(lists) => void update(() => patchJSON(`/api/rooms/${roomId}/tokens/${actionEditorToken.id}/actions`, lists))}
+          onClose={() => setActionEditorTokenId(null)} />}
 
         </aside>
       </div>
       <section className="col-start-1 row-start-2 min-w-0 space-y-3 md:col-start-2 md:row-start-1" aria-label="Tabletop">
           <div className="flex flex-wrap items-center justify-between gap-2"><h2 className="text-xl">{state.activeMap?.name ?? "The tabletop"}</h2><p className="text-muted text-xs">{state.metersPerGrid} m per grid square</p></div>
-          <p className="text-muted text-xs">{isDM ? "Left-drag a structure to move it. Drag the round handle above the selected structure to rotate it; hold Shift to snap to 15°. Drag a token to move it freely; hold Shift to snap it to the grid. Walls stop a dragged token, which slides along them, and it stays wherever the drag ends. Drag across empty space to select several tokens, then drag one of them to move the group. Click any token without dragging to pick one of its attacks, then click a target. Select an object to hide it from or reveal it to players. Hold the right mouse button and drag to measure distance; release to hide the ruler. Use Place structure to add walls, doors, windows, cover or terrain to this room's map, and select a structure to remove it; these changes stay in this room and never alter the saved map." : "Drag a token to move it freely; hold Shift to snap it to the grid. Walls stop a dragged token, which slides along them, and it stays wherever the drag ends. Drag across empty space to select several tokens, then drag one of them to move the group. Click a token you control without dragging to pick an attack and see its range, then click a highlighted target; the dice roll automatically. Walls and other attack-blocking structures stop attacks unless they let attacks pass. Hold the right mouse button and drag to measure distance; release to hide the ruler."}</p>
+          <p className="text-muted text-xs">{isDM ? "Left-drag a structure to move it. Drag the round handle above the selected structure to rotate it; hold Shift to snap to 15°. Drag a token to move it freely; hold Shift to snap it to the grid. Walls stop a dragged token, which slides along them, and it stays wherever the drag ends. Drag across empty space to select several tokens, then drag one of them to move the group. Right-click any token without dragging to open its action wheel: pick an attack, spell, item, check or death save, click a target or the point where an area lands, then press Roll on the confirm card. Hits change hit points at once. Select an object to hide it from or reveal it to players. Hold the right mouse button and drag to measure distance; release to hide the ruler. Use Place structure to add walls, doors, windows, cover or terrain to this room's map, and select a structure to remove it; these changes stay in this room and never alter the saved map." : "Drag a token to move it freely; hold Shift to snap it to the grid. Walls stop a dragged token, which slides along them, and it stays wherever the drag ends. Drag across empty space to select several tokens, then drag one of them to move the group. Right-click a token you control without dragging to open its action wheel: pick an attack, spell, item, check or death save and see its range, click a highlighted target or the point where an area lands, then press Roll on the confirm card. Hits change hit points at once. Walls and other attack-blocking structures stop attacks unless they let attacks pass. Hold the right mouse button and drag to measure distance; release to hide the ruler."}</p>
           <div className="grid grid-cols-1 items-center gap-3 rounded-lg border border-[var(--paper)]/10 bg-[var(--input)] px-3 py-2 sm:grid-cols-[minmax(0,1fr)_auto]" role="group" aria-label="Selected tabletop object">
             {selectedTokens.length === 1
               ? <p className="min-w-0 truncate text-sm text-[var(--paper)]"><span className="text-muted mr-2 text-xs uppercase tracking-[0.12em]">token</span>{selectedTokens[0].name}{isDM && <span className="text-muted ml-2 text-xs">{selectedTokens[0].is_hidden ? "Hidden" : "Visible"}</span>}</p>
@@ -461,6 +473,7 @@ export function RoomPage() {
             onMoveToken={(tokenId, to, path) => moveRoomTokens("token.move", { tokenId, to, path }, [{ tokenId, to }])}
             onMoveTokens={(moves) => moveRoomTokens("tokens.move", { moves }, moves)}
             remoteDragPositions={remoteDrags}
+            floatingResults={floats}
             onDragTokens={(moves) => dragFrames.push(moves)}
             onDragTokensEnd={() => {
               dragFrames.cancel();
@@ -468,9 +481,9 @@ export function RoomPage() {
             }}
             onMoveStructure={moveRoomStructure}
             onMeasure={measure}
-            onAttack={(sourceTokenId, targetTokenId, attackId) => sendMap("attack.resolve", { sourceTokenId, targetTokenId, attackId })}
-            onEditAttacks={(tokenId) => {
-              setAttackEditorTokenId(tokenId);
+            onAction={(request) => sendMap(request.type, request.body)}
+            onEditActions={(tokenId) => {
+              setActionEditorTokenId(tokenId);
               setToolsOpen(true);
             }}
             placingStructure={placingStructure ? { kind: structureKind } : null}

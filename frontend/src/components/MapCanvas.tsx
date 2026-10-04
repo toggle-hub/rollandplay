@@ -1,15 +1,19 @@
 import { useEffect, useRef, useState, type MouseEvent, type PointerEvent } from "react";
 import { assetURL } from "../api/client";
-import type { MapStructure, ResolvedTokenAttack, RoomToken, VisibleRoomState } from "../api/types";
-import { attackTargetStatus, type AttackTargetStatus } from "../lib/attacks";
+import type { MapStructure, RoomToken, VisibleRoomState } from "../api/types";
+import { choiceRequest, choiceTargeting, choiceTitle, confirmLines, type ActionRequest, type FloatTone, type WheelChoice } from "../lib/actions";
+import { attackLineBlocked, attackTargetStatus, type AttackTargetStatus } from "../lib/attacks";
 import { geometryCenter, rotateGeometry, type Point } from "../lib/geometryTransforms";
 import { structureLabel, templateGeometry } from "../lib/structures";
 import { extendPath, movementBarriers, walkToken } from "../lib/movement";
 import { clampTokenCenter, snapTokenCenter } from "../lib/tokenGrid";
 import { castVision } from "../lib/vision";
-import { TokenAttackMenu } from "./TokenAttackMenu";
+import { ActionConfirmCard } from "./ActionConfirmCard";
+import { TokenActionWheel } from "./TokenActionWheel";
 
 export type MapSelection = { kind: "tokens"; ids: string[] } | { kind: "structure"; id: string };
+/** A short result floated above a token, such as the damage an action just dealt. */
+export type FloatingResult = { id: string; tokenId: string; text: string; tone: FloatTone };
 type Props = {
   state: VisibleRoomState;
   selectedTokenIds?: readonly string[];
@@ -23,8 +27,10 @@ type Props = {
   onMoveStructure?: (structureId: string, geometry: Point[]) => void;
   onMeasure?: (from: Point, to: Point) => void;
   onSelect?: (selection: MapSelection | null) => void;
-  onAttack?: (sourceTokenId: string, targetTokenId: string, attackId: string) => void;
-  onEditAttacks?: (tokenId: string) => void;
+  /** Sent when the viewer presses Roll on the confirm card of an action, check or death save. */
+  onAction?: (request: ActionRequest) => void;
+  onEditActions?: (tokenId: string) => void;
+  floatingResults?: readonly FloatingResult[];
   placingStructure?: { kind: string } | null;
   onPlaceStructure?: (geometry: Point[]) => void;
   onCancelPlacement?: () => void;
@@ -64,6 +70,12 @@ const attackStatusColors: Record<AttackTargetStatus, string> = {
   blocked: "#ffa9a9",
   out_of_range: "#80738e",
 };
+const floatColors: Record<FloatTone, string> = {
+  damage: "#ffa9a9",
+  heal: "#d9ffb5",
+  miss: "#b8adc4",
+  info: "#ebc7ff",
+};
 const framePaddingPx = 6;
 const rotationHandleOffsetPx = 24;
 const rotationHandleRadiusPx = 7;
@@ -81,8 +93,9 @@ export function MapCanvas({
   onMoveStructure,
   onMeasure,
   onSelect,
-  onAttack,
-  onEditAttacks,
+  onAction,
+  onEditActions,
+  floatingResults,
   placingStructure,
   onPlaceStructure,
   onCancelPlacement,
@@ -112,15 +125,19 @@ export function MapCanvas({
     | null
   >(null);
   const [ruler, setRuler] = useState<{ from: Point; to: Point } | null>(null);
-  const [attackMenu, setAttackMenu] = useState<{ tokenId: string; x: number; y: number } | null>(null);
+  const [actionWheel, setActionWheel] = useState<{ tokenId: string; x: number; y: number } | null>(null);
   const [rangePreview, setRangePreview] = useState<{ tokenId: string; rangeM: number } | null>(null);
-  const [targeting, setTargeting] = useState<{ tokenId: string; attackId: string; hoverTokenId?: string; message?: string } | null>(null);
+  const [targeting, setTargeting] = useState<{ tokenId: string; choice: WheelChoice; hoverTokenId?: string; hoverPoint?: Point; message?: string } | null>(null);
+  // A chosen action waiting on the confirm card's Roll.
+  const [pending, setPending] = useState<{ sourceTokenId: string; choice: WheelChoice; targetTokenId?: string; point?: Point } | null>(null);
   const [placementPoint, setPlacementPoint] = useState<Point | null>(null);
   const placingKind = placingStructure?.kind;
   const findToken = (tokenId?: string) => tokenId === undefined ? undefined : state.visibleTokens.find((token) => token.id === tokenId);
   const targetingSource = findToken(targeting?.tokenId);
-  const targetingAttack = targetingSource?.attacks?.find((attack) => attack.id === targeting?.attackId);
-  const attackMenuToken = findToken(attackMenu?.tokenId);
+  const targetingSpec = targeting ? choiceTargeting(targeting.choice) : null;
+  const wheelToken = findToken(actionWheel?.tokenId);
+  const pendingSource = findToken(pending?.sourceTokenId);
+  const pendingTarget = findToken(pending?.targetTokenId);
   const previewToken = findToken(rangePreview?.tokenId);
   const selectedStructure = canMoveStructures && selectedStructureId !== undefined
     ? state.structures.find((structure) => structure.id === selectedStructureId)
@@ -281,8 +298,8 @@ export function MapCanvas({
       ctx.stroke();
       ctx.setLineDash([]);
     }
-    const rangeSource = targetingAttack ? targetingSource : previewToken;
-    const rangeM = targetingAttack?.range_m ?? rangePreview?.rangeM;
+    const rangeSource = targetingSpec ? targetingSource : previewToken;
+    const rangeM = targetingSpec?.rangeM ?? rangePreview?.rangeM;
     if (rangeSource && rangeM !== undefined) {
       const center = toCanvas(tokenCenter(rangeSource));
       ctx.fillStyle = "rgba(255,184,135,.08)";
@@ -295,19 +312,39 @@ export function MapCanvas({
       ctx.stroke();
       ctx.setLineDash([]);
     }
-    if (targeting && targetingSource && targetingAttack) {
+    if (targeting && targetingSource && targetingSpec && targetingSpec.areaRadiusM > 0) {
+      const at = targeting.hoverPoint;
+      if (at) {
+        const status = attackTargetStatus(tokenCenter(targetingSource), at, targetingSpec.rangeM, state.structures);
+        const color = status !== "valid" ? "#80738e" : targetingSpec.tone === "heal" ? "#d9ffb5" : "#ffa9a9";
+        const center = toCanvas(at);
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 2;
+        ctx.setLineDash([6, 6]);
+        ctx.beginPath();
+        ctx.arc(center.x, center.y, targetingSpec.areaRadiusM * scale, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.setLineDash([]);
+        areaTokens(at, targetingSpec.areaRadiusM).forEach((token) => {
+          const ring = toCanvas(tokenCenter(token));
+          ctx.beginPath();
+          ctx.arc(ring.x, ring.y, (n(token.size_m, 1) * scale) / 2 + 4, 0, Math.PI * 2);
+          ctx.stroke();
+        });
+      }
+    } else if (targeting && targetingSource && targetingSpec) {
       const from = tokenCenter(targetingSource);
       state.visibleTokens.forEach((token) => {
-        if (token.id === targetingSource.id) return;
+        if (token.id === targetingSource.id && !targetingSpec.allowSelf) return;
         const to = tokenCenter(token);
-        const status = attackTargetStatus(from, to, targetingAttack.range_m, state.structures);
+        const status = token.id === targetingSource.id ? "valid" : attackTargetStatus(from, to, targetingSpec.rangeM, state.structures);
         const center = toCanvas(to);
         ctx.strokeStyle = attackStatusColors[status];
         ctx.lineWidth = 2;
         ctx.beginPath();
         ctx.arc(center.x, center.y, (n(token.size_m, 1) * scale) / 2 + 4, 0, Math.PI * 2);
         ctx.stroke();
-        if (token.id !== targeting.hoverTokenId) return;
+        if (token.id !== targeting.hoverTokenId || token.id === targetingSource.id) return;
         const a = toCanvas(from);
         ctx.setLineDash(status === "valid" ? [] : [5, 5]);
         ctx.beginPath();
@@ -343,7 +380,21 @@ export function MapCanvas({
         ctx.fillText(`${rulerDistanceMeters.toFixed(2)} m`, b.x + 8, b.y - 8);
       }
     }
-  }, [state, selectedTokenIds, selectedStructureId, canMoveStructures, rulerDistanceMeters, drag, remoteDragPositions, marquee, structureDrag, ruler, rangePreview, targeting, placingKind, placementPoint, gridSize, imageVersion]);
+    if (floatingResults?.length) {
+      const font = ctx.font;
+      ctx.font = "bold 13px sans-serif";
+      ctx.textAlign = "center";
+      floatingResults.forEach((result) => {
+        const token = findToken(result.tokenId);
+        if (!token) return;
+        const center = toCanvas(livePosition(token));
+        ctx.fillStyle = floatColors[result.tone];
+        ctx.fillText(result.text, center.x, center.y - (n(token.size_m, 1) * scale) / 2 - 10);
+      });
+      ctx.textAlign = "start";
+      ctx.font = font;
+    }
+  }, [state, selectedTokenIds, selectedStructureId, canMoveStructures, rulerDistanceMeters, drag, remoteDragPositions, marquee, structureDrag, ruler, rangePreview, targeting, placingKind, placementPoint, gridSize, imageVersion, floatingResults]);
   useEffect(() => {
     state.visibleTokens.forEach((token) => {
       const id = token.image_asset_id;
@@ -360,31 +411,49 @@ export function MapCanvas({
       return;
     }
     setTargeting(null);
-    closeAttackMenu();
+    setPending(null);
+    closeWheel();
   }, [placingKind]);
   useEffect(() => {
-    if (targeting && !targetingAttack) setTargeting(null);
-    if (attackMenu && !attackMenuToken) setAttackMenu(null);
+    if (targeting && !targetingSource) setTargeting(null);
+    if (pending && !pendingSource) setPending(null);
+    if (actionWheel && !wheelToken) setActionWheel(null);
     if (rangePreview && !previewToken) setRangePreview(null);
-  }, [targeting, targetingAttack, attackMenu, attackMenuToken, rangePreview, previewToken]);
+  }, [targeting, targetingSource, pending, pendingSource, actionWheel, wheelToken, rangePreview, previewToken]);
   function pickToken(point: Point, accept: (token: RoomToken) => boolean) {
     for (let index = state.visibleTokens.length - 1; index >= 0; index--) {
       const token = state.visibleTokens[index];
       if (accept(token) && Math.hypot(n(token.x_m) - point.x, n(token.y_m) - point.y) <= n(token.size_m, 1)) return token;
     }
   }
-  function closeAttackMenu() {
-    setAttackMenu(null);
+  // Visible tokens an area centred on `at` reaches: within its radius and with nothing blocking the way from the point.
+  function areaTokens(at: Point, radiusM: number) {
+    return state.visibleTokens.filter((token) => {
+      const center = tokenCenter(token);
+      return Math.hypot(center.x - at.x, center.y - at.y) <= radiusM + 1e-9 && !attackLineBlocked(at, center, state.structures);
+    });
+  }
+  function closeWheel() {
+    setActionWheel(null);
     setRangePreview(null);
   }
-  function chooseAttack(attack: ResolvedTokenAttack) {
-    if (!attackMenu) return;
-    setTargeting({ tokenId: attackMenu.tokenId, attackId: attack.id });
-    closeAttackMenu();
-    ref.current?.focus({ preventScroll: true });
+  function chooseAction(choice: WheelChoice) {
+    if (!actionWheel) return;
+    const tokenId = actionWheel.tokenId;
+    closeWheel();
+    if (choiceTargeting(choice)) {
+      setTargeting({ tokenId, choice });
+      ref.current?.focus({ preventScroll: true });
+    } else {
+      setPending({ sourceTokenId: tokenId, choice });
+    }
   }
   function cancelTargeting() {
     setTargeting(null);
+    ref.current?.focus({ preventScroll: true });
+  }
+  function closePending() {
+    setPending(null);
     ref.current?.focus({ preventScroll: true });
   }
   function stopPlacing() {
@@ -448,10 +517,21 @@ export function MapCanvas({
     setStructureDrag(null);
     setRuler(null);
   }
+  // A right click without a drag on a token the viewer may act with opens its action wheel.
   function finishRightGesture(event: MouseEvent<HTMLCanvasElement> | PointerEvent<HTMLCanvasElement>) {
-    if (!rightGesture.current) return;
+    const gesture = rightGesture.current;
+    if (!gesture) return;
     cancelPointerAction();
     event.currentTarget.style.cursor = "default";
+    if (gesture.moved || placingKind || !onAction) return;
+    const token = pickToken(gesture.from, (candidate) => !!candidate.can_act);
+    if (!token) return;
+    const rect = event.currentTarget.getBoundingClientRect();
+    setActionWheel({ tokenId: token.id, x: event.clientX - rect.left, y: event.clientY - rect.top });
+    setRangePreview(null);
+    setTargeting(null);
+    setPending(null);
+    onSelect?.({ kind: "tokens", ids: [token.id] });
   }
   // Window blur drops a drag with this render's props and structures.
   const cancelLatest = useRef(cancelPointerAction);
@@ -463,6 +543,31 @@ export function MapCanvas({
     window.addEventListener("blur", cancel);
     return () => window.removeEventListener("blur", cancel);
   }, []);
+  function pendingCard() {
+    if (!pending || !pendingSource) return null;
+    const { choice, targetTokenId, point } = pending;
+    const source = pendingSource;
+    const areaCount = point ? areaTokens(point, choiceTargeting(choice)?.areaRadiusM ?? 0).length : undefined;
+    const subtitle = pendingTarget
+      ? `${source.name} → ${pendingTarget.name}`
+      : areaCount !== undefined
+        ? `${source.name} → area · ${areaCount} ${areaCount === 1 ? "creature" : "creatures"} you can see`
+        : source.name;
+    return <ActionConfirmCard
+      title={choiceTitle(choice)}
+      subtitle={subtitle}
+      lines={confirmLines(choice, pendingTarget, areaCount)}
+      onRoll={() => {
+        onAction?.(choiceRequest(source.id, choice, targetTokenId, point));
+        closePending();
+      }}
+      onBack={choiceTargeting(choice) ? () => {
+        setTargeting({ tokenId: source.id, choice });
+        closePending();
+      } : undefined}
+      onCancel={closePending}
+    />;
+  }
   return (
     <div className="relative min-w-0">
       <canvas
@@ -470,14 +575,14 @@ export function MapCanvas({
         className="block h-auto w-full max-w-full touch-none rounded-xl border border-[var(--paper)]/15 bg-[var(--surface)] focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)]"
         role="img"
         tabIndex={0}
-        aria-label="Interactive tabletop map. Drag a structure to move it. Drag the round handle above the selected structure to rotate it; hold Shift to snap rotation to 15 degrees. Drag a token to move it freely; hold Shift to snap it to the grid when dropped. Everyone at the table sees it move. Walls stop it and it slides along them; it stays wherever the drag ends. Drag across empty space to select several tokens, then drag one of them to move the group. Click a token you control without dragging to choose an attack, then click a target. Hold the right mouse button and drag to measure distance; release to hide the ruler. Press Escape to end a drag where the token is. While placing a structure, click the map to place it; press Escape to stop."
+        aria-label="Interactive tabletop map. Drag a structure to move it. Drag the round handle above the selected structure to rotate it; hold Shift to snap rotation to 15 degrees. Drag a token to move it freely; hold Shift to snap it to the grid when dropped. Everyone at the table sees it move. Walls stop it and it slides along them; it stays wherever the drag ends. Drag across empty space to select several tokens, then drag one of them to move the group. Right click a token you control without dragging to open its action wheel, pick an attack, spell, item, check or death save, click a target or the point where an area lands, then press Roll on the confirm card. Hold the right mouse button and drag to measure distance; release to hide the ruler. Press Escape to end a drag where the token is, or to close the action wheel or cancel an action. While placing a structure, click the map to place it; press Escape to stop."
         onContextMenu={(event) => event.preventDefault()}
         onPointerDown={(event) => {
           if ((event.button !== 0 && event.button !== 2) || pointerActive.current) return;
           event.currentTarget.focus({ preventScroll: true });
           event.currentTarget.setPointerCapture?.(event.pointerId);
           pointerActive.current = true;
-          closeAttackMenu();
+          closeWheel();
           const point = eventPoint(event);
           setRuler(null);
           if (event.button === 2) {
@@ -488,17 +593,34 @@ export function MapCanvas({
             onPlaceStructure?.(templateGeometry(placingKind, point, gridSize));
             return;
           }
+          if (pending) {
+            setPending(null);
+            return;
+          }
           if (targeting) {
-            const target = targetingSource && targetingAttack
-              ? pickToken(point, (candidate) => candidate.id !== targetingSource.id)
-              : undefined;
-            if (!target || !targetingSource || !targetingAttack) {
+            if (!targetingSource || !targetingSpec) {
               setTargeting(null);
               return;
             }
-            const status = attackTargetStatus(tokenCenter(targetingSource), tokenCenter(target), targetingAttack.range_m, state.structures);
+            const from = tokenCenter(targetingSource);
+            if (targetingSpec.areaRadiusM > 0) {
+              const status = attackTargetStatus(from, point, targetingSpec.rangeM, state.structures);
+              if (status === "valid") {
+                setPending({ sourceTokenId: targetingSource.id, choice: targeting.choice, point: { x: round(point.x), y: round(point.y) } });
+                setTargeting(null);
+              } else {
+                setTargeting({ ...targeting, message: status === "blocked" ? "Blocked by a structure" : "Out of range" });
+              }
+              return;
+            }
+            const target = pickToken(point, (candidate) => targetingSpec.allowSelf || candidate.id !== targetingSource.id);
+            if (!target) {
+              setTargeting(null);
+              return;
+            }
+            const status = target.id === targetingSource.id ? "valid" : attackTargetStatus(from, tokenCenter(target), targetingSpec.rangeM, state.structures);
             if (status === "valid") {
-              onAttack?.(targetingSource.id, target.id, targetingAttack.id);
+              setPending({ sourceTokenId: targetingSource.id, choice: targeting.choice, targetTokenId: target.id });
               setTargeting(null);
             } else {
               setTargeting({ ...targeting, message: status === "blocked" ? "Blocked by a structure" : "Out of range" });
@@ -573,8 +695,13 @@ export function MapCanvas({
               event.currentTarget.style.cursor = "crosshair";
               return;
             }
-            if (targeting && targetingSource) {
-              const hover = pickToken(point, (candidate) => candidate.id !== targetingSource.id);
+            if (targeting && targetingSource && targetingSpec) {
+              if (targetingSpec.areaRadiusM > 0) {
+                setTargeting({ ...targeting, hoverPoint: point });
+                event.currentTarget.style.cursor = "crosshair";
+                return;
+              }
+              const hover = pickToken(point, (candidate) => targetingSpec.allowSelf || candidate.id !== targetingSource.id);
               if (hover?.id !== targeting.hoverTokenId) setTargeting({ ...targeting, hoverTokenId: hover?.id });
               event.currentTarget.style.cursor = hover ? "crosshair" : "default";
               return;
@@ -634,12 +761,6 @@ export function MapCanvas({
             if (!moved) {
               // A click on one token of a group selects just that token.
               if (current.tokens.length > 1) onSelect?.({ kind: "tokens", ids: [current.grabbed.id] });
-              if (onAttack) {
-                const rect = event.currentTarget.getBoundingClientRect();
-                const firstAttack = current.grabbed.attacks?.[0];
-                setAttackMenu({ tokenId: current.grabbed.id, x: event.clientX - rect.left, y: event.clientY - rect.top });
-                setRangePreview(firstAttack ? { tokenId: current.grabbed.id, rangeM: firstAttack.range_m } : null);
-              }
             }
           } else if (marquee) {
             if (marquee.moved || Math.hypot(event.clientX - marquee.clientX, event.clientY - marquee.clientY) >= 4) {
@@ -669,6 +790,9 @@ export function MapCanvas({
           cancelPointerAction();
           event.currentTarget.style.cursor = "default";
         }}
+        // pointerdown already focuses the canvas; the browser's own mousedown focus would come later and
+        // steal focus from the confirm card's Roll button that a target click just opened.
+        onMouseDown={(event) => event.preventDefault()}
         onMouseUp={(event) => {
           // pointerup waits for the last held mouse button; mouseup does not.
           if (event.button === 2) finishRightGesture(event);
@@ -679,36 +803,39 @@ export function MapCanvas({
           if (event.key === "Shift") setDragSnap(true);
           if (event.key !== "Escape") return;
           if (placingKind) onCancelPlacement?.();
-          closeAttackMenu();
+          closeWheel();
           setTargeting(null);
+          setPending(null);
           cancelPointerAction();
         }}
         onKeyUp={(event) => {
           if (event.key === "Shift") setDragSnap(false);
         }}
       />
-      {attackMenu && attackMenuToken && <TokenAttackMenu
-        x={attackMenu.x}
-        y={attackMenu.y}
-        token={attackMenuToken}
-        onPreview={(attack) => setRangePreview({ tokenId: attackMenuToken.id, rangeM: attack.range_m })}
-        onChoose={chooseAttack}
-        onEdit={attackMenuToken.attacks_editable && onEditAttacks ? () => {
-          onEditAttacks(attackMenuToken.id);
-          closeAttackMenu();
+      {actionWheel && wheelToken && <TokenActionWheel
+        x={actionWheel.x}
+        y={actionWheel.y}
+        token={wheelToken}
+        onPreview={(rangeM) => setRangePreview(rangeM === null ? null : { tokenId: wheelToken.id, rangeM })}
+        onChoose={chooseAction}
+        onEdit={wheelToken.actions_editable && onEditActions ? () => {
+          onEditActions(wheelToken.id);
+          closeWheel();
         } : undefined}
         onClose={() => {
-          closeAttackMenu();
+          closeWheel();
           ref.current?.focus({ preventScroll: true });
         }}
       />}
       {placingKind ? <div className="absolute left-1/2 top-3 z-30 flex -translate-x-1/2 items-center gap-3 rounded-lg border border-[var(--paper)]/15 bg-[var(--input)] px-3 py-2 text-xs text-[var(--paper)] shadow-xl" role="status" aria-live="polite">
         <span>{`Placing ${structureLabel(placingKind)} — click the map to place it`}</span>
         <button className="shrink-0 text-[var(--accent)] underline underline-offset-4 hover:text-[var(--paper)]" type="button" onClick={stopPlacing}>Stop placing</button>
-      </div> : targeting && targetingAttack && <div className="absolute left-1/2 top-3 z-30 flex -translate-x-1/2 items-center gap-3 rounded-lg border border-[var(--paper)]/15 bg-[var(--input)] px-3 py-2 text-xs text-[var(--paper)] shadow-xl" role="status" aria-live="polite">
-        <span>{`${targetingAttack.name} · ${targetingAttack.range_m} m — click a highlighted target`}{targeting.message && ` · ${targeting.message}`}</span>
-        <button className="shrink-0 text-[var(--accent)] underline underline-offset-4 hover:text-[var(--paper)]" type="button" onClick={cancelTargeting}>Cancel attack</button>
-      </div>}
+      </div> : targeting && targetingSpec ? <div className="absolute left-1/2 top-3 z-30 flex -translate-x-1/2 items-center gap-3 rounded-lg border border-[var(--paper)]/15 bg-[var(--input)] px-3 py-2 text-xs text-[var(--paper)] shadow-xl" role="status" aria-live="polite">
+        <span>{targetingSpec.areaRadiusM > 0
+          ? `${choiceTitle(targeting.choice)} · ${targetingSpec.areaRadiusM} m radius — click where it lands`
+          : `${choiceTitle(targeting.choice)} · ${targetingSpec.rangeM} m — click a highlighted target`}{targeting.message && ` · ${targeting.message}`}</span>
+        <button className="shrink-0 text-[var(--accent)] underline underline-offset-4 hover:text-[var(--paper)]" type="button" onClick={cancelTargeting}>Cancel</button>
+      </div> : pendingCard()}
     </div>
   );
 }

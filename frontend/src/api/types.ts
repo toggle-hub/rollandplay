@@ -136,8 +136,34 @@ export type TokenAttack = {
   attack_bonus: number;
   damage: string;
   damage_bonus: number;
+  damage_type: string;
 };
 export type ResolvedTokenAttack = TokenAttack & { to_hit: number; damage_modifier: number };
+export type ActionKind = "attack" | "save" | "heal";
+/** A stored spell or ability (sheet data or token attributes under "actions"). */
+export type TokenAction = {
+  id: string;
+  name: string;
+  kind: ActionKind;
+  range_m: number;
+  /** 0 targets one token; above 0 every token in the radius around a chosen point. */
+  area_radius_m: number;
+  ability: string;
+  proficient: boolean;
+  bonus: number;
+  save_ability: string;
+  half_on_save: boolean;
+  dice: string;
+  dice_bonus: number;
+  ability_to_dice: boolean;
+  damage_type: string;
+  uses?: { max: number; remaining: number } | null;
+};
+export type ResolvedTokenAction = TokenAction & { to_hit: number; save_dc: number; dice_modifier: number };
+export type TokenItem = Omit<TokenAction, "uses"> & { quantity: number };
+export type ResolvedTokenItem = Omit<ResolvedTokenAction, "uses"> & { quantity: number };
+export type DeathSaves = { successes: number; failures: number; stable: boolean; dead: boolean };
+export type TokenDefenses = { armor_class: number | null; resistances: string[]; immunities: string[]; vulnerabilities: string[] };
 export type RoomToken = {
   id: string;
   room_map_id?: string;
@@ -152,7 +178,12 @@ export type RoomToken = {
   is_hidden: boolean;
   attributes: Record<string, unknown>;
   attacks?: ResolvedTokenAttack[];
-  attacks_editable?: boolean;
+  actions?: ResolvedTokenAction[];
+  items?: ResolvedTokenItem[];
+  /** Whether the viewer may edit this token's attacks, actions and items. */
+  actions_editable?: boolean;
+  /** Whether the viewer may act with this token (its owner or the game master). */
+  can_act?: boolean;
   image_asset_id?: string;
   /** Players the game master lets move this token besides its owner; sent to game masters only. */
   mover_user_ids?: string[];
@@ -161,6 +192,10 @@ export type RoomToken = {
   /** Health reaches only the game master, the token owner and the owner of its sheet. */
   hit_points?: number;
   max_hit_points?: number;
+  /** Sheet-backed tokens only, with the same visibility as health. */
+  death_saves?: DeathSaves;
+  /** Same visibility as health. */
+  defenses?: TokenDefenses;
 };
 export type TokenPatch = {
   hit_points?: number;
@@ -169,6 +204,10 @@ export type TokenPatch = {
   mover_user_ids?: string[];
   /** null clears the image. */
   image_asset_id?: string | null;
+  armor_class?: number;
+  resistances?: string[];
+  immunities?: string[];
+  vulnerabilities?: string[];
 };
 export type RollResult = {
   expression: string;
@@ -179,6 +218,37 @@ export type RollResult = {
   /** Present when the roll answers a check prompted by the game master. */
   check?: CheckOutcome;
 };
+export type TargetResult =
+  | "hit" | "critical" | "miss" | "saved" | "failed" | "healed" | "no_effect"
+  | "success" | "failure" | "stable" | "dead" | "revived";
+export type TargetOutcome = {
+  token_id: string;
+  name: string;
+  /** The attack d20, the target's saving throw, or the death save. */
+  roll?: RollResult;
+  result: TargetResult;
+  damage?: number;
+  healing?: number;
+  defense?: "resistant" | "immune" | "vulnerable";
+  down?: boolean;
+  dead?: boolean;
+};
+export type ActionOutcome = {
+  name: string;
+  kind: ActionKind | "death_save";
+  source: "attack" | "action" | "item" | "death_save";
+  source_token_id: string;
+  dc?: number;
+  save_ability?: string;
+  damage_type?: string;
+  /** The shared damage or healing roll. */
+  effect?: RollResult;
+  targets: TargetOutcome[];
+  uses_left?: number;
+  quantity_left?: number;
+};
+/** Chat roll of a resolved action, quick check aside. */
+export type ActionRoll = { action: ActionOutcome };
 export type CheckKind = "ability" | "save" | "skill" | "attribute";
 export type CheckOutcome = {
   check_id: string;
@@ -215,7 +285,7 @@ export type ChatMessage = {
   sender_user_id: string;
   kind: "chat" | "dm" | "roll" | "system";
   body: string;
-  roll?: RollResult | null;
+  roll?: RollResult | ActionRoll | null;
   recipient_user_ids?: string[];
   created_at: string;
 };

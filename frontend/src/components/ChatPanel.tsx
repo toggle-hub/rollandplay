@@ -1,7 +1,9 @@
 import { FormEvent, useLayoutEffect, useRef, useState } from "react";
 import { ChatCircle, CheckCircle, DiceFive, LockSimple, PaperPlaneTilt, XCircle } from "@phosphor-icons/react";
 import { PlayerName } from "./PlayerName";
-import type { ChatMessage, RoomMember } from "../api/types";
+import type { ActionOutcome, ChatMessage, RollResult, RoomMember, TargetOutcome, TargetResult } from "../api/types";
+import { isActionRoll } from "../lib/actions";
+import { humanizeKey } from "../lib/checks";
 
 type Props = {
   messages: ChatMessage[];
@@ -53,7 +55,7 @@ export function ChatPanel({ messages, members, isDM, onSend }: Props) {
           </div>
           <div className={message.kind === "system" ? "border-l-2 border-[var(--line)] pl-3 text-xs leading-relaxed text-[var(--muted)]" : `rounded-xl rounded-tl-sm border p-3 leading-relaxed ${privateMessage ? "border-[var(--lavender)]/20 bg-[var(--lavender)]/5" : "border-[var(--paper)]/5 bg-[var(--input)]/60"}`}>
             {message.body && <p className="mb-0 whitespace-pre-wrap">{message.body}</p>}
-            {message.kind === "roll" && message.roll && <div className={message.body ? "mt-3" : ""}>
+            {message.kind === "roll" && message.roll && (isActionRoll(message.roll) ? <ActionRollView action={message.roll.action} spaced={!!message.body} /> : <div className={message.body ? "mt-3" : ""}>
               {message.roll.check && <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
                 <span className="text-xs text-[var(--muted)]">{message.roll.check.title ? `${message.roll.check.title} · ` : ""}{message.roll.check.label} · DC {message.roll.check.dc}</span>
                 {message.roll.check.success
@@ -72,7 +74,7 @@ export function ChatPanel({ messages, members, isDM, onSend }: Props) {
                 </div>
                 <p className="mb-0 mt-2 text-xs text-[var(--muted)]">{message.roll.damage.dice.map((die, index) => <span key={index}>d{die.sides} [{die.values.join(", ")}] </span>)}<span>· modifier {message.roll.damage.modifier}</span></p>
               </div>}
-            </div>}
+            </div>)}
           </div>
         </article>;
       })}
@@ -112,4 +114,75 @@ export function ChatPanel({ messages, members, isDM, onSend }: Props) {
       {error && <p role="alert" className="mb-0 text-xs text-[var(--pink)]">{error}</p>}
     </form>
   </section>;
+}
+
+/** Badge label per result, and whether it reads as a success (green) or a setback (pink). */
+const resultBadges: Record<TargetResult, { label: string; good: boolean }> = {
+  hit: { label: "Hit", good: true },
+  critical: { label: "Critical hit", good: true },
+  miss: { label: "Miss", good: false },
+  saved: { label: "Saved", good: true },
+  failed: { label: "Failed", good: false },
+  healed: { label: "Healed", good: true },
+  no_effect: { label: "No effect", good: false },
+  success: { label: "Success", good: true },
+  failure: { label: "Failure", good: false },
+  stable: { label: "Stable", good: true },
+  dead: { label: "Dead", good: false },
+  revived: { label: "Back up", good: true },
+};
+
+function DiceDetail({ roll }: { roll: RollResult }) {
+  return <p className="mb-0 mt-1 text-xs text-[var(--muted)]">{roll.dice.map((die, index) => <span key={index}>d{die.sides} [{die.values.join(", ")}] </span>)}<span>· modifier {roll.modifier}</span></p>;
+}
+
+function ResultBadge({ result }: { result: TargetResult }) {
+  const { label, good } = resultBadges[result];
+  return good
+    ? <strong className="inline-flex items-center gap-1 rounded-md bg-[var(--green)]/10 px-2 py-1 text-xs text-[var(--green)]"><CheckCircle size={14} weight="fill" aria-hidden="true" />{label}</strong>
+    : <strong className="inline-flex items-center gap-1 rounded-md bg-[var(--pink)]/10 px-2 py-1 text-xs text-[var(--pink)]"><XCircle size={14} weight="fill" aria-hidden="true" />{label}</strong>;
+}
+
+function TargetRow({ target }: { target: TargetOutcome }) {
+  const tag = target.dead ? "Dead" : target.down ? "Down" : "";
+  return <li className="rounded-lg border border-[var(--paper)]/5 bg-[var(--surface)]/40 p-2">
+    <div className="flex flex-wrap items-center justify-between gap-2">
+      <span className="font-medium">{target.name}</span>
+      <span className="inline-flex flex-wrap items-center gap-2">
+        {!!target.damage && <span className="font-semibold tabular-nums text-[var(--pink)]">-{target.damage}</span>}
+        {!!target.healing && <span className="font-semibold tabular-nums text-[var(--green)]">+{target.healing}</span>}
+        {target.defense && <span className="text-xs text-[var(--muted)]">{target.defense}</span>}
+        {tag && !(tag === "Dead" && target.result === "dead") && <span className="rounded bg-[var(--pink)]/10 px-1.5 py-0.5 text-xs text-[var(--pink)]">{tag}</span>}
+        <ResultBadge result={target.result} />
+      </span>
+    </div>
+    {target.roll && <>
+      <div className="mt-1 flex flex-wrap items-center justify-between gap-2 text-xs text-[var(--peach)]">
+        <span className="inline-flex items-center gap-1"><DiceFive size={14} aria-hidden="true" />{target.roll.expression}</span>
+        <span className="tabular-nums">total {target.roll.total}</span>
+      </div>
+      <DiceDetail roll={target.roll} />
+    </>}
+  </li>;
+}
+
+function ActionRollView({ action, spaced }: { action: ActionOutcome; spaced: boolean }) {
+  const header = [action.name];
+  if (action.kind === "save" && action.save_ability) header.push(`${humanizeKey(action.save_ability)} save DC ${action.dc ?? 0}`);
+  if (action.damage_type) header.push(action.damage_type);
+  return <div className={spaced ? "mt-3" : ""}>
+    <p className="mb-2 text-xs text-[var(--muted)]">{header.join(" · ")}</p>
+    {action.effect && <div className="mb-3">
+      <div className="flex flex-wrap items-center justify-between gap-2 text-[var(--peach)]">
+        <span className="inline-flex items-center gap-1.5 font-medium"><DiceFive size={18} aria-hidden="true" />{action.kind === "heal" ? "Healing" : "Damage"} · {action.effect.expression}</span>
+        <strong className="rounded-md bg-[var(--peach)]/10 px-2 py-1 tabular-nums">total {action.effect.total}</strong>
+      </div>
+      <DiceDetail roll={action.effect} />
+    </div>}
+    {action.targets.length === 0
+      ? <p className="mb-0 text-xs text-[var(--muted)]">No creatures in the area</p>
+      : <ul className="m-0 list-none space-y-2 p-0">{action.targets.map((target) => <TargetRow key={target.token_id} target={target} />)}</ul>}
+    {action.uses_left !== undefined && <p className="mb-0 mt-2 text-xs text-[var(--muted)]">{action.uses_left} {action.uses_left === 1 ? "use" : "uses"} left</p>}
+    {action.quantity_left !== undefined && <p className="mb-0 mt-2 text-xs text-[var(--muted)]">{action.quantity_left} left</p>}
+  </div>;
 }
