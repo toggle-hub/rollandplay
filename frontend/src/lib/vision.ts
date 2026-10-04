@@ -1,5 +1,6 @@
 import type { MapStructure } from "../api/types";
 import type { Point } from "./geometryTransforms";
+import { structureSegments } from "./segments";
 
 const steps = 180;
 const fullTurn = 2 * Math.PI;
@@ -32,15 +33,6 @@ export function castVision(origin: Point, rangeM: number, structures: MapStructu
     });
     return hit;
   });
-}
-
-function structureSegments(structure: MapStructure): [Point, Point][] {
-  const points = structure.geometry;
-  if (points.length < 2) return [];
-  const segments: [Point, Point][] = [];
-  for (let index = 0; index < points.length - 1; index++) segments.push([points[index], points[index + 1]]);
-  if (points.length > 2) segments.push([points[points.length - 1], points[0]]);
-  return segments;
 }
 
 /** Distance along the ray from origin at angle to segment a–b, if it hits. */

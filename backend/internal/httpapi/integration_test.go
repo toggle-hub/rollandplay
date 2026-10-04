@@ -1164,6 +1164,14 @@ func TestRoomStructurePlacementAndRemovalStayInRoom(t *testing.T) {
 	readType(t, pWS, "structure.moved")
 	sendWS(t, pWS, "token.move", "past-moved-wall", map[string]any{"tokenId": hero["id"], "to": map[string]float64{"x": 3, "y": 1}, "path": []map[string]float64{{"x": 1, "y": 1}, {"x": 3, "y": 1}}})
 	readType(t, pWS, "token.moved")
+	// A group move is checked along each token's walked path, so walking around a wall's end is allowed.
+	expectError(pWS, "tokens.move", "group-through-wall", "blocked_movement", map[string]any{"moves": []map[string]any{
+		{"tokenId": hero["id"], "to": map[string]float64{"x": 5, "y": 1}},
+	}})
+	sendWS(t, pWS, "tokens.move", "group-around-wall", map[string]any{"moves": []map[string]any{
+		{"tokenId": hero["id"], "to": map[string]float64{"x": 5, "y": 1}, "path": []map[string]float64{{"x": 3, "y": 1}, {"x": 3, "y": 4}, {"x": 5, "y": 4}, {"x": 5, "y": 1}}},
+	}})
+	readType(t, pWS, "token.moved")
 
 	expectError(pWS, "structure.remove", "player-remove", "forbidden", map[string]any{"structureId": placedID})
 	sendWS(t, dmWS, "structure.remove", "remove-placed", map[string]any{"structureId": placedID})

@@ -428,13 +428,7 @@ func (c *client) tokenMove(msg clientEnvelope) {
 		return
 	}
 	structures, _ := c.hub.loadStructures(context.Background(), c.roomID)
-	if len(req.Path) == 0 {
-		req.Path = []game.Point{{X: token.X, Y: token.Y}, req.To}
-	} else {
-		req.Path = append([]game.Point{{X: token.X, Y: token.Y}}, req.Path...)
-		req.Path = append(req.Path, req.To)
-	}
-	if !game.CanMove(req.Path, structures, token) {
+	if !game.CanMove(walkedPath(token, req.Path, req.To), structures, token) {
 		c.error(msg.RequestID, "blocked_movement", "movement is blocked")
 		return
 	}
@@ -449,6 +443,15 @@ func (c *client) tokenMove(msg clientEnvelope) {
 	c.hub.publish(c.roomID, envelope{Type: "vision.update", RequestID: nil, Body: map[string]any{"room_id": c.roomID, "version": time.Now().UnixNano()}})
 }
 
+// walkedPath is the route a move is checked along: from where the token is stored, through the
+// waypoints the client walked around movement-blocking structures, to where it lands.
+func walkedPath(token game.Token, waypoints []game.Point, to game.Point) []game.Point {
+	path := make([]game.Point, 0, len(waypoints)+2)
+	path = append(path, game.Point{X: token.X, Y: token.Y})
+	path = append(path, waypoints...)
+	return append(path, to)
+}
+
 // maxGroupMove bounds one group move; a marquee selection on a busy map stays well under it.
 const maxGroupMove = 100
 
@@ -458,8 +461,9 @@ func (c *client) tokensMove(msg clientEnvelope) {
 	defer c.endDrag()
 	var req struct {
 		Moves []struct {
-			TokenID string     `json:"tokenId"`
-			To      game.Point `json:"to"`
+			TokenID string       `json:"tokenId"`
+			To      game.Point   `json:"to"`
+			Path    []game.Point `json:"path"`
 		} `json:"moves"`
 	}
 	if json.Unmarshal(msg.Body, &req) != nil || len(req.Moves) == 0 || len(req.Moves) > maxGroupMove {
@@ -487,7 +491,7 @@ func (c *client) tokensMove(msg clientEnvelope) {
 			c.error(msg.RequestID, "forbidden", "you cannot move this token")
 			return
 		}
-		if !game.CanMove([]game.Point{{X: token.X, Y: token.Y}, m.To}, structures, token) {
+		if !game.CanMove(walkedPath(token, m.Path, m.To), structures, token) {
 			c.error(msg.RequestID, "blocked_movement", "movement is blocked")
 			return
 		}

@@ -234,8 +234,8 @@ describe("MapCanvas", () => {
     fireEvent.pointerMove(canvas, { clientX: 144, clientY: 144 });
     fireEvent.pointerUp(canvas, { clientX: 144, clientY: 144 });
     expect(moveMany).toHaveBeenCalledExactlyOnceWith([
-      { tokenId: "a", to: { x: 2, y: 2 } },
-      { tokenId: "b", to: { x: 4, y: 2 } },
+      { tokenId: "a", to: { x: 2, y: 2 }, path: [{ x: 1, y: 1 }, { x: 2, y: 2 }] },
+      { tokenId: "b", to: { x: 4, y: 2 }, path: [{ x: 3, y: 1 }, { x: 4, y: 2 }] },
     ]);
     expect(moveOne).not.toHaveBeenCalled();
     expect(select).not.toHaveBeenCalled();
@@ -305,15 +305,57 @@ describe("MapCanvas", () => {
       expect(onMoveToken).toHaveBeenCalledExactlyOnceWith("token", { x: 3.5, y: 2.5 }, [{ x: 1, y: 1 }, { x: 3.5, y: 2.5 }]);
     });
 
-    it("ends the live drag without moving when Escape cancels it", () => {
+    it.each(["Escape", "pointercancel", "lostcapture", "blur"])("leaves the token where it was dragged when %s ends the drag", (end) => {
       const { canvas, onDragTokensEnd, onMoveToken } = renderDrag();
       fireEvent.pointerDown(canvas, { clientX: 72, clientY: 72, button: 0 });
       fireEvent.pointerMove(canvas, { clientX: 216, clientY: 144 });
-      fireEvent.keyDown(canvas, { key: "Escape" });
-      expect(onDragTokensEnd).toHaveBeenCalledTimes(1);
-      fireEvent.pointerUp(canvas, { clientX: 216, clientY: 144 });
-      expect(onMoveToken).not.toHaveBeenCalled();
-      expect(onDragTokensEnd).toHaveBeenCalledTimes(1);
+      if (end === "Escape") fireEvent.keyDown(canvas, { key: "Escape" });
+      else if (end === "pointercancel") fireEvent.pointerCancel(canvas);
+      else if (end === "lostcapture") fireEvent.lostPointerCapture(canvas);
+      else fireEvent(window, new Event("blur"));
+      expect(onMoveToken).toHaveBeenCalledExactlyOnceWith("token", { x: 3, y: 2 }, [{ x: 1, y: 1 }, { x: 3, y: 2 }]);
+      fireEvent.pointerUp(canvas, { clientX: 288, clientY: 288 });
+      expect(onMoveToken).toHaveBeenCalledTimes(1);
+      expect(onDragTokensEnd).not.toHaveBeenCalled();
+    });
+
+    it("draws no outline where the dragged token started", () => {
+      const { canvas } = renderDrag();
+      const arc = globalThis.__canvasContext.arc;
+      fireEvent.pointerDown(canvas, { clientX: 72, clientY: 72, button: 0 });
+      arc.mockClear();
+      fireEvent.pointerMove(canvas, { clientX: 216, clientY: 144 });
+      expect(arc).not.toHaveBeenCalledWith(24, 24, 12, 0, Math.PI * 2);
+    });
+
+    describe("into walls", () => {
+      const barrier = { ...wall, geometry: [{ x: 3, y: 0 }, { x: 3, y: 4 }] };
+      function renderWalled() {
+        const onMoveToken = vi.fn();
+        const onDragTokens = vi.fn();
+        const { container } = render(
+          <MapCanvas state={{ ...state, structures: [barrier], visibleTokens: [token] }} onDragTokens={onDragTokens} onMoveToken={onMoveToken} />,
+        );
+        return { canvas: container.querySelector("canvas")!, onMoveToken, onDragTokens };
+      }
+
+      it("stops the token next to a wall it is dragged into, and drops it there", () => {
+        const { canvas, onMoveToken, onDragTokens } = renderWalled();
+        fireEvent.pointerDown(canvas, { clientX: 72, clientY: 72, button: 0 });
+        fireEvent.pointerMove(canvas, { clientX: 5 * 72, clientY: 72 });
+        expect(onDragTokens).toHaveBeenLastCalledWith([{ tokenId: "token", to: { x: 2.5, y: 1 } }]);
+        fireEvent.pointerUp(canvas, { clientX: 5 * 72, clientY: 72 });
+        expect(onMoveToken).toHaveBeenCalledExactlyOnceWith("token", { x: 2.5, y: 1 }, [{ x: 1, y: 1 }, { x: 2.5, y: 1 }]);
+      });
+
+      it("walks around a wall's end and sends the way it went", () => {
+        const { canvas, onMoveToken } = renderWalled();
+        fireEvent.pointerDown(canvas, { clientX: 72, clientY: 72, button: 0 });
+        fireEvent.pointerMove(canvas, { clientX: 72, clientY: 5 * 72 });
+        fireEvent.pointerMove(canvas, { clientX: 5 * 72, clientY: 5 * 72 });
+        fireEvent.pointerUp(canvas, { clientX: 5 * 72, clientY: 72 });
+        expect(onMoveToken).toHaveBeenCalledExactlyOnceWith("token", { x: 5, y: 1 }, [{ x: 1, y: 1 }, { x: 1, y: 5 }, { x: 5, y: 5 }, { x: 5, y: 1 }]);
+      });
     });
 
     it("ends the live drag without moving when the token snaps back to where it started", () => {

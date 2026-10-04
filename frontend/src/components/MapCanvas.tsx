@@ -4,6 +4,7 @@ import type { MapStructure, ResolvedTokenAttack, RoomToken, VisibleRoomState } f
 import { attackTargetStatus, type AttackTargetStatus } from "../lib/attacks";
 import { geometryCenter, rotateGeometry, type Point } from "../lib/geometryTransforms";
 import { structureLabel, templateGeometry } from "../lib/structures";
+import { extendPath, movementBarriers, walkToken } from "../lib/movement";
 import { clampTokenCenter, snapTokenCenter } from "../lib/tokenGrid";
 import { castVision } from "../lib/vision";
 import { TokenAttackMenu } from "./TokenAttackMenu";
@@ -16,8 +17,9 @@ type Props = {
   movableTokenIds?: ReadonlySet<string>;
   canMoveStructures?: boolean;
   rulerDistanceMeters?: number;
+  /** `path` is the way the token walked around movement-blocking structures, from where it started to `to`. */
   onMoveToken?: (tokenId: string, to: Point, path: Point[]) => void;
-  onMoveTokens?: (moves: { tokenId: string; to: Point }[]) => void;
+  onMoveTokens?: (moves: TokenMove[]) => void;
   onMoveStructure?: (structureId: string, geometry: Point[]) => void;
   onMeasure?: (from: Point, to: Point) => void;
   onSelect?: (selection: MapSelection | null) => void;
@@ -30,9 +32,10 @@ type Props = {
   remoteDragPositions?: ReadonlyMap<string, Point>;
   /** Live positions of the tokens being dragged, before they are dropped. */
   onDragTokens?: (moves: { tokenId: string; to: Point }[]) => void;
-  /** The live drag ended without a move: cancelled, or dropped where it started. */
+  /** The live drag ended without a move: the tokens never left where they started. */
   onDragTokensEnd?: () => void;
 };
+export type TokenMove = { tokenId: string; to: Point; path: Point[] };
 type TokenDrag = {
   /** Every token moving together; the grabbed one leads and, with Shift held, snaps to the grid. */
   tokens: RoomToken[];
@@ -46,6 +49,10 @@ type TokenDrag = {
   moved: boolean;
   /** Shift is held, so the dragged tokens snap to the grid. */
   snap: boolean;
+  /** Where each token is now. It follows the pointer until a movement-blocking structure stops it. */
+  at: ReadonlyMap<string, Point>;
+  /** The way each token walked from where it started to where it is, sent with the drop. */
+  paths: ReadonlyMap<string, Point[]>;
 };
 type Marquee = { from: Point; to: Point; clientX: number; clientY: number; moved: boolean };
 type TransformFrame = { box: Point[]; anchor: Point; handle: Point; center: Point };
@@ -90,6 +97,8 @@ export function MapCanvas({
   const pointerActive = useRef(false);
   const rightGesture = useRef<{ from: Point; clientX: number; clientY: number; moved: boolean } | null>(null);
   const [drag, setDrag] = useState<TokenDrag | null>(null);
+  // The drag as of the latest event, ahead of the render that draws it.
+  const dragRef = useRef<TokenDrag | null>(null);
   // Whether the table has been sent live frames of the current drag that a move or end must close.
   const streaming = useRef(false);
   const dragEnd = useRef(onDragTokensEnd);
@@ -132,9 +141,9 @@ export function MapCanvas({
   const mapWidth = n(active?.width_m, 30);
   const mapHeight = n(active?.height_m, 30);
   const isMovable = (token: RoomToken) => movableTokenIds?.has(token.id) ?? true;
-  // Where the dragged tokens are drawn, streamed to the table and dropped. Free, they stay under the pointer, to the
-  // hundredth of a meter the server stores; with Shift the grabbed token snaps to the grid and the rest keep their offsets to it.
-  function dragPositions(tokenDrag: TokenDrag, pointer: Point, snap: boolean) {
+  // Where the dragged tokens head for, ignoring structures. Free, the grabbed one stays under the pointer, to the
+  // hundredth of a meter the server stores; with Shift it snaps to the grid. The rest keep their offsets to it.
+  function dragTargets(tokenDrag: TokenDrag, pointer: Point, snap: boolean) {
     if (!snap) {
       return new Map([...followPositions(tokenDrag, pointer)].map(([id, p]) => [id, { x: round(p.x), y: round(p.y) }]));
     }
@@ -171,6 +180,26 @@ export function MapCanvas({
         : clampTokenCenter({ x: n(token.x_m) + dx, y: n(token.y_m) + dy }, n(token.size_m, 1), mapWidth, mapHeight),
     ]));
   }
+  // Moves the drag to the pointer. Once it counts as a drag, each token walks toward its target and stops at
+  // movement-blocking structures, sliding along them, so it never jumps through a wall.
+  function advanceDrag(tokenDrag: TokenDrag, pointer: Point, snap: boolean, moved: boolean): TokenDrag {
+    const next = { ...tokenDrag, current: pointer, snap, moved };
+    if (!moved) return next;
+    const barriers = movementBarriers(state.structures);
+    const targets = dragTargets(next, pointer, snap);
+    const at = new Map(tokenDrag.at);
+    const paths = new Map(tokenDrag.paths);
+    tokenDrag.tokens.forEach((token) => {
+      const size = n(token.size_m, 1);
+      const route = walkToken(at.get(token.id)!, targets.get(token.id)!, size / 2, barriers, (point) => clampTokenCenter(point, size, mapWidth, mapHeight));
+      if (route.length === 0) return;
+      const path = [...paths.get(token.id)!];
+      route.forEach((point) => extendPath(path, point, barriers));
+      at.set(token.id, route[route.length - 1]);
+      paths.set(token.id, path);
+    });
+    return { ...next, at, paths };
+  }
   useEffect(() => {
     const c = ref.current;
     if (!c) return;
@@ -197,7 +226,7 @@ export function MapCanvas({
       ctx.stroke();
     }
     // Tokens being dragged here or by someone else at the table are drawn, and see, from where they are now.
-    const positions = drag?.moved ? dragPositions(drag, drag.current, drag.snap) : undefined;
+    const positions = drag?.moved ? drag.at : undefined;
     const livePosition = (token: RoomToken) => positions?.get(token.id) ?? remoteDragPositions?.get(token.id) ?? tokenCenter(token);
     drawStructures(ctx, state.structures, scale, selectedStructureId, structureDrag);
     if (state.visibility?.fog) {
@@ -228,19 +257,6 @@ export function MapCanvas({
       });
       fog.globalCompositeOperation = "source-over";
       ctx.drawImage(layer, 0, 0);
-    }
-    if (drag?.moved) {
-      // Dashed outlines mark where the dragged tokens started.
-      ctx.strokeStyle = "#80738e";
-      ctx.lineWidth = 2;
-      ctx.setLineDash([5, 5]);
-      drag.tokens.forEach((token) => {
-        const center = toCanvas(tokenCenter(token));
-        ctx.beginPath();
-        ctx.arc(center.x, center.y, (n(token.size_m, 1) * scale) / 2, 0, Math.PI * 2);
-        ctx.stroke();
-      });
-      ctx.setLineDash([]);
     }
     state.visibleTokens.forEach((t) => {
       const image = t.image_asset_id ? images.current.get(t.image_asset_id) : undefined;
@@ -392,24 +408,42 @@ export function MapCanvas({
     streaming.current = false;
     dragEnd.current?.();
   }
+  function updateDrag(next: TokenDrag | null) {
+    dragRef.current = next;
+    setDrag(next);
+  }
   function streamDrag(tokenDrag: TokenDrag) {
     if (!tokenDrag.moved || !onDragTokens) return;
-    const at = dragPositions(tokenDrag, tokenDrag.current, tokenDrag.snap);
     streaming.current = true;
-    onDragTokens(tokenDrag.tokens.map((token) => ({ tokenId: token.id, to: at.get(token.id)! })));
+    onDragTokens(tokenDrag.tokens.map((token) => ({ tokenId: token.id, to: tokenDrag.at.get(token.id)! })));
+  }
+  // However the drag ends, a release, Escape or a lost pointer, the tokens stay where they walked to.
+  function dropTokens(tokenDrag: TokenDrag) {
+    updateDrag(null);
+    const moves = tokenDrag.tokens.map((token) => ({ tokenId: token.id, to: tokenDrag.at.get(token.id)!, path: tokenDrag.paths.get(token.id)! }));
+    const walked = tokenDrag.moved && moves.some(({ to, path }) => to.x !== path[0].x || to.y !== path[0].y);
+    if (walked && moves.length === 1 && onMoveToken) onMoveToken(moves[0].tokenId, moves[0].to, moves[0].path);
+    else if (walked && moves.length > 1 && onMoveTokens) onMoveTokens(moves);
+    else {
+      endStreaming();
+      return;
+    }
+    // The move itself closes the live drag for the table.
+    streaming.current = false;
   }
   // Pressing or releasing Shift mid-drag snaps or frees the tokens without waiting for the pointer to move.
   function setDragSnap(snap: boolean) {
-    if (!drag || drag.snap === snap) return;
-    const next = { ...drag, snap };
-    setDrag(next);
+    const current = dragRef.current;
+    if (!current || current.snap === snap) return;
+    const next = advanceDrag(current, current.current, snap, current.moved);
+    updateDrag(next);
     streamDrag(next);
   }
   function cancelPointerAction() {
+    if (dragRef.current) dropTokens(dragRef.current);
     endStreaming();
     rightGesture.current = null;
     pointerActive.current = false;
-    setDrag(null);
     setMarquee(null);
     setStructureDrag(null);
     setRuler(null);
@@ -419,9 +453,15 @@ export function MapCanvas({
     cancelPointerAction();
     event.currentTarget.style.cursor = "default";
   }
+  // Window blur drops a drag with this render's props and structures.
+  const cancelLatest = useRef(cancelPointerAction);
   useEffect(() => {
-    window.addEventListener("blur", cancelPointerAction);
-    return () => window.removeEventListener("blur", cancelPointerAction);
+    cancelLatest.current = cancelPointerAction;
+  });
+  useEffect(() => {
+    const cancel = () => cancelLatest.current();
+    window.addEventListener("blur", cancel);
+    return () => window.removeEventListener("blur", cancel);
   }, []);
   return (
     <div className="relative min-w-0">
@@ -430,7 +470,7 @@ export function MapCanvas({
         className="block h-auto w-full max-w-full touch-none rounded-xl border border-[var(--paper)]/15 bg-[var(--surface)] focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)]"
         role="img"
         tabIndex={0}
-        aria-label="Interactive tabletop map. Drag a structure to move it. Drag the round handle above the selected structure to rotate it; hold Shift to snap rotation to 15 degrees. Drag a token to move it freely; hold Shift to snap it to the grid when dropped. Everyone at the table sees it move. Drag across empty space to select several tokens, then drag one of them to move the group. Click a token you control without dragging to choose an attack, then click a target. Hold the right mouse button and drag to measure distance; release to hide the ruler. Press Escape to cancel a drag. While placing a structure, click the map to place it; press Escape to stop."
+        aria-label="Interactive tabletop map. Drag a structure to move it. Drag the round handle above the selected structure to rotate it; hold Shift to snap rotation to 15 degrees. Drag a token to move it freely; hold Shift to snap it to the grid when dropped. Everyone at the table sees it move. Walls stop it and it slides along them; it stays wherever the drag ends. Drag across empty space to select several tokens, then drag one of them to move the group. Click a token you control without dragging to choose an attack, then click a target. Hold the right mouse button and drag to measure distance; release to hide the ruler. Press Escape to end a drag where the token is. While placing a structure, click the map to place it; press Escape to stop."
         onContextMenu={(event) => event.preventDefault()}
         onPointerDown={(event) => {
           if ((event.button !== 0 && event.button !== 2) || pointerActive.current) return;
@@ -485,8 +525,9 @@ export function MapCanvas({
             const tokens = group
               ? state.visibleTokens.filter((candidate) => group.includes(candidate.id) && isMovable(candidate))
               : [token];
-            const from = tokenCenter(token);
-            setDrag({
+            const at = new Map(tokens.map((candidate) => [candidate.id, tokenCenter(candidate)]));
+            const from = at.get(token.id)!;
+            updateDrag({
               tokens,
               grabbed: token,
               grabOffset: { x: point.x - from.x, y: point.y - from.y },
@@ -496,6 +537,8 @@ export function MapCanvas({
               clientY: event.clientY,
               moved: false,
               snap: event.shiftKey,
+              at,
+              paths: new Map([...at].map(([id, start]) => [id, [start]])),
             });
             if (!group) onSelect?.({ kind: "tokens", ids: [token.id] });
             return;
@@ -543,9 +586,11 @@ export function MapCanvas({
                 : "default";
             return;
           }
-          if (drag) {
-            const next = { ...drag, current: point, snap: event.shiftKey, moved: drag.moved || Math.hypot(event.clientX - drag.clientX, event.clientY - drag.clientY) >= 4 };
-            setDrag(next);
+          const current = dragRef.current;
+          if (current) {
+            const moved = current.moved || Math.hypot(event.clientX - current.clientX, event.clientY - current.clientY) >= 4;
+            const next = advanceDrag(current, point, event.shiftKey, moved);
+            updateDrag(next);
             streamDrag(next);
             return;
           }
@@ -582,33 +627,20 @@ export function MapCanvas({
             return;
           }
           if (!pointerActive.current) return;
-          if (drag) {
-            let moving = false;
-            if (drag.moved || Math.hypot(event.clientX - drag.clientX, event.clientY - drag.clientY) >= 4) {
-              const positions = dragPositions(drag, eventPoint(event), event.shiftKey);
-              const to = positions.get(drag.grabbed.id)!;
-              if (to.x !== drag.from.x || to.y !== drag.from.y) {
-                if (drag.tokens.length === 1 && onMoveToken) {
-                  onMoveToken(drag.grabbed.id, to, [drag.from, to]);
-                  moving = true;
-                } else if (drag.tokens.length > 1 && onMoveTokens) {
-                  onMoveTokens(drag.tokens.map((token) => ({ tokenId: token.id, to: positions.get(token.id)! })));
-                  moving = true;
-                }
-              }
-            } else {
+          const current = dragRef.current;
+          if (current) {
+            const moved = current.moved || Math.hypot(event.clientX - current.clientX, event.clientY - current.clientY) >= 4;
+            dropTokens(moved ? advanceDrag(current, eventPoint(event), event.shiftKey, true) : current);
+            if (!moved) {
               // A click on one token of a group selects just that token.
-              if (drag.tokens.length > 1) onSelect?.({ kind: "tokens", ids: [drag.grabbed.id] });
+              if (current.tokens.length > 1) onSelect?.({ kind: "tokens", ids: [current.grabbed.id] });
               if (onAttack) {
                 const rect = event.currentTarget.getBoundingClientRect();
-                const firstAttack = drag.grabbed.attacks?.[0];
-                setAttackMenu({ tokenId: drag.grabbed.id, x: event.clientX - rect.left, y: event.clientY - rect.top });
-                setRangePreview(firstAttack ? { tokenId: drag.grabbed.id, rangeM: firstAttack.range_m } : null);
+                const firstAttack = current.grabbed.attacks?.[0];
+                setAttackMenu({ tokenId: current.grabbed.id, x: event.clientX - rect.left, y: event.clientY - rect.top });
+                setRangePreview(firstAttack ? { tokenId: current.grabbed.id, rangeM: firstAttack.range_m } : null);
               }
             }
-            // The move itself closes the live drag for the table; anything else ends it here.
-            if (moving) streaming.current = false;
-            else endStreaming();
           } else if (marquee) {
             if (marquee.moved || Math.hypot(event.clientX - marquee.clientX, event.clientY - marquee.clientY) >= 4) {
               const to = eventPoint(event);
@@ -628,7 +660,7 @@ export function MapCanvas({
             onMoveStructure?.(structureDrag.structure.id, structureDrag.currentGeometry);
           }
           pointerActive.current = false;
-          setDrag(null);
+          updateDrag(null);
           setMarquee(null);
           setStructureDrag(null);
           event.currentTarget.style.cursor = placingKind ? "crosshair" : "default";
