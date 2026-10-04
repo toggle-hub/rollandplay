@@ -44,7 +44,7 @@ type TokenDrag = {
   clientX: number;
   clientY: number;
   moved: boolean;
-  /** Shift is held, so the drop snaps to the grid. */
+  /** Shift is held, so the dragged tokens snap to the grid. */
   snap: boolean;
 };
 type Marquee = { from: Point; to: Point; clientX: number; clientY: number; moved: boolean };
@@ -132,9 +132,9 @@ export function MapCanvas({
   const mapWidth = n(active?.width_m, 30);
   const mapHeight = n(active?.height_m, 30);
   const isMovable = (token: RoomToken) => movableTokenIds?.has(token.id) ?? true;
-  // Where each dragged token lands. A free drop stays where the token is drawn, to the hundredth of a meter the
-  // server stores; with Shift the grabbed token snaps to the grid and the rest keep their offsets to it.
-  function landingPositions(tokenDrag: TokenDrag, pointer: Point, snap: boolean) {
+  // Where the dragged tokens are drawn, streamed to the table and dropped. Free, they stay under the pointer, to the
+  // hundredth of a meter the server stores; with Shift the grabbed token snaps to the grid and the rest keep their offsets to it.
+  function dragPositions(tokenDrag: TokenDrag, pointer: Point, snap: boolean) {
     if (!snap) {
       return new Map([...followPositions(tokenDrag, pointer)].map(([id, p]) => [id, { x: round(p.x), y: round(p.y) }]));
     }
@@ -154,7 +154,7 @@ export function MapCanvas({
         : clampTokenCenter({ x: n(token.x_m) + dx, y: n(token.y_m) + dy }, n(token.size_m, 1), mapWidth, mapHeight),
     ]));
   }
-  // Where each dragged token is drawn mid-drag: the grabbed token stays under the pointer and the rest keep their offsets to it.
+  // Free drag positions: the grabbed token stays under the pointer and the rest keep their offsets to it.
   function followPositions(tokenDrag: TokenDrag, pointer: Point) {
     const lead = clampTokenCenter(
       { x: pointer.x - tokenDrag.grabOffset.x, y: pointer.y - tokenDrag.grabOffset.y },
@@ -197,7 +197,7 @@ export function MapCanvas({
       ctx.stroke();
     }
     // Tokens being dragged here or by someone else at the table are drawn, and see, from where they are now.
-    const positions = drag?.moved ? followPositions(drag, drag.current) : undefined;
+    const positions = drag?.moved ? dragPositions(drag, drag.current, drag.snap) : undefined;
     const livePosition = (token: RoomToken) => positions?.get(token.id) ?? remoteDragPositions?.get(token.id) ?? tokenCenter(token);
     drawStructures(ctx, state.structures, scale, selectedStructureId, structureDrag);
     if (state.visibility?.fog) {
@@ -241,20 +241,6 @@ export function MapCanvas({
         ctx.stroke();
       });
       ctx.setLineDash([]);
-      if (drag.snap) {
-        // Dashed lavender ghosts mark the cells the dragged tokens snap to when dropped.
-        const landing = landingPositions(drag, drag.current, true);
-        ctx.strokeStyle = "#be8cff";
-        ctx.lineWidth = 2;
-        ctx.setLineDash([4, 4]);
-        drag.tokens.forEach((token) => {
-          const center = toCanvas(landing.get(token.id)!);
-          ctx.beginPath();
-          ctx.arc(center.x, center.y, (n(token.size_m, 1) * scale) / 2, 0, Math.PI * 2);
-          ctx.stroke();
-        });
-        ctx.setLineDash([]);
-      }
     }
     state.visibleTokens.forEach((t) => {
       const image = t.image_asset_id ? images.current.get(t.image_asset_id) : undefined;
@@ -406,9 +392,18 @@ export function MapCanvas({
     streaming.current = false;
     dragEnd.current?.();
   }
-  // Pressing or releasing Shift mid-drag toggles grid snapping without waiting for the pointer to move.
+  function streamDrag(tokenDrag: TokenDrag) {
+    if (!tokenDrag.moved || !onDragTokens) return;
+    const at = dragPositions(tokenDrag, tokenDrag.current, tokenDrag.snap);
+    streaming.current = true;
+    onDragTokens(tokenDrag.tokens.map((token) => ({ tokenId: token.id, to: at.get(token.id)! })));
+  }
+  // Pressing or releasing Shift mid-drag snaps or frees the tokens without waiting for the pointer to move.
   function setDragSnap(snap: boolean) {
-    setDrag((current) => current && current.snap !== snap ? { ...current, snap } : current);
+    if (!drag || drag.snap === snap) return;
+    const next = { ...drag, snap };
+    setDrag(next);
+    streamDrag(next);
   }
   function cancelPointerAction() {
     endStreaming();
@@ -551,11 +546,7 @@ export function MapCanvas({
           if (drag) {
             const next = { ...drag, current: point, snap: event.shiftKey, moved: drag.moved || Math.hypot(event.clientX - drag.clientX, event.clientY - drag.clientY) >= 4 };
             setDrag(next);
-            if (next.moved && onDragTokens) {
-              const follow = followPositions(next, point);
-              streaming.current = true;
-              onDragTokens(next.tokens.map((token) => ({ tokenId: token.id, to: follow.get(token.id)! })));
-            }
+            streamDrag(next);
             return;
           }
           if (marquee) {
@@ -594,7 +585,7 @@ export function MapCanvas({
           if (drag) {
             let moving = false;
             if (drag.moved || Math.hypot(event.clientX - drag.clientX, event.clientY - drag.clientY) >= 4) {
-              const positions = landingPositions(drag, eventPoint(event), event.shiftKey);
+              const positions = dragPositions(drag, eventPoint(event), event.shiftKey);
               const to = positions.get(drag.grabbed.id)!;
               if (to.x !== drag.from.x || to.y !== drag.from.y) {
                 if (drag.tokens.length === 1 && onMoveToken) {

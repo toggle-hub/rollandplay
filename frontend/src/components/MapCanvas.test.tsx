@@ -277,7 +277,7 @@ describe("MapCanvas", () => {
       fireEvent.pointerMove(canvas, { clientX: 216, clientY: 144 });
       expect(onDragTokens).toHaveBeenLastCalledWith([{ tokenId: "token", to: { x: 3, y: 2 } }]);
       expect(arc).toHaveBeenCalledWith(72, 48, 12, 0, Math.PI * 2);
-      // No landing ghost without Shift.
+      // Not snapped without Shift.
       expect(arc).not.toHaveBeenCalledWith(84, 60, 12, 0, Math.PI * 2);
       fireEvent.pointerUp(canvas, { clientX: 217, clientY: 145 });
       expect(onMoveToken).toHaveBeenCalledExactlyOnceWith("token", { x: 3.01, y: 2.01 }, [{ x: 1, y: 1 }, { x: 3.01, y: 2.01 }]);
@@ -285,18 +285,22 @@ describe("MapCanvas", () => {
       expect(onDragTokensEnd).not.toHaveBeenCalled();
     });
 
-    it("ghosts the landing cell while Shift is held and snaps the token to it on drop", () => {
-      const { canvas, onMoveToken } = renderDrag();
+    it("draws and streams the token snapped to the grid while Shift is held, and drops it there", () => {
+      const { canvas, onDragTokens, onMoveToken } = renderDrag();
       const arc = globalThis.__canvasContext.arc;
       fireEvent.pointerDown(canvas, { clientX: 72, clientY: 72, button: 0 });
       fireEvent.pointerMove(canvas, { clientX: 216, clientY: 144 });
       arc.mockClear();
-      // Pressing Shift shows the ghost at once, without moving the pointer.
+      // Pressing Shift snaps the token at once, without moving the pointer, and the table sees it snap too.
       fireEvent.keyDown(canvas, { key: "Shift", shiftKey: true });
       expect(arc).toHaveBeenCalledWith(84, 60, 12, 0, Math.PI * 2);
+      expect(arc).not.toHaveBeenCalledWith(72, 48, 12, 0, Math.PI * 2);
+      expect(onDragTokens).toHaveBeenLastCalledWith([{ tokenId: "token", to: { x: 3.5, y: 2.5 } }]);
       arc.mockClear();
       fireEvent.keyUp(canvas, { key: "Shift" });
+      expect(arc).toHaveBeenCalledWith(72, 48, 12, 0, Math.PI * 2);
       expect(arc).not.toHaveBeenCalledWith(84, 60, 12, 0, Math.PI * 2);
+      expect(onDragTokens).toHaveBeenLastCalledWith([{ tokenId: "token", to: { x: 3, y: 2 } }]);
       fireEvent.pointerUp(canvas, { clientX: 216, clientY: 144, shiftKey: true });
       expect(onMoveToken).toHaveBeenCalledExactlyOnceWith("token", { x: 3.5, y: 2.5 }, [{ x: 1, y: 1 }, { x: 3.5, y: 2.5 }]);
     });
