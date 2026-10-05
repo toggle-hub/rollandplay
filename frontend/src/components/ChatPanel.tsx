@@ -31,7 +31,7 @@ export function ChatPanel({ messages, members, isDM, onSend }: Props) {
     try { onSend(text, isDM ? recipients : [], roll.trim() || undefined); setText(""); setRoll(""); }
     catch (err) { setError(err instanceof Error ? err.message : "Could not send your message."); }
   }
-  return <section className="flex min-w-0 flex-col overflow-hidden rounded-xl border border-[var(--line)] bg-[var(--surface)]" aria-labelledby="chat-heading">
+  return <section className="flex h-full min-h-0 min-w-0 flex-col overflow-hidden rounded-xl border border-[var(--line)] bg-[var(--surface)]" aria-labelledby="chat-heading">
     <header className="flex items-center gap-3 border-b border-[var(--line)] px-4 py-4">
       <span className="grid size-9 shrink-0 place-items-center rounded-lg bg-[var(--purple)]/15 text-[var(--purple)]"><ChatCircle size={20} weight="duotone" aria-hidden="true" /></span>
       <div>
@@ -39,7 +39,7 @@ export function ChatPanel({ messages, members, isDM, onSend }: Props) {
         <p className="mb-0 mt-0.5 text-xs text-[var(--muted)]">The story between the rolls.</p>
       </div>
     </header>
-    <div ref={feedRef} role="log" aria-label="Room messages" aria-live="polite" aria-relevant="additions" tabIndex={0} className="h-80 max-h-[50dvh] min-h-48 space-y-4 overflow-y-auto overscroll-contain p-4">
+    <div ref={feedRef} role="log" aria-label="Room messages" aria-live="polite" aria-relevant="additions" tabIndex={0} className="min-h-48 flex-1 space-y-4 overflow-y-auto overscroll-contain p-4">
       {messages.length === 0 && <div className="flex h-full flex-col items-center justify-center px-2 text-center">
         <ChatCircle size={32} weight="light" className="mb-3 text-[var(--lavender)]" aria-hidden="true" />
         <p className="mb-1 text-sm text-[var(--paper)]">The table is quiet.</p>

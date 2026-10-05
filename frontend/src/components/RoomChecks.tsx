@@ -7,16 +7,19 @@ type Props = {
   members: RoomMember[];
   currentUserId?: string;
   isDM: boolean;
+  /** A compact strip above the map instead of the full panel, for the checks waiting on this player. */
+  pinned?: boolean;
   /** Rolls for the current user, or for `userId` when a game master rolls on a player's behalf. */
   onRoll: (checkId: string, userId?: string) => void;
   onClose: (checkId: string) => void;
 };
 
 /** Checks the game master prompted: open ones can be rolled, closed ones keep each player's outcome. */
-export function RoomChecks({ checks, members, currentUserId, isDM, onRoll, onClose }: Props) {
+export function RoomChecks({ checks, members, currentUserId, isDM, pinned = false, onRoll, onClose }: Props) {
   if (checks.length === 0) return null;
-  return <section className="card space-y-4" aria-labelledby="room-checks-heading">
-    <h2 id="room-checks-heading" className="flex items-center gap-2 text-xl"><DiceFive size={22} className="text-[var(--accent)]" aria-hidden="true" />Checks</h2>
+  const headingId = pinned ? "pinned-checks-heading" : "room-checks-heading";
+  return <section className={pinned ? "space-y-2 rounded-lg border border-[var(--accent)]/40 bg-[var(--accent)]/10 px-3 py-2" : "card space-y-4"} aria-labelledby={headingId}>
+    <h2 id={headingId} className={pinned ? "mb-0 flex items-center gap-2 text-sm font-medium text-[var(--lavender)]" : "flex items-center gap-2 text-xl"}><DiceFive size={pinned ? 16 : 22} className="text-[var(--accent)]" aria-hidden="true" />{pinned ? "Your roll is waiting" : "Checks"}</h2>
     <ul className="space-y-3">
       {checks.map((check) => {
         const open = !check.closed_at;
@@ -33,7 +36,7 @@ export function RoomChecks({ checks, members, currentUserId, isDM, onRoll, onClo
             </div>
           </div>
           <ul className="space-y-1.5">
-            {check.targets.map((target) => {
+            {check.targets.filter((target) => !pinned || target.user_id === currentUserId).map((target) => {
               const member = members.find((item) => item.user_id === target.user_id);
               const name = playerLabel(member ? { id: member.user_id, username: member.username, pronouns: member.pronouns } : null);
               const isMe = target.user_id === currentUserId;

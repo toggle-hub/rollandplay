@@ -756,6 +756,9 @@ func TestRoomInviteCarriesRuleBookAndPlayerChoosesMatchingSheet(t *testing.T) {
 		t.Fatalf("private rule book leaked to a non-member: status %d", status)
 	}
 	sheet := post[map[string]any](t, player, a.server.URL, "/api/sheets", map[string]any{"rule_book_id": private["id"], "name": "Housed", "data": map[string]any{}})
+	dmRoom := dialWS(t, a, dm, roomID)
+	defer dmRoom.Close()
+	readType(t, dmRoom, "state.snapshot")
 
 	memberPath := "/api/rooms/" + roomID + "/members/" + pu["id"].(string)
 	if status := statusOf(t, player, "PATCH", a.server.URL+memberPath, map[string]any{"sheet_id": otherSheet["id"]}); status != 400 {
@@ -771,6 +774,10 @@ func TestRoomInviteCarriesRuleBookAndPlayerChoosesMatchingSheet(t *testing.T) {
 	chosen := patch[map[string]any](t, player, a.server.URL, memberPath, map[string]any{"sheet_id": sheet["id"]})
 	if chosen["sheet_id"] != sheet["id"] || chosen["is_dm"] != false {
 		t.Fatalf("player should choose their own matching character: %+v", chosen)
+	}
+	// The table hears about the new character, so the game master can prompt checks for it right away.
+	if ev := readType(t, dmRoom, "member.updated"); ev["body"].(map[string]any)["user_id"] != pu["id"] {
+		t.Fatalf("choosing a character should tell the table: %+v", ev)
 	}
 	cleared := patch[map[string]any](t, player, a.server.URL, memberPath, map[string]any{"sheet_id": nil})
 	if cleared["sheet_id"] != nil {
