@@ -226,10 +226,21 @@ export type RoomToken = {
   death_saves?: DeathSaves;
   /** Same visibility as health. */
   defenses?: TokenDefenses;
+  /** Same visibility as health. */
+  temporary_hit_points?: number;
+  /** Everyone at the table sees conditions: 5e condition keys such as "prone", or the game master's own words. */
+  conditions?: string[];
+  /** Everyone at the table sees whether a token is down, stable at 0 HP, or dead, but not its HP. */
+  status?: TokenStatus;
+  /** Whose token this is for the viewer: their own, another player's, or one only the game master controls. */
+  side?: TokenSide;
 };
+export type TokenStatus = "down" | "stable" | "dead";
+export type TokenSide = "own" | "party" | "npc";
 export type TokenPatch = {
   hit_points?: number;
   max_hit_points?: number;
+  temporary_hit_points?: number;
   vision_range_m?: number;
   mover_user_ids?: string[];
   /** null clears the image. */
@@ -238,6 +249,12 @@ export type TokenPatch = {
   resistances?: string[];
   immunities?: string[];
   vulnerabilities?: string[];
+  /** Sheet-backed tokens only; three failures mark the character dead, fewer bring it back. */
+  death_save_successes?: number;
+  death_save_failures?: number;
+  stable?: boolean;
+  /** The owner or the game master; replaces the whole list. */
+  conditions?: string[];
 };
 export type RollResult = {
   expression: string;

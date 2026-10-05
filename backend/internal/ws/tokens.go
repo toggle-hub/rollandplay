@@ -11,14 +11,17 @@ import (
 )
 
 // TokenSelectSQL selects room tokens in the column order ScanToken reads; callers append the where clause.
-const TokenSelectSQL = `select rt.id::text,coalesce(rt.owner_user_id::text,''),rt.name,rt.x_m::float8,rt.y_m::float8,rt.rotation_deg::float8,rt.size_m::float8,rt.vision_range_m::float8,rt.is_hidden,rt.attributes,coalesce(rt.sheet_id::text,''),coalesce(s.user_id::text,''),coalesce(s.data,rt.attributes),coalesce(rt.image_asset_id::text,''),coalesce((select array_agg(m.user_id::text order by m.user_id) from room_token_movers m where m.token_id=rt.id),'{}'::text[]) from room_tokens rt join room_maps rm on rm.id=rt.room_map_id left join sheets s on s.id=rt.sheet_id`
+const TokenSelectSQL = `select rt.id::text,coalesce(rt.owner_user_id::text,''),rt.name,rt.x_m::float8,rt.y_m::float8,rt.rotation_deg::float8,rt.size_m::float8,rt.vision_range_m::float8,rt.is_hidden,rt.attributes,coalesce(rt.sheet_id::text,''),coalesce(s.user_id::text,''),coalesce(s.data,rt.attributes),coalesce(rt.image_asset_id::text,''),coalesce((select array_agg(m.user_id::text order by m.user_id) from room_token_movers m where m.token_id=rt.id),'{}'::text[]),rt.conditions from room_tokens rt join room_maps rm on rm.id=rt.room_map_id left join sheets s on s.id=rt.sheet_id`
 
 // ScanToken reads one row selected with TokenSelectSQL.
 func ScanToken(row pgx.Row) (game.Token, error) {
 	var t game.Token
 	var attrs, stats []byte
-	if err := row.Scan(&t.ID, &t.OwnerUserID, &t.Name, &t.X, &t.Y, &t.RotationDeg, &t.SizeM, &t.VisionRangeM, &t.IsHidden, &attrs, &t.SheetID, &t.SheetOwnerUserID, &stats, &t.ImageAssetID, &t.MoverUserIDs); err != nil {
+	if err := row.Scan(&t.ID, &t.OwnerUserID, &t.Name, &t.X, &t.Y, &t.RotationDeg, &t.SizeM, &t.VisionRangeM, &t.IsHidden, &attrs, &t.SheetID, &t.SheetOwnerUserID, &stats, &t.ImageAssetID, &t.MoverUserIDs, &t.Conditions); err != nil {
 		return t, err
+	}
+	if t.Conditions == nil {
+		t.Conditions = []string{}
 	}
 	// Separate decodes keep Attributes and Stats unaliased for sheetless tokens.
 	_ = json.Unmarshal(attrs, &t.Attributes)
@@ -42,4 +45,13 @@ func LoadActiveTokens(ctx context.Context, pool *pgxpool.Pool, roomID string) ([
 		out = append(out, t)
 	}
 	return out, rows.Err()
+}
+
+// RoomGameMasters lists the room's game masters, which decides whose tokens are NPCs.
+func RoomGameMasters(ctx context.Context, pool *pgxpool.Pool, roomID string) ([]string, error) {
+	rows, err := pool.Query(ctx, `select user_id::text from room_members where room_id=$1 and is_dm`, roomID)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, pgx.RowTo[string])
 }
