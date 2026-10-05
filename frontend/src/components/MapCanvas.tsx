@@ -7,6 +7,7 @@ import { geometryCenter, rotateGeometry, type Point } from "../lib/geometryTrans
 import { structureLabel, templateGeometry } from "../lib/structures";
 import { extendPath, movementBarriers, walkToken } from "../lib/movement";
 import { clampTokenCenter, snapTokenCenter } from "../lib/tokenGrid";
+import { drawToken, drawTokenLabels } from "../lib/tokenDrawing";
 import { castVision } from "../lib/vision";
 import { ActionConfirmCard } from "./ActionConfirmCard";
 import { TokenActionWheel } from "./TokenActionWheel";
@@ -279,6 +280,7 @@ export function MapCanvas({
       const image = t.image_asset_id ? images.current.get(t.image_asset_id) : undefined;
       drawToken(ctx, t, livePosition(t), scale, !!selectedTokenIds?.includes(t.id), image);
     });
+    state.visibleTokens.forEach((t) => drawTokenLabels(ctx, t, livePosition(t), scale, !!selectedTokenIds?.includes(t.id)));
     const framed = canMoveStructures ? structureDrag?.structure ?? selectedStructure : undefined;
     if (framed) {
       const frame = structureDrag?.action === "rotate"
@@ -905,56 +907,6 @@ function drawTransformFrame(ctx: CanvasRenderingContext2D, frame: TransformFrame
   ctx.arc(frame.handle.x * scale, frame.handle.y * scale, rotationHandleRadiusPx, 0, Math.PI * 2);
   ctx.fill();
   ctx.stroke();
-}
-function drawToken(
-  ctx: CanvasRenderingContext2D,
-  t: RoomToken,
-  center: Point,
-  scale: number,
-  selected: boolean,
-  image?: HTMLImageElement,
-) {
-  const cx = center.x * scale;
-  const cy = center.y * scale;
-  const r = (n(t.size_m, 1) * scale) / 2;
-  if (image?.complete && image.naturalWidth > 0) {
-    // Center-crop the image to a square and clip it to the token's circle.
-    const side = Math.min(image.naturalWidth, image.naturalHeight);
-    ctx.save();
-    ctx.beginPath();
-    ctx.arc(cx, cy, r, 0, Math.PI * 2);
-    ctx.clip();
-    ctx.drawImage(image, (image.naturalWidth - side) / 2, (image.naturalHeight - side) / 2, side, side, cx - r, cy - r, 2 * r, 2 * r);
-    ctx.restore();
-    if (t.is_hidden) {
-      ctx.fillStyle = "rgba(128,115,142,.5)";
-      ctx.beginPath();
-      ctx.arc(cx, cy, r, 0, Math.PI * 2);
-      ctx.fill();
-    }
-    ctx.strokeStyle = selected ? "#f6effa" : t.is_hidden ? "#80738e" : "#be8cff";
-    ctx.lineWidth = selected ? 3 : 2;
-    ctx.beginPath();
-    ctx.arc(cx, cy, r, 0, Math.PI * 2);
-    ctx.stroke();
-  } else {
-    ctx.fillStyle = t.is_hidden ? "#80738e" : selected ? "#f6effa" : "#be8cff";
-    ctx.beginPath();
-    ctx.arc(cx, cy, r, 0, Math.PI * 2);
-    ctx.fill();
-  }
-  ctx.fillStyle = t.is_hidden ? "#b8adc4" : "#f6effa";
-  ctx.fillText(`${t.name}${t.is_hidden ? " (hidden)" : ""}`, cx + 8, cy);
-  if (t.max_hit_points !== undefined && t.max_hit_points > 0 && t.hit_points !== undefined) {
-    const width = Math.max(2 * r, 24);
-    const left = cx - width / 2;
-    const top = cy + r + 3;
-    const ratio = Math.min(1, Math.max(0, t.hit_points / t.max_hit_points));
-    ctx.fillStyle = "#40364c";
-    ctx.fillRect(left, top, width, 4);
-    ctx.fillStyle = ratio > 0.5 ? "#d9ffb5" : ratio > 0.25 ? "#ffb887" : "#ffa9a9";
-    ctx.fillRect(left, top, width * ratio, 4);
-  }
 }
 function hitsStructure(structure: MapStructure, point: Point) {
   const geometry = structure.geometry;

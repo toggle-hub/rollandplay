@@ -41,8 +41,12 @@ type Token struct {
 	CanMove          bool             `json:"can_move,omitempty"`       // per viewer
 	HitPoints        *int             `json:"hit_points,omitempty"`     // per viewer: DM, owner, sheet owner
 	MaxHitPoints     *int             `json:"max_hit_points,omitempty"`
-	DeathSaves       *DeathSaves      `json:"death_saves,omitempty"` // same viewers as health, sheet-backed only
-	Defenses         *Defenses        `json:"defenses,omitempty"`    // same viewers as health
+	DeathSaves       *DeathSaves      `json:"death_saves,omitempty"`          // same viewers as health, sheet-backed only
+	Defenses         *Defenses        `json:"defenses,omitempty"`             // same viewers as health
+	TempHitPoints    *int             `json:"temporary_hit_points,omitempty"` // same viewers as health
+	Conditions       []string         `json:"conditions"`                     // everyone at the table
+	Status           string           `json:"status,omitempty"`               // everyone: down|stable|dead, never HP numbers
+	Side             string           `json:"side,omitempty"`                 // per viewer: own|party|npc
 }
 
 // MovableBy reports whether userID may move the token: its owner, the game master,

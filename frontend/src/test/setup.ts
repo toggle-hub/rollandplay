@@ -23,6 +23,7 @@ const canvasContext = {
   clip: vi.fn(),
   rect: vi.fn(),
   drawImage: vi.fn(),
+  measureText: vi.fn((text: string) => ({ width: text.length * 6 })),
 };
 Object.defineProperty(globalThis, "__canvasContext", { value: canvasContext });
 Object.defineProperty(HTMLCanvasElement.prototype, "getContext", {

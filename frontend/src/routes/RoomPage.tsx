@@ -11,6 +11,7 @@ import { RoomChecks } from "../components/RoomChecks";
 import { PlayerName } from "../components/PlayerName";
 import { ActionsEditor } from "../components/ActionsEditor";
 import { TokenSettingsPanel } from "../components/TokenSettingsPanel";
+import { CharacterStatusCard } from "../components/CharacterStatusCard";
 import { RoomInvitePanel } from "../components/RoomInvitePanel";
 import { useToast } from "../components/Toast";
 import { defaultBlocksForKind, structureTypes, type StructureBlocks } from "../lib/structures";
@@ -129,7 +130,7 @@ export function RoomPage() {
           const results = roll.action.targets.map((target) => ({ id: `${message.id}:${target.token_id}`, tokenId: target.token_id, ...floatText(target) }));
           const ids = results.map((result) => result.id);
           setFloats((current) => [...current, ...results]);
-          window.setTimeout(() => setFloats((current) => current.filter((result) => !ids.includes(result.id))), 1800);
+          window.setTimeout(() => setFloats((current) => current.filter((result) => !ids.includes(result.id))), 3000);
           void load();
         }
       }
@@ -329,10 +330,12 @@ export function RoomPage() {
             setToolsOpen(false);
             toolsToggleRef.current?.focus();
           }}>Close tools</button>
-        {settingsToken && <TokenSettingsPanel key={settingsToken.id} token={settingsToken} isDM={isDM} canEditImage={canManageSelectedToken} members={members} busy={busy}
+        {state.activeMap && <CharacterStatusCard tokens={state.visibleTokens} selectedTokenIds={selectedTokens.map((token) => token.id)} isDM={isDM} onSend={sendMap} />}
+        {settingsToken && <TokenSettingsPanel key={settingsToken.id} token={settingsToken} isDM={isDM} canManage={canManageSelectedToken} members={members} busy={busy}
           onSave={(patch) => void update(() => patchToken(settingsToken.id, patch))}
           onUploadImage={(file) => uploadTokenImage(settingsToken.id, file)}
-          onClearImage={() => void update(() => patchToken(settingsToken.id, { image_asset_id: null }))} />}
+          onClearImage={() => void update(() => patchToken(settingsToken.id, { image_asset_id: null }))}
+          onSend={sendMap} />}
         {isDM && <form className="card space-y-4 p-5!" onSubmit={attachMap}>
           <h2 className="flex items-center gap-2 text-xl"><MapTrifold size={22} className="text-[var(--accent)]" aria-hidden="true" />Room map</h2>
           <p className="text-muted text-sm">Choose one of your maps and make it active at this table.</p>

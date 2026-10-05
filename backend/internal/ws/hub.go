@@ -312,6 +312,10 @@ func (c *client) handle(msg clientEnvelope) {
 		c.tokenRemove(msg)
 	case "token.visibility":
 		c.tokenVisibility(msg)
+	case "token.health":
+		c.tokenHealth(msg)
+	case "token.rest":
+		c.tokenRest(msg)
 	case "structure.move":
 		c.structureMove(msg)
 	case "structure.visibility":
