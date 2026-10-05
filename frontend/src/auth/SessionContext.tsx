@@ -19,26 +19,49 @@ type SessionContextValue = {
 
 const SessionContext = createContext<SessionContextValue | null>(null);
 const destinationKey = "rollandplay:login-destination";
+/** How long a page opened before sign-in is remembered: long enough to open the emailed link. */
+export const destinationTtlMs = 60 * 60 * 1000;
 
 export function localDestination(value: string | null): string | null {
   if (!value || !value.startsWith("/") || value.startsWith("//") || /[\\\s]/.test(value)) return null;
   const url = new URL(value, window.location.origin);
   if (url.origin !== window.location.origin) return null;
-  if (!/^\/(rooms|friends|rule-books|sheets|maps)(\/|$)/.test(url.pathname)) return null;
+  if (!/^\/(rooms|join|friends|rule-books|sheets|maps|profile)(\/|$)/.test(url.pathname)) return null;
   return `${url.pathname}${url.search}${url.hash}`;
 }
 
+/**
+ * Remembers the page to open after sign-in. It is kept in localStorage, so it survives the sign-in
+ * link opening in a new tab, and it expires after `destinationTtlMs`.
+ */
 export function rememberDestination(value: string): void {
   const destination = localDestination(value);
-  if (destination) sessionStorage.setItem(destinationKey, destination);
+  if (!destination) return;
+  try {
+    localStorage.setItem(destinationKey, JSON.stringify({ path: destination, saved_at: Date.now() }));
+  } catch {
+    // Storage can be unavailable (private modes); sign-in then opens the default page.
+  }
 }
 
+/** The page remembered before sign-in, unless it expired; otherwise the Rooms page. */
 export function loginDestination(): string {
-  return localDestination(sessionStorage.getItem(destinationKey)) ?? "/rooms";
+  try {
+    const saved: unknown = JSON.parse(localStorage.getItem(destinationKey) ?? "null");
+    if (!saved || typeof saved !== "object" || !("path" in saved) || !("saved_at" in saved)) return "/rooms";
+    if (typeof saved.path !== "string" || typeof saved.saved_at !== "number" || Date.now() - saved.saved_at > destinationTtlMs) return "/rooms";
+    return localDestination(saved.path) ?? "/rooms";
+  } catch {
+    return "/rooms";
+  }
 }
 
 export function clearDestination(): void {
-  sessionStorage.removeItem(destinationKey);
+  try {
+    localStorage.removeItem(destinationKey);
+  } catch {
+    // Nothing was stored.
+  }
 }
 
 export function SessionProvider({ children }: { children: ReactNode }) {

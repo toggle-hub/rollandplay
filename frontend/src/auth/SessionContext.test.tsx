@@ -3,7 +3,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-libra
 import { MemoryRouter, useLocation } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AppShell } from "../AppShell";
-import { SessionProvider, localDestination, loginDestination, rememberDestination } from "./SessionContext";
+import { SessionProvider, destinationTtlMs, localDestination, loginDestination, rememberDestination } from "./SessionContext";
 
 vi.mock("../routes/LandingPage", () => ({ LandingPage: () => <main>Public story</main> }));
 
@@ -23,7 +23,8 @@ function openApp(path: string, strict = false) {
 
 afterEach(() => {
   cleanup();
-  sessionStorage.clear();
+  localStorage.clear();
+  vi.restoreAllMocks();
   vi.unstubAllGlobals();
 });
 
@@ -45,7 +46,7 @@ describe("session boundary", () => {
     expect(screen.getByRole("link", { name: "Rooms" })).toHaveAttribute("aria-current", "page");
   });
 
-  it.each(["/rooms", "/rooms/private-room?tab=chat#latest", "/friends", "/rule-books", "/sheets", "/maps", "/maps/private-map/edit"])("gates signed-out deep links at %s without fetching protected data", async (path) => {
+  it.each(["/rooms", "/rooms/private-room?tab=chat#latest", "/join/TAVERN42", "/friends", "/rule-books", "/sheets", "/maps", "/maps/private-map/edit", "/profile"])("gates signed-out deep links at %s without fetching protected data", async (path) => {
     const fetchMock = vi.fn().mockResolvedValue(response(401));
     vi.stubGlobal("fetch", fetchMock);
     openApp(path);
@@ -71,23 +72,24 @@ describe("session boundary", () => {
     expect(await screen.findByLabelText("Room name")).toBeInTheDocument();
   });
 
-  it("requires first sign-in profile details before mounting workspace tools", async () => {
+  it("requires first sign-in profile details before mounting workspace tools, with pronouns optional", async () => {
     const incomplete = { ...user, username: "keeper", pronouns: "", profile_complete: false };
-    const complete = { ...user, username: "Keeper", pronouns: "she/her", profile_complete: true };
+    const complete = { ...user, username: "Keeper", pronouns: "", profile_complete: true };
     const fetchMock = vi.fn().mockImplementation((path: string, init?: RequestInit) => {
       if (path === "/api/me" && init?.method === "PATCH") return Promise.resolve(response(200, complete));
       return Promise.resolve(response(200, path === "/api/me" ? incomplete : []));
     });
     vi.stubGlobal("fetch", fetchMock);
     openApp("/rooms");
-    expect(await screen.findByRole("heading", { name: "What should we call you?" })).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { level: 1, name: "What should we call you?" })).toBeInTheDocument();
+    expect(screen.getAllByRole("heading", { level: 1 })).toHaveLength(1);
     expect(screen.queryByLabelText("Room name")).not.toBeInTheDocument();
-    fireEvent.change(screen.getByLabelText("What should we call you?"), { target: { value: "Keeper" } });
-    fireEvent.change(screen.getByLabelText("Pronouns"), { target: { value: "she/her" } });
+    fireEvent.change(screen.getByLabelText("Name"), { target: { value: "Keeper" } });
     fireEvent.click(screen.getByRole("button", { name: /save and continue/i }));
     expect(await screen.findByLabelText("Room name")).toBeInTheDocument();
-    expect(screen.getByText("Keeper (she/her)")).toBeInTheDocument();
-    expect(fetchMock).toHaveBeenCalledWith("/api/me", expect.objectContaining({ method: "PATCH", body: JSON.stringify({ username: "Keeper", pronouns: "she/her" }) }));
+    // Without pronouns, the name shows alone.
+    expect(screen.getByRole("link", { name: "Your profile: Keeper" })).toHaveAttribute("href", "/profile");
+    expect(fetchMock).toHaveBeenCalledWith("/api/me", expect.objectContaining({ method: "PATCH", body: JSON.stringify({ username: "Keeper", pronouns: "" }) }));
   });
 
   it("removes the workspace after a successful sign-out", async () => {
@@ -134,6 +136,38 @@ describe("session boundary", () => {
     expect(loginDestination()).toBe("/rooms");
     await act(async () => { resolveSession(response(401)); });
     expect(screen.getByRole("navigation", { name: "Workspace" })).toBeInTheDocument();
+  });
+
+  it("opens an invite link after signing in from the emailed link in another tab", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(response(401)));
+    openApp("/join/TAVERN42");
+    expect(await screen.findByLabelText("Email address")).toBeInTheDocument();
+    cleanup();
+
+    // The sign-in link opens a new tab: only localStorage carries over.
+    const preview = { room_id: "room-1", name: "The Gilded Tankard", rule_book: { id: "book-1", name: "Tavern Rules" }, requires_password: false, member: null };
+    const fetchMock = vi.fn().mockImplementation((path: string) => {
+      if (path === "/api/me") return Promise.resolve(response(401));
+      if (path === "/api/auth/consume") return Promise.resolve(response(200, { user }));
+      if (path === "/api/invites/TAVERN42") return Promise.resolve(response(200, preview));
+      return Promise.resolve(response(200, []));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    openApp("/auth/consume?token=from-email");
+    expect(await screen.findByRole("region", { name: "Invite details" })).toHaveTextContent("The Gilded Tankard");
+    expect(screen.getByLabelText("Invite code")).toHaveValue("TAVERN42");
+    expect(screen.getByLabelText("Current path")).toHaveTextContent(/^\/rooms$/);
+    expect(loginDestination()).toBe("/rooms");
+  });
+
+  it("forgets a remembered page once it is too old", () => {
+    const now = Date.now();
+    vi.spyOn(Date, "now").mockReturnValue(now);
+    rememberDestination("/join/TAVERN42");
+    vi.spyOn(Date, "now").mockReturnValue(now + destinationTtlMs - 1000);
+    expect(loginDestination()).toBe("/join/TAVERN42");
+    vi.spyOn(Date, "now").mockReturnValue(now + destinationTtlMs + 1000);
+    expect(loginDestination()).toBe("/rooms");
   });
 
   it.each(["https://evil.example/rooms", "//evil.example/rooms", "/\\evil.example/rooms", "/login", "/auth/consume?token=old", "/rooms/../../login"])("rejects an unsafe or non-workspace destination: %s", (path) => {

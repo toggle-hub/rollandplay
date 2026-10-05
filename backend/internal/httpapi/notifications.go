@@ -55,11 +55,13 @@ func (s *Server) handleNotifications(w http.ResponseWriter, r *http.Request) {
 const (
 	minCandidateQuery = 2
 	maxCandidates     = 8
+	maxFriendInvites  = 50
 )
 
-// handleInviteCandidates finds users a game master may invite by username: substring matches,
-// prefix matches first. Members, the caller, users without a finished profile and users blocked
-// either way are left out; `invited` marks users with a pending invitation to the room.
+// handleInviteCandidates finds users a game master may invite. Without `q` it lists the caller's
+// friends; with `q` it matches usernames anywhere, friends first, then prefix matches. Members, the
+// caller, users without a finished profile and users blocked either way are left out; `invited`
+// marks users with a pending invitation to the room and `friend` the caller's friends.
 func (s *Server) handleInviteCandidates(w http.ResponseWriter, r *http.Request) {
 	u, _, ok := s.requireUser(w, r)
 	if !ok {
@@ -70,12 +72,15 @@ func (s *Server) handleInviteCandidates(w http.ResponseWriter, r *http.Request) 
 		WriteError(w, 403, "forbidden", "DM required")
 		return
 	}
+	base := `select jsonb_build_object('id',u.id::text,'username',u.username,'pronouns',u.pronouns,'invited',exists(select 1 from room_invitations i where i.room_id=$1 and i.invitee_user_id=u.id),'friend',u.is_friend) from (select users.*, ` + friendsBetween("users.id", "$2") + ` as is_friend from users) u where u.profile_complete and u.id<>$2 and not exists(select 1 from room_members m where m.room_id=$1 and m.user_id=u.id) and not ` + blockedBetween("u.id", "$2")
 	q := strings.TrimSpace(r.URL.Query().Get("q"))
-	if n := utf8.RuneCountInString(q); n < minCandidateQuery || n > 80 {
-		WriteJSON(w, 200, []json.RawMessage{})
-		return
+	var rows []json.RawMessage
+	var err error
+	if q == "" {
+		rows, err = s.queryJSON(r.Context(), base+` and u.is_friend order by lower(u.username), u.username limit $3`, roomID, u.ID, maxFriendInvites)
+	} else if n := utf8.RuneCountInString(q); n >= minCandidateQuery && n <= 80 {
+		rows, err = s.queryJSON(r.Context(), base+` and strpos(lower(u.username),lower($3))>0 order by u.is_friend desc, strpos(lower(u.username),lower($3))=1 desc, length(u.username), u.username limit $4`, roomID, u.ID, q, maxCandidates)
 	}
-	rows, err := s.queryJSON(r.Context(), `select jsonb_build_object('id',u.id::text,'username',u.username,'pronouns',u.pronouns,'invited',exists(select 1 from room_invitations i where i.room_id=$1 and i.invitee_user_id=u.id)) from users u where u.profile_complete and u.id<>$2 and strpos(lower(u.username),lower($3))>0 and not exists(select 1 from room_members m where m.room_id=$1 and m.user_id=u.id) and not `+blockedBetween("u.id", "$2")+` order by strpos(lower(u.username),lower($3))=1 desc, length(u.username), u.username limit $4`, roomID, u.ID, q, maxCandidates)
 	if rows == nil && err == nil {
 		rows = []json.RawMessage{}
 	}
@@ -150,7 +155,8 @@ func (s *Server) handleRoomInvitationCreate(w http.ResponseWriter, r *http.Reque
 }
 
 // handleRoomInvitationAccept joins the invitee to the room as a player, without the invite code or
-// password, and answers like POST /api/rooms/join.
+// password, and answers like POST /api/rooms/join; like joining with a code, an optional sheet_id
+// seats the invitee with that character.
 func (s *Server) handleRoomInvitationAccept(w http.ResponseWriter, r *http.Request) {
 	u, _, ok := s.requireUser(w, r)
 	if !ok {
@@ -161,6 +167,10 @@ func (s *Server) handleRoomInvitationAccept(w http.ResponseWriter, r *http.Reque
 		WriteError(w, 404, "not_found", "invitation not found")
 		return
 	}
+	var req struct {
+		SheetID string `json:"sheet_id"`
+	}
+	_ = ReadJSON(r, &req)
 	var roomID string
 	err := s.Pool.QueryRow(r.Context(), `select room_id::text from room_invitations where id=$1 and invitee_user_id=$2`, id, u.ID).Scan(&roomID)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -171,7 +181,18 @@ func (s *Server) handleRoomInvitationAccept(w http.ResponseWriter, r *http.Reque
 		WriteError(w, 500, "db", err.Error())
 		return
 	}
-	if _, err := s.Pool.Exec(r.Context(), `insert into room_members(id,room_id,user_id,is_dm) values($1,$2,$3,false) on conflict(room_id,user_id) do nothing`, uuid.New().String(), roomID, u.ID); err != nil {
+	if req.SheetID != "" {
+		valid, err := s.roomSheetAllowed(r.Context(), req.SheetID, roomID, u.ID, false, u.ID)
+		if err != nil {
+			WriteError(w, 500, "db", err.Error())
+			return
+		}
+		if !valid {
+			WriteError(w, 400, "invalid_sheet", "choose a character that uses this room's rule book")
+			return
+		}
+	}
+	if _, err := s.Pool.Exec(r.Context(), `insert into room_members(id,room_id,user_id,is_dm,sheet_id) values($1,$2,$3,false,$4) on conflict(room_id,user_id) do update set sheet_id=coalesce(excluded.sheet_id,room_members.sheet_id)`, uuid.New().String(), roomID, u.ID, nullableLiteral(req.SheetID)); err != nil {
 		WriteError(w, 500, "db", err.Error())
 		return
 	}

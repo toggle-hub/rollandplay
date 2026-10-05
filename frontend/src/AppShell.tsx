@@ -1,7 +1,7 @@
 import { lazy, Suspense, useEffect, useState } from "react";
 import type { ReactNode } from "react";
 import { Link, Navigate, NavLink, Outlet, Route, Routes, useLocation, useNavigate } from "react-router-dom";
-import { ArrowRight, List, SignOut, X } from "@phosphor-icons/react";
+import { ArrowRight, List, SignOut, UserCircle, X } from "@phosphor-icons/react";
 import { Brand } from "./components/Brand";
 import { NotificationsMenu } from "./components/NotificationsMenu";
 import { PlayerName } from "./components/PlayerName";
@@ -15,6 +15,8 @@ import { MapsPage } from "./routes/MapsPage";
 import { MapEditorPage } from "./routes/MapEditorPage";
 import { RuleBooksPage } from "./routes/RuleBooksPage";
 import { SheetsPage } from "./routes/SheetsPage";
+import { JoinPage } from "./routes/JoinPage";
+import { ProfilePage } from "./routes/ProfilePage";
 import { loginDestination, rememberDestination, useSession } from "./auth/SessionContext";
 
 const LandingPage = lazy(() => import("./routes/LandingPage").then((module) => ({ default: module.LandingPage })));
@@ -115,7 +117,11 @@ export function AppShell() {
               ))}
             </nav>
             <div className="flex min-w-0 items-center gap-4">
-              {currentUser && <PlayerName player={currentUser} className="text-muted max-w-52 truncate text-sm" />}
+              {currentUser && <Link to="/profile" className="text-muted flex min-w-0 items-center gap-2 text-sm hover:text-[var(--lavender)]" title="Edit your profile">
+                <UserCircle size={20} aria-hidden="true" className="shrink-0" />
+                <span className="sr-only">Your profile: </span>
+                <PlayerName player={currentUser} className="max-w-52 truncate" />
+              </Link>}
               <button className="btn-secondary whitespace-nowrap" onClick={logout} disabled={signingOut}><SignOut aria-hidden="true" size={18} />{signingOut ? "Signing out…" : "Sign out"}</button>
             </div>
           </div>
@@ -132,11 +138,13 @@ export function AppShell() {
         <Route element={<RequireSession />}>
           <Route element={<Workspace />}>
             <Route path="/rooms" element={<RoomsPage />} />
+            <Route path="/join/:code" element={<JoinPage />} />
             <Route path="/rooms/:roomId" element={<RoomPage />} />
             <Route path="/friends" element={<FriendsPage />} />
             <Route path="/rule-books" element={<RuleBooksPage />} />
             <Route path="/sheets" element={<SheetsPage />} />
             <Route path="/maps" element={<MapsPage />} />
+            <Route path="/profile" element={<ProfilePage />} />
             <Route path="/maps/:mapId/edit" element={<MapEditorPage />} />
           </Route>
         </Route>
