@@ -13,14 +13,16 @@ export const minInviteQuery = 2;
 export const inviteSearchThrottleMs = 300;
 
 /**
- * Game-master card: find players by username, invite them, and withdraw pending invitations.
- * `memberCount` changes when someone joins, which refreshes the pending list and the results.
+ * Game-master card: your friends who aren't at the table yet, one click from an invitation; a
+ * username search for everyone else (friends first); and pending invitations to withdraw.
+ * `memberCount` changes when someone joins, which refreshes the lists.
  */
 export function RoomInvitePanel({ roomId, memberCount }: { roomId: string; memberCount: number }) {
   const [query, setQuery] = useState("");
   const search = useThrottledValue(query.trim(), inviteSearchThrottleMs);
   // Results with the query they answer; until they answer the typed query, the panel shows a search in progress.
   const [results, setResults] = useState<{ query: string; items: InviteCandidate[] }>({ query: "", items: [] });
+  const [friends, setFriends] = useState<InviteCandidate[]>([]);
   const [pending, setPending] = useState<SentRoomInvitation[]>([]);
   const [revision, setRevision] = useState(0);
   const [busy, setBusy] = useState<string | null>(null);
@@ -32,10 +34,14 @@ export function RoomInvitePanel({ roomId, memberCount }: { roomId: string; membe
     apiFetch<SentRoomInvitation[]>(`/api/rooms/${roomId}/invitations`)
       .then((items) => setPending(items ?? []))
       .catch((err) => setError(err instanceof Error ? err.message : "Could not load invitations."));
+    // Without a query, the server lists the game master's friends who could join.
+    apiFetch<InviteCandidate[]>(`/api/rooms/${roomId}/invite-candidates`)
+      .then((items) => setFriends(items ?? []))
+      .catch((err) => setError(err instanceof Error ? err.message : "Could not load your friends."));
   }, [roomId, memberCount, revision]);
-  // Accepted and declined invitations leave the lists as soon as the player answers.
+  // Answered invitations and new or removed friends show up as soon as they happen.
   useNotificationEvents((note) => {
-    if (note.kind.startsWith("room_invitation.") && note.room?.id === roomId) setRevision((current) => current + 1);
+    if (note.kind.startsWith("friend.") || (note.kind.startsWith("room_invitation.") && note.room?.id === roomId)) setRevision((current) => current + 1);
   });
 
   useEffect(() => {
@@ -67,8 +73,11 @@ export function RoomInvitePanel({ roomId, memberCount }: { roomId: string; membe
     }
   }
 
-  const markInvited = (userId: string, invited: boolean) =>
-    setResults((current) => ({ ...current, items: current.items.map((item) => item.id === userId ? { ...item, invited } : item) }));
+  const markInvited = (userId: string, invited: boolean) => {
+    const mark = (items: InviteCandidate[]) => items.map((item) => item.id === userId ? { ...item, invited } : item);
+    setResults((current) => ({ ...current, items: mark(current.items) }));
+    setFriends(mark);
+  };
 
   const invite = (candidate: InviteCandidate) => act(candidate.id, async () => {
     const created = await postJSON<SentRoomInvitation>(`/api/rooms/${roomId}/invitations`, { username: candidate.username });
@@ -90,6 +99,13 @@ export function RoomInvitePanel({ roomId, memberCount }: { roomId: string; membe
     if (exact && !exact.invited && busy === null) void invite(exact);
   }
 
+  const candidateRow = (candidate: InviteCandidate) => <li key={candidate.id} className="flex items-center justify-between gap-3 text-sm">
+    <span className="min-w-0 break-words"><PlayerName player={candidate} />{candidate.friend && <span className="ml-2 text-xs text-[var(--green)]">Friend</span>}</span>
+    {candidate.invited
+      ? <span className="shrink-0 text-xs text-[var(--muted)]">Invited</span>
+      : <button type="button" className="btn shrink-0 min-h-9! px-3! py-1.5!" disabled={busy !== null} aria-label={`Invite ${playerLabel(candidate)}`} onClick={() => void invite(candidate)}>{busy === candidate.id ? "Inviting…" : "Invite"}</button>}
+  </li>;
+
   const typed = query.trim().length >= minInviteQuery;
   return <section className="card space-y-4" aria-labelledby="room-invite-heading">
     <h2 id="room-invite-heading" className="flex items-center gap-2 text-xl"><EnvelopeSimple size={22} className="text-[var(--accent)]" aria-hidden="true" />Invite players</h2>
@@ -99,20 +115,21 @@ export function RoomInvitePanel({ roomId, memberCount }: { roomId: string; membe
         <MagnifyingGlass size={16} aria-hidden="true" className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-[var(--muted)]" />
         <input id="room-invite-username" className="w-full pl-9!" autoComplete="off" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search by username" aria-describedby="room-invite-help" />
       </div>
-      <p id="room-invite-help" className="text-muted text-xs">Type at least {minInviteQuery} letters. Invited players join from their notifications, without the code or password.</p>
+      <p id="room-invite-help" className="text-muted text-xs">Type at least {minInviteQuery} letters to search everyone. Invited players join from their notifications, without the code or password.</p>
     </form>
     {error && <p role="alert" className="text-sm text-[var(--pink)]">{error}</p>}
     <div aria-live="polite" className="space-y-2">
-      {typed && (results.query !== query.trim()
+      {typed ? (results.query !== query.trim()
         ? <p className="text-muted text-sm">Searching…</p>
         : candidates.length === 0
           ? <p className="text-muted text-sm">No players match “{query.trim()}”.</p>
-          : <ul className="space-y-2" aria-label="Matching players">{candidates.map((candidate) => <li key={candidate.id} className="flex items-center justify-between gap-3 text-sm">
-            <PlayerName className="min-w-0 break-words" player={candidate} />
-            {candidate.invited
-              ? <span className="shrink-0 text-xs text-[var(--muted)]">Invited</span>
-              : <button type="button" className="btn shrink-0 min-h-9! px-3! py-1.5!" disabled={busy !== null} aria-label={`Invite ${playerLabel(candidate)}`} onClick={() => void invite(candidate)}>{busy === candidate.id ? "Inviting…" : "Invite"}</button>}
-          </li>)}</ul>)}
+          : <ul className="space-y-2" aria-label="Matching players">{candidates.map(candidateRow)}</ul>)
+        : friends.length > 0
+          ? <>
+            <h3 className="text-sm text-[var(--lavender)]">Your friends</h3>
+            <ul className="space-y-2" aria-label="Your friends">{friends.map(candidateRow)}</ul>
+          </>
+          : <p className="text-muted text-xs">Friends you add on the Friends page are listed here, one click from an invitation.</p>}
     </div>
     {pending.length > 0 && <div className="space-y-2 border-t border-[var(--paper)]/10 pt-3">
       <h3 className="text-sm text-[var(--lavender)]">Waiting for an answer</h3>

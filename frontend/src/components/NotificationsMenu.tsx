@@ -17,11 +17,14 @@ export function NotificationsMenu() {
   const [open, setOpen] = useState(false);
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState("");
+  // An invitation waiting for the player to choose which of their characters joins.
+  const [picking, setPicking] = useState<{ invitationId: string; options: Sheet[]; chosen: string } | null>(null);
   const rootRef = useRef<HTMLDivElement>(null);
   const buttonRef = useRef<HTMLButtonElement>(null);
   const count = requests.length + invitations.length;
 
   useEffect(() => setOpen(false), [location.pathname]);
+  useEffect(() => { if (!open) setPicking(null); }, [open]);
   useEffect(() => {
     if (!open) return;
     const onPointer = (event: PointerEvent) => {
@@ -59,18 +62,21 @@ export function NotificationsMenu() {
     announce({ kind: "friend.changed" });
   });
 
-  // Like joining with a code: one matching character is chosen, none sends the player to create one.
-  const join = (invitation: RoomInvitation) => act(invitation.id, async () => {
-    const joined = await postJSON<RoomJoin>(`/api/room-invitations/${invitation.id}/accept`, {});
-    let hasCharacter = joined.is_dm || !!joined.sheet_id;
-    if (!hasCharacter) {
-      const matching = ((await apiFetch<Sheet[]>("/api/sheets")) ?? []).filter((sheet) => sheet.user_id === userId && sheet.rule_book_id === joined.rule_book.id);
-      if (matching.length === 1) await patchJSON(`/api/rooms/${joined.room_id}/members/${userId}`, { sheet_id: matching[0].id });
-      hasCharacter = matching.length > 0;
-    }
+  async function acceptInvitation(invitation: RoomInvitation, sheetId: string | undefined) {
+    const joined = await postJSON<RoomJoin>(`/api/room-invitations/${invitation.id}/accept`, sheetId ? { sheet_id: sheetId } : {});
     setOpen(false);
-    navigate(hasCharacter ? `/rooms/${joined.room_id}` : `/sheets?room=${encodeURIComponent(joined.room_id)}`);
+    navigate(joined.is_dm || joined.sheet_id ? `/rooms/${joined.room_id}` : `/sheets?room=${encodeURIComponent(joined.room_id)}`);
+  }
+
+  // Like joining with a code: one matching character is chosen, several ask which one, none sends
+  // the player to create one.
+  const join = (invitation: RoomInvitation) => act(invitation.id, async () => {
+    const matching = ((await apiFetch<Sheet[]>("/api/sheets")) ?? []).filter((sheet) => sheet.user_id === userId && sheet.rule_book_id === invitation.room.rule_book.id);
+    if (matching.length > 1) setPicking({ invitationId: invitation.id, options: matching, chosen: matching[0].id });
+    else await acceptInvitation(invitation, matching[0]?.id);
   });
+
+  const joinAs = (invitation: RoomInvitation, sheetId: string) => act(invitation.id, () => acceptInvitation(invitation, sheetId));
 
   const decline = (invitation: RoomInvitation) => act(invitation.id, () => deleteJSON(`/api/room-invitations/${invitation.id}`));
 
@@ -88,10 +94,19 @@ export function NotificationsMenu() {
         <ul className="space-y-2">{invitations.map((invitation) => <li key={invitation.id} className="space-y-2 border-t border-[var(--paper)]/10 pt-2 text-sm">
           <p className="break-words"><PlayerName player={invitation.inviter} /> invited you to <strong className="font-medium text-[var(--paper)]">{invitation.room.name}</strong></p>
           <p className="text-muted text-xs">Plays with {invitation.room.rule_book.name}</p>
-          <div className="flex flex-wrap gap-2">
+          {picking?.invitationId === invitation.id ? <div className="space-y-2">
+            <label className="field-label block" htmlFor={`invitation-character-${invitation.id}`}>Which character joins?</label>
+            <select id={`invitation-character-${invitation.id}`} className="w-full" autoFocus value={picking.chosen} onChange={(event) => setPicking({ ...picking, chosen: event.target.value })}>
+              {picking.options.map((sheet) => <option key={sheet.id} value={sheet.id}>{sheet.name}</option>)}
+            </select>
+            <div className="flex flex-wrap gap-2">
+              <button type="button" className="btn min-h-9! px-3! py-1.5!" disabled={busy !== null} onClick={() => void joinAs(invitation, picking.chosen)}>{busy === invitation.id ? "Joining…" : "Join room"}</button>
+              <button type="button" className="btn-secondary min-h-9! px-3! py-1.5!" disabled={busy !== null} onClick={() => setPicking(null)}>Back</button>
+            </div>
+          </div> : <div className="flex flex-wrap gap-2">
             <button type="button" className="btn min-h-9! px-3! py-1.5!" disabled={busy !== null} onClick={() => void join(invitation)}>{busy === invitation.id ? "Working…" : "Join room"}</button>
             <button type="button" className="btn-secondary min-h-9! px-3! py-1.5!" disabled={busy !== null} onClick={() => void decline(invitation)}>Decline</button>
-          </div>
+          </div>}
         </li>)}</ul>
       </div>}
       {requests.length > 0 && <div className="space-y-2">

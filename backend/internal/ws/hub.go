@@ -264,6 +264,10 @@ func (c *client) writeLoop() {
 			if err := c.conn.WriteJSON(ev); err != nil {
 				return
 			}
+			if c.endsConnection(ev) {
+				c.sayGoodbye()
+				return
+			}
 		case <-ticker.C:
 			if err := c.conn.WriteControl(websocket.PingMessage, []byte("ping"), time.Now().Add(5*time.Second)); err != nil {
 				return

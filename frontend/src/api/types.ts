@@ -17,7 +17,14 @@ export type Room = {
   invite_code: string;
   settings: Record<string, unknown>;
   rule_book: RuleBookRef;
+  /** Listed rooms only: whether joining with the invite code asks for a password. */
+  requires_password?: boolean;
+  /** Listed rooms only: your seat, or null for a public room you haven't joined. */
+  membership?: RoomMembership | null;
+  /** Listed rooms only: members who aren't game masters. */
+  player_count?: number;
 };
+export type RoomMembership = { is_dm: boolean; sheet_id: string | null; sheet_name: string | null };
 /** Response of POST /api/rooms/join: the invite carries the room's rule book. */
 export type RoomJoin = {
   room_id: string;
@@ -53,8 +60,8 @@ export type RoomInvitation = {
 };
 /** A pending invitation to a room, as the room's game masters see it. */
 export type SentRoomInvitation = { id: string; room_id: string; created_at: string; invitee: PublicUser };
-/** A user a game master may invite; `invited` when an invitation is already pending. */
-export type InviteCandidate = PublicUser & { invited: boolean };
+/** A user a game master may invite; `invited` when an invitation is already pending, `friend` for the game master's friends. */
+export type InviteCandidate = PublicUser & { invited: boolean; friend?: boolean };
 /** Response of GET /api/notifications: what waits for the signed-in user. */
 export type NotificationsState = { friend_requests: Friend[]; room_invitations: RoomInvitation[] };
 export type NotificationKind =

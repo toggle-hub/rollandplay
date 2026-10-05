@@ -2,7 +2,7 @@ import { FormEvent, useEffect, useState } from "react";
 import type { ReactNode } from "react";
 import { UserPlus, UsersThree } from "@phosphor-icons/react";
 import { PlayerName } from "../components/PlayerName";
-import { apiFetch, deleteJSON, patchJSON, postJSON } from "../api/client";
+import { ApiError, apiFetch, deleteJSON, patchJSON, postJSON } from "../api/client";
 import type { Friend } from "../api/types";
 import { useNotificationEvents, useNotifications } from "../notifications/NotificationsContext";
 
@@ -10,7 +10,7 @@ type FriendBuckets = { pending_inbound: Friend[]; pending_outbound: Friend[]; ac
 const empty: FriendBuckets = { pending_inbound: [], pending_outbound: [], accepted: [], blocked: [] };
 export function FriendsPage() {
   const [friends, setFriends] = useState<FriendBuckets>(empty);
-  const [email, setEmail] = useState("");
+  const [contact, setContact] = useState("");
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
@@ -29,9 +29,23 @@ export function FriendsPage() {
     setNotice("");
     try { await action(); } catch (err) { setError(err instanceof Error ? err.message : "Could not update your friends."); } finally { setBusy(false); refreshNotifications().catch(() => {}); }
   }
+  // Anything with an @ is an email address; everything else is a username.
   function request(e: FormEvent) {
     e.preventDefault();
-    void act(async () => { await postJSON("/api/friends", { email: email.trim() }); setEmail(""); await load(); setNotice("Friend request sent."); });
+    const value = contact.trim();
+    const byEmail = value.includes("@");
+    void act(async () => {
+      try {
+        await postJSON("/api/friends", byEmail ? { email: value } : { username: value });
+      } catch (err) {
+        if (err instanceof ApiError && err.status === 404) throw new Error(`No player has the ${byEmail ? "email" : "username"} “${value}”.`);
+        if (err instanceof ApiError && err.status === 409) throw new Error("You’re already friends with that player, or a request between you is waiting.");
+        throw err;
+      }
+      setContact("");
+      await load();
+      setNotice("Friend request sent.");
+    });
   }
   function accept(id: string) {
     void act(async () => {
@@ -45,18 +59,19 @@ export function FriendsPage() {
   function remove(id: string) { void act(async () => { await deleteJSON(`/api/friends/${id}`); await load(); }); }
   return (
     <div className="workspace-page">
-      <header><p className="eyebrow">Better together</p><h1 className="page-heading">Your party, beyond the table.</h1><p className="page-description">Keep your fellow adventurers close and welcome someone new.</p></header>
+      <header><h1 className="page-heading">Friends</h1></header>
       <form className="card space-y-4" onSubmit={request}>
         <h2 className="flex items-center gap-3 text-xl"><UserPlus size={24} className="text-[var(--accent)]" aria-hidden="true" />Add a friend</h2>
         <div className="flex flex-col items-start gap-4 sm:flex-row sm:items-end">
-          <div className="w-full sm:max-w-lg"><label className="field-label mb-2 block" htmlFor="friend-email">Their email address</label><input id="friend-email" type="email" required className="w-full" value={email} onChange={(e) => setEmail(e.target.value)} placeholder="friend@example.com" /></div>
-          <button className="btn shrink-0" disabled={busy}>{busy ? "Working…" : "Request friend"}</button>
+          <div className="w-full sm:max-w-lg"><label className="field-label mb-2 block" htmlFor="friend-contact">Their username or email</label><input id="friend-contact" required autoComplete="off" className="w-full" value={contact} onChange={(e) => setContact(e.target.value)} placeholder="Petra or friend@example.com" /></div>
+          <button className="btn shrink-0" disabled={busy || !contact.trim()}>{busy ? "Working…" : "Request friend"}</button>
         </div>
+        <p className="text-muted text-xs">Friends are listed first when you invite players to your rooms.</p>
       </form>
       {error && <p role="alert" className="text-[var(--pink)]">{error}</p>}
       {notice && <p role="status" className="text-[var(--green)]">{notice}</p>}
       {loading ? <p role="status" className="text-muted">Gathering your party…</p> : <div className="grid grid-flow-dense gap-6 lg:grid-cols-2">
-        <Bucket title="Your friends" description="People ready for the next adventure." emptyText="Your party starts with one invitation. Add a friend by email above." items={friends.accepted} action={(friend) => <button className="btn-secondary" disabled={busy} onClick={() => remove(friend.id)}>Remove</button>} />
+        <Bucket title="Your friends" description="People ready for the next adventure." emptyText="Your party starts with one invitation. Add a friend by username or email above." items={friends.accepted} action={(friend) => <button className="btn-secondary" disabled={busy} onClick={() => remove(friend.id)}>Remove</button>} />
         <Bucket title="Incoming requests" description="An invitation to share the story." emptyText="No incoming requests. New invitations will appear here." items={friends.pending_inbound} action={(friend) => <><button className="btn" disabled={busy} onClick={() => accept(friend.id)}>Accept</button><button className="btn-secondary" disabled={busy} onClick={() => void act(async () => { await patchJSON(`/api/friends/${friend.id}`, { status: "blocked" }); await load(); })}>Block</button></>} />
         <Bucket title="Sent requests" description="The invitations you’ve sent out." emptyText="No invitations waiting for a response." items={friends.pending_outbound} action={(friend) => <button className="btn-secondary" disabled={busy} onClick={() => remove(friend.id)}>Cancel</button>} />
         <Bucket title="Blocked" description="Manage who can connect with you." emptyText="You haven’t blocked anyone." items={friends.blocked} action={(friend) => <button className="btn-secondary" disabled={busy} onClick={() => remove(friend.id)}>Remove</button>} />

@@ -72,6 +72,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/rooms", s.handleRoomsCreate)
 	mux.HandleFunc("GET /api/rooms/{roomID}", s.handleRoomGet)
 	mux.HandleFunc("PATCH /api/rooms/{roomID}", s.handleRoomPatch)
+	mux.HandleFunc("DELETE /api/rooms/{roomID}", s.handleRoomDelete)
+	mux.HandleFunc("POST /api/rooms/{roomID}/leave", s.handleRoomLeave)
 	mux.HandleFunc("POST /api/rooms/join", s.handleRoomJoin)
 	mux.HandleFunc("GET /api/invites/{code}", s.handleInviteGet)
 	mux.HandleFunc("GET /api/rooms/{roomID}/members", s.handleMembers)
@@ -320,8 +322,8 @@ func (s *Server) handleMePatch(w http.ResponseWriter, r *http.Request) {
 	}
 	username := strings.TrimSpace(req.Username)
 	pronouns := strings.TrimSpace(req.Pronouns)
-	if username == "" || pronouns == "" {
-		WriteError(w, 400, "profile_required", "name and pronouns are required")
+	if username == "" {
+		WriteError(w, 400, "profile_required", "a name is required")
 		return
 	}
 	if len(username) > 80 || len(pronouns) > 40 {
@@ -329,6 +331,10 @@ func (s *Server) handleMePatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	row, err := s.oneJSON(r.Context(), `update users set username=$2, pronouns=$3, profile_complete=true, updated_at=now() where id=$1 returning jsonb_build_object('id',id::text,'username',username,'email',email::text,'pronouns',pronouns,'profile_complete',profile_complete)`, u.ID, username, pronouns)
+	if err != nil && strings.Contains(err.Error(), "users_username_key") {
+		WriteError(w, 409, "username_taken", "another player already uses that name")
+		return
+	}
 	respondRaw(w, row, err)
 }
 
@@ -362,7 +368,9 @@ func (s *Server) handleRoomsList(w http.ResponseWriter, r *http.Request) {
 	}
 	// Only rooms the caller owns or belongs to, plus public rooms when ?public=true is asked for.
 	// Private rooms of other users must never be listed: the response carries their invite code.
-	rows, err := s.queryJSON(r.Context(), `select `+roomJSON+` || jsonb_build_object('created_at',created_at) from rooms where ($1 and is_public) or owner_id=$2 or exists(select 1 from room_members where room_id=rooms.id and user_id=$2) order by created_at desc`, r.URL.Query().Get("public") == "true", u.ID)
+	// `membership` is the caller's seat ({is_dm, sheet_id, sheet_name}, null when not a member) and
+	// `player_count` counts members who aren't game masters.
+	rows, err := s.queryJSON(r.Context(), `select `+roomJSON+` || jsonb_build_object('created_at',created_at,'requires_password',password_hash is not null,'membership',(select jsonb_build_object('is_dm',m.is_dm,'sheet_id',m.sheet_id::text,'sheet_name',sh.name) from room_members m left join sheets sh on sh.id=m.sheet_id where m.room_id=rooms.id and m.user_id=$2),'player_count',(select count(*) from room_members m where m.room_id=rooms.id and not m.is_dm)) from rooms where ($1 and is_public) or owner_id=$2 or exists(select 1 from room_members where room_id=rooms.id and user_id=$2) order by created_at desc`, r.URL.Query().Get("public") == "true", u.ID)
 	respondRows(w, rows, err)
 }
 func (s *Server) handleRoomsCreate(w http.ResponseWriter, r *http.Request) {
@@ -612,13 +620,19 @@ func (s *Server) handleFriendCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		Email string `json:"email"`
+		Email    string `json:"email"`
+		Username string `json:"username"`
 	}
 	_ = ReadJSON(r, &req)
 	var target string
-	err := s.Pool.QueryRow(r.Context(), `select id::text from users where email=$1`, strings.ToLower(strings.TrimSpace(req.Email))).Scan(&target)
+	var err error
+	if username := strings.TrimSpace(req.Username); username != "" {
+		target, err = s.userIDByUsername(r.Context(), username)
+	} else {
+		err = s.Pool.QueryRow(r.Context(), `select id::text from users where email=$1`, strings.ToLower(strings.TrimSpace(req.Email))).Scan(&target)
+	}
 	if err != nil {
-		WriteError(w, 404, "not_found", "user not found")
+		WriteError(w, 404, "not_found", "no player has that username or email")
 		return
 	}
 	if target == u.ID {
