@@ -1793,6 +1793,10 @@ func (s *Server) visibleState(ctx context.Context, roomID, userID string) (map[s
 	for _, t := range tokens {
 		t.CanMove = t.MovableBy(userID, isDM)
 		t.CanAct = isDM || t.OwnerUserID == userID
+		// Movers get the walking speed so the drag readout can warn past it.
+		if speed, ok := t.Stats["speed_m"].(float64); ok && speed > 0 && t.CanMove {
+			t.SpeedM = &speed
+		}
 		if isDM || t.OwnerUserID == userID || (t.SheetOwnerUserID != "" && t.SheetOwnerUserID == userID) {
 			t.HitPoints, t.MaxHitPoints = t.Health()
 			d := game.DefenseState(t.Stats)

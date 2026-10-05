@@ -2212,6 +2212,76 @@ func TestRoomTokenDragStreaming(t *testing.T) {
 	}
 }
 
+func TestRoomRulerSharingAndSpeed(t *testing.T) {
+	a := newTestApp(t)
+	dm, _ := login(t, a, "ruler-dm@example.com")
+	player, playerUser := login(t, a, "ruler-player@example.com")
+	rb := post[map[string]any](t, dm, a.server.URL, "/api/rule-books", map[string]any{"name": "Ruler Rules", "attributes": map[string]any{}, "is_public": true})
+	sheet := post[map[string]any](t, player, a.server.URL, "/api/sheets", map[string]any{"rule_book_id": rb["id"], "name": "Hero", "data": map[string]any{"speed_m": 9}})
+	room := post[map[string]any](t, dm, a.server.URL, "/api/rooms", map[string]any{"name": "Ruler", "rule_book_id": rb["id"]})
+	roomID := room["id"].(string)
+	roomPath := "/api/rooms/" + roomID
+	post[map[string]any](t, player, a.server.URL, "/api/rooms/join", map[string]any{"invite_code": room["invite_code"]})
+	gm := post[map[string]any](t, dm, a.server.URL, "/api/maps", map[string]any{"name": "Field", "width_m": 20, "height_m": 20})
+	post[map[string]any](t, dm, a.server.URL, roomPath+"/maps", map[string]any{"map_id": gm["id"], "is_active": true})
+	hero := post[map[string]any](t, player, a.server.URL, roomPath+"/tokens", map[string]any{"sheet_id": sheet["id"], "name": "Hero", "x_m": 1, "y_m": 1})
+	goblin := post[map[string]any](t, dm, a.server.URL, roomPath+"/tokens", map[string]any{"name": "Goblin", "x_m": 3, "y_m": 1, "attributes": map[string]any{"speed_m": 6}})
+
+	// Movers get the walking speed; a player never gets it for a token they cannot move.
+	speeds := func(c *http.Client) map[string]any {
+		t.Helper()
+		out := map[string]any{}
+		for _, raw := range get[map[string]any](t, c, a.server.URL, roomPath+"/state")["visibleTokens"].([]any) {
+			token := raw.(map[string]any)
+			out[token["id"].(string)] = token["speed_m"]
+		}
+		return out
+	}
+	if got := speeds(player); got[hero["id"].(string)] != float64(9) || got[goblin["id"].(string)] != nil {
+		t.Fatalf("player speeds: %+v", got)
+	}
+	if got := speeds(dm); got[hero["id"].(string)] != float64(9) || got[goblin["id"].(string)] != float64(6) {
+		t.Fatalf("game master speeds: %+v", got)
+	}
+
+	dmWS, playerWS := dialWS(t, a, dm, roomID), dialWS(t, a, player, roomID)
+	for _, conn := range []*websocket.Conn{dmWS, playerWS} {
+		defer conn.Close()
+		readType(t, conn, "state.snapshot")
+	}
+	sendWS(t, playerWS, "ruler.measure", "r1", map[string]any{"from": map[string]float64{"x": 1, "y": 1}, "to": map[string]float64{"x": 4, "y": 5}})
+	shown := readType(t, dmWS, "ruler.shown")["body"].(map[string]any)
+	if shown["user_id"] != playerUser["id"] || shown["meters"] != float64(5) || shown["conn_id"] == "" || shown["room_id"] != roomID {
+		t.Fatalf("the table should see the player's ruler: %+v", shown)
+	}
+	sendWS(t, playerWS, "ruler.clear", "r2", map[string]any{})
+	if cleared := readType(t, dmWS, "ruler.cleared")["body"].(map[string]any); cleared["conn_id"] != shown["conn_id"] {
+		t.Fatalf("clearing should name the same ruler: %+v", cleared)
+	}
+	// The measurer gets no echo of its own ruler.
+	sendWS(t, playerWS, "chat.send", "mark", map[string]any{"text": "mark"})
+	_ = playerWS.SetReadDeadline(time.Now().Add(5 * time.Second))
+	for {
+		var ev map[string]any
+		if err := playerWS.ReadJSON(&ev); err != nil {
+			t.Fatal(err)
+		}
+		if ev["type"] == "ruler.shown" || ev["type"] == "ruler.cleared" {
+			t.Fatalf("the measurer should not get its own ruler back: %+v", ev)
+		}
+		if ev["type"] == "chat.message" {
+			break
+		}
+	}
+	// A ruler still held when the measurer disconnects is taken off the table.
+	sendWS(t, playerWS, "ruler.measure", "r3", map[string]any{"from": map[string]float64{"x": 1, "y": 1}, "to": map[string]float64{"x": 2, "y": 1}})
+	readType(t, dmWS, "ruler.shown")
+	playerWS.Close()
+	if cleared := readType(t, dmWS, "ruler.cleared")["body"].(map[string]any); cleared["conn_id"] != shown["conn_id"] {
+		t.Fatalf("disconnect should clear the ruler: %+v", cleared)
+	}
+}
+
 func dialWS(t *testing.T, a *testApp, c *http.Client, roomID string) *websocket.Conn {
 	t.Helper()
 	return dialPath(t, a, c, "/api/rooms/"+roomID+"/ws")

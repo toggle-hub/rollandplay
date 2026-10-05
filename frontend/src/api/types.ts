@@ -226,6 +226,8 @@ export type RoomToken = {
   death_saves?: DeathSaves;
   /** Same visibility as health. */
   defenses?: TokenDefenses;
+  /** Walking speed in meters (`speed_m` on the sheet or stat block); sent only to viewers who may move the token. */
+  speed_m?: number;
 };
 export type TokenPatch = {
   hit_points?: number;

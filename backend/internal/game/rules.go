@@ -43,6 +43,7 @@ type Token struct {
 	MaxHitPoints     *int             `json:"max_hit_points,omitempty"`
 	DeathSaves       *DeathSaves      `json:"death_saves,omitempty"` // same viewers as health, sheet-backed only
 	Defenses         *Defenses        `json:"defenses,omitempty"`    // same viewers as health
+	SpeedM           *float64         `json:"speed_m,omitempty"`     // per viewer: those who may move the token
 }
 
 // MovableBy reports whether userID may move the token: its owner, the game master,
