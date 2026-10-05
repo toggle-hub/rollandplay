@@ -336,6 +336,10 @@ export type ChatMessage = {
   recipient_user_ids?: string[];
   created_at: string;
 };
+/** A page of earlier chat from `GET /api/rooms/{roomID}/chat?before=`, oldest first. */
+export type ChatPage = { messages: ChatMessage[]; hasEarlier: boolean };
+/** Who has the room open right now, sent as `presence.changed` whenever a socket joins or leaves. */
+export type PresenceChange = { room_id: string; online_user_ids: string[]; user_id?: string; online?: boolean };
 export type VisibleRoomState = {
   room: Room;
   activeMap: GameMap | null;
@@ -343,6 +347,8 @@ export type VisibleRoomState = {
   visibleTokens: RoomToken[];
   ownTokens: RoomToken[];
   chatHistory: ChatMessage[];
+  /** True when messages older than `chatHistory` (the newest 200) exist. */
+  chatHasEarlier?: boolean;
   /** Open checks first, then the most recent closed ones. */
   checks?: RoomCheck[];
   metersPerGrid: number | string;
