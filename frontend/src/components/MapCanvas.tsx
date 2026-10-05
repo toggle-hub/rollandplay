@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, type MouseEvent, type PointerEvent } from "react";
 import { assetURL } from "../api/client";
 import type { MapStructure, RoomToken, VisibleRoomState } from "../api/types";
-import { choiceRequest, choiceTargeting, choiceTitle, confirmLines, type ActionRequest, type FloatTone, type WheelChoice } from "../lib/actions";
+import { choiceRequest, choiceTargeting, choiceTitle, choiceUsesD20, confirmLines, type ActionRequest, type FloatTone, type WheelChoice } from "../lib/actions";
 import { attackLineBlocked, attackTargetStatus, type AttackTargetStatus } from "../lib/attacks";
 import { geometryCenter, rotateGeometry, type Point } from "../lib/geometryTransforms";
 import { structureLabel, templateGeometry } from "../lib/structures";
@@ -557,8 +557,9 @@ export function MapCanvas({
       title={choiceTitle(choice)}
       subtitle={subtitle}
       lines={confirmLines(choice, pendingTarget, areaCount)}
-      onRoll={() => {
-        onAction?.(choiceRequest(source.id, choice, targetTokenId, point));
+      rollOptions={choiceUsesD20(choice)}
+      onRoll={(options) => {
+        onAction?.(choiceRequest(source.id, choice, targetTokenId, point, options));
         closePending();
       }}
       onBack={choiceTargeting(choice) ? () => {

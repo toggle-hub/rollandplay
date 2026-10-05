@@ -4,8 +4,8 @@ import { segmentsIntersect, structureSegments } from "./segments";
 
 export type AttackTargetStatus = "valid" | "out_of_range" | "blocked";
 
-/** Same grammar as the server's dice expressions (Go `diceExprRE`). */
-export const diceExpressionPattern = /^[+-]?([0-9]*d[0-9]+|[0-9]+)([+-]([0-9]*d[0-9]+|[0-9]+))*$/;
+/** Same grammar as the server's dice expressions (Go `diceExprRE`): NdM, NdMkhK/NdMklK (keep highest/lowest K) and whole numbers joined by + and -. */
+export const diceExpressionPattern = /^[+-]?([0-9]*d[0-9]+(k[hl][0-9]+)?|[0-9]+)([+-]([0-9]*d[0-9]+(k[hl][0-9]+)?|[0-9]+))*$/;
 
 export const dndAbilities = ["strength", "dexterity", "constitution", "intelligence", "wisdom", "charisma"];
 

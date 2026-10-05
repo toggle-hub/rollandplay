@@ -15,6 +15,7 @@ import type {
 import { formatModifier } from "./attacks";
 import { humanizeKey } from "./checks";
 import type { Point } from "./geometryTransforms";
+import { normalRoll, rollOptionsBody, type RollOptions, type RollOptionsBody } from "./rolls";
 
 /** Same list and order as the server's `game.DamageTypes`. */
 export const damageTypes = [
@@ -31,9 +32,9 @@ export type WheelChoice =
   | { kind: "death_save" };
 
 export type ActionRequest =
-  | { type: "action.resolve"; body: { sourceTokenId: string; source: "attack" | "action" | "item"; actionId: string; targetTokenId?: string; point?: Point } }
-  | { type: "check.quick"; body: { tokenId: string; kind: string; key: string } }
-  | { type: "death.save"; body: { tokenId: string } };
+  | { type: "action.resolve"; body: { sourceTokenId: string; source: "attack" | "action" | "item"; actionId: string; targetTokenId?: string; point?: Point } & RollOptionsBody }
+  | { type: "check.quick"; body: { tokenId: string; kind: string; key: string } & RollOptionsBody }
+  | { type: "death.save"; body: { tokenId: string } & RollOptionsBody };
 
 export type ChoiceTargeting = { rangeM: number; areaRadiusM: number; allowSelf: boolean; tone: "damage" | "heal" };
 
@@ -101,6 +102,18 @@ export function choiceTargeting(choice: WheelChoice): ChoiceTargeting | null {
   }
 }
 
+/** Whether the choice rolls the actor's own d20 (attack rolls, checks, death saves), which advantage and a bonus change. Save effects roll the targets' dice instead, and heals roll none. */
+export function choiceUsesD20(choice: WheelChoice): boolean {
+  switch (choice.kind) {
+    case "attack":
+    case "check":
+    case "death_save":
+      return true;
+    case "action": return choice.action.kind === "attack";
+    case "item": return choice.item.kind === "attack";
+  }
+}
+
 /** The text of the confirm card: what will be rolled and what it costs. */
 export function confirmLines(choice: WheelChoice, target?: RoomToken, areaCount?: number): string[] {
   if (choice.kind === "check") return [`${checkLabel(choice.check)}: 1d20 plus your modifier`];
@@ -134,16 +147,17 @@ export function confirmLines(choice: WheelChoice, target?: RoomToken, areaCount?
   return lines;
 }
 
-/** Builds the websocket request the confirm card's Roll button sends. */
-export function choiceRequest(sourceTokenId: string, choice: WheelChoice, targetTokenId?: string, point?: Point): ActionRequest {
+/** Builds the websocket request the confirm card's Roll button sends; roll options apply only to choices that roll a d20. */
+export function choiceRequest(sourceTokenId: string, choice: WheelChoice, targetTokenId?: string, point?: Point, options: RollOptions = normalRoll): ActionRequest {
+  const extra = choiceUsesD20(choice) ? rollOptionsBody(options) : {};
   switch (choice.kind) {
     case "check":
-      return { type: "check.quick", body: { tokenId: sourceTokenId, kind: choice.check.kind, key: choice.check.key } };
+      return { type: "check.quick", body: { tokenId: sourceTokenId, kind: choice.check.kind, key: choice.check.key, ...extra } };
     case "death_save":
-      return { type: "death.save", body: { tokenId: sourceTokenId } };
+      return { type: "death.save", body: { tokenId: sourceTokenId, ...extra } };
     default: {
       const actionId = choice.kind === "attack" ? choice.attack.id : choice.kind === "action" ? choice.action.id : choice.item.id;
-      const body: Extract<ActionRequest, { type: "action.resolve" }>["body"] = { sourceTokenId, source: choice.kind, actionId };
+      const body: Extract<ActionRequest, { type: "action.resolve" }>["body"] = { sourceTokenId, source: choice.kind, actionId, ...extra };
       if (targetTokenId) body.targetTokenId = targetTokenId;
       if (point) body.point = point;
       return { type: "action.resolve", body };

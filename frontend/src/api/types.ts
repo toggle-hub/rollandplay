@@ -241,7 +241,8 @@ export type TokenPatch = {
 };
 export type RollResult = {
   expression: string;
-  dice: { count: number; sides: number; values: number[] }[];
+  /** keep is set on keep terms such as 2d20kh1 ("kh" highest, "kl" lowest); kept then marks the dice that count. */
+  dice: { count: number; sides: number; values: number[]; keep?: "kh" | "kl"; kept?: boolean[] }[];
   modifier: number;
   total: number;
   damage?: RollResult;
@@ -328,6 +329,8 @@ export type VisibleRoomState = {
   chatHistory: ChatMessage[];
   /** Open checks first, then the most recent closed ones. */
   checks?: RoomCheck[];
+  /** The fight running on the active map, or null. Players never see hidden tokens in it. */
+  combat?: Combat | null;
   metersPerGrid: number | string;
   visibility?: {
     /** Players see fog everywhere outside their tokens' vision; game masters see no fog. */
@@ -338,6 +341,10 @@ export type VisibleRoomState = {
     visibleStructureIds: string[];
   };
 };
+/** A token in the turn order. player_user_id plays it (sheet owner, else token owner) and may end its turn. */
+export type Combatant = { id: string; token_id: string; name: string; initiative: number; player_user_id: string; is_hidden: boolean };
+/** current_combatant_id is null for players while a hidden token acts. */
+export type Combat = { round: number; current_combatant_id: string | null; combatants: Combatant[] };
 /** A live drag by someone else at the table: where their dragged tokens are right now. */
 export type TokenDragFrame = { room_id: string; moves: { token_id: string; x: number; y: number }[] };
 export type ClientEnvelope = { type: string; requestId: string; body: unknown };

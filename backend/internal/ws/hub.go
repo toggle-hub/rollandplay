@@ -332,6 +332,18 @@ func (c *client) handle(msg clientEnvelope) {
 		c.checkRoll(msg)
 	case "check.close":
 		c.checkClose(msg)
+	case "combat.start":
+		c.combatStart(msg)
+	case "combat.next":
+		c.combatNext(msg)
+	case "combat.add":
+		c.combatAdd(msg)
+	case "combat.remove":
+		c.combatRemove(msg)
+	case "combat.move":
+		c.combatMove(msg)
+	case "combat.end":
+		c.combatEnd(msg)
 	case "ruler.measure":
 		var req struct {
 			From game.Point `json:"from"`

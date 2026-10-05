@@ -119,15 +119,20 @@ func (c *client) checkPrompt(msg clientEnvelope) {
 	c.hub.publish(c.roomID, c.checkChanged(&msg.RequestID, checkID, recipients))
 }
 
-// checkRoll rolls a pending check for the sender, or for any target when sent by a DM.
-// Body: {checkId, userId?}.
+// checkRoll rolls a pending check for the sender, or for any target when sent by a DM, with
+// optional advantage, disadvantage and bonus. Body: {checkId, userId?, mode?, bonus?}.
 func (c *client) checkRoll(msg clientEnvelope) {
 	var req struct {
 		CheckID string `json:"checkId"`
 		UserID  string `json:"userId"`
+		game.RollOptions
 	}
 	if json.Unmarshal(msg.Body, &req) != nil {
 		c.error(msg.RequestID, "bad_json", "invalid body")
+		return
+	}
+	if err := req.RollOptions.Validate(); err != nil {
+		c.error(msg.RequestID, "invalid_roll", err.Error())
 		return
 	}
 	target := req.UserID
@@ -198,7 +203,7 @@ func (c *client) checkRoll(msg clientEnvelope) {
 	}
 	var stats map[string]any
 	_ = json.Unmarshal(data, &stats)
-	rr, err := game.RollExpression(check.Expression(stats), rand.Reader)
+	rr, err := game.RollExpression(req.RollOptions.D20(check.Modifier(stats)), rand.Reader)
 	if err != nil {
 		c.error(msg.RequestID, "bad_roll", err.Error())
 		return
@@ -219,7 +224,11 @@ func (c *client) checkRoll(msg clientEnvelope) {
 	if success {
 		outcome = "success"
 	}
-	body := fmt.Sprintf("%s: %s (DC %d), %s", name, check.Label(), dc, outcome)
+	dcNote := fmt.Sprintf("DC %d", dc)
+	if note := req.RollOptions.Note(); note != "" {
+		dcNote += ", " + note
+	}
+	body := fmt.Sprintf("%s: %s (%s), %s", name, check.Label(), dcNote, outcome)
 	recipients := []string{}
 	if isPrivate {
 		recipients = []string{target}

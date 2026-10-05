@@ -147,15 +147,16 @@ func adjustForDefenses(stats map[string]any, damageType string, amount int) (int
 	return amount, ""
 }
 
-// RollAttack rolls to hit against the target's armor class (10 when unset). A natural 20
-// always hits and doubles the damage dice; a natural 1 always misses. The damage roll is
-// returned for the outcome's Effect and is nil on a miss.
-func RollAttack(a ResolvedAction, t Target, rng io.Reader) (TargetOutcome, *RollResult, map[string]any, error) {
-	roll, err := RollExpression(withModifier("1d20", a.ToHit), rng)
+// RollAttack rolls to hit against the target's armor class (10 when unset), with the attacker's
+// advantage, disadvantage and bonus. A natural 20 on the kept d20 always hits and doubles the
+// damage dice; a natural 1 always misses. The damage roll is returned for the outcome's Effect
+// and is nil on a miss.
+func RollAttack(a ResolvedAction, t Target, opts RollOptions, rng io.Reader) (TargetOutcome, *RollResult, map[string]any, error) {
+	roll, err := RollExpression(opts.D20(a.ToHit), rng)
 	if err != nil {
 		return TargetOutcome{}, nil, nil, err
 	}
-	nat := roll.Dice[0].Values[0]
+	nat := roll.Natural()
 	ac := 10
 	if v := statInt(t.Stats, "armor_class"); v != nil {
 		ac = *v
@@ -240,14 +241,15 @@ func ApplyHealing(amount int, t Target) (TargetOutcome, map[string]any) {
 	return out, patch
 }
 
-// DeathSave rolls a dying character's death saving throw: 20 revives with 1 HP, 10 or more
-// succeeds (three successes stabilize), 1 counts as two failures, three failures kill.
-func DeathSave(t Target, rng io.Reader) (TargetOutcome, map[string]any, error) {
-	roll, err := RollExpression("1d20", rng)
+// DeathSave rolls a dying character's death saving throw, with the roller's advantage,
+// disadvantage and bonus: a natural 20 revives with 1 HP, a natural 1 counts as two failures,
+// otherwise a total of 10 or more succeeds (three successes stabilize); three failures kill.
+func DeathSave(t Target, opts RollOptions, rng io.Reader) (TargetOutcome, map[string]any, error) {
+	roll, err := RollExpression(opts.D20(0), rng)
 	if err != nil {
 		return TargetOutcome{}, nil, err
 	}
-	nat := roll.Dice[0].Values[0]
+	nat := roll.Natural()
 	state := DeathSaveState(t.Stats)
 	out := t.outcome()
 	out.Roll = &roll
@@ -256,7 +258,7 @@ func DeathSave(t Target, rng io.Reader) (TargetOutcome, map[string]any, error) {
 	case nat == 20:
 		out.Result = ResultRevived
 		patch = map[string]any{"hit_points": 1, "death_save_successes": 0, "death_save_failures": 0, "stable": false}
-	case nat >= 10:
+	case nat != 1 && roll.Total >= 10:
 		if state.Successes+1 >= 3 {
 			out.Result = ResultStable
 			patch = map[string]any{"stable": true, "death_save_successes": 0, "death_save_failures": 0}
