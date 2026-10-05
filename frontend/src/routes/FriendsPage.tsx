@@ -4,6 +4,7 @@ import { UserPlus, UsersThree } from "@phosphor-icons/react";
 import { PlayerName } from "../components/PlayerName";
 import { apiFetch, deleteJSON, patchJSON, postJSON } from "../api/client";
 import type { Friend } from "../api/types";
+import { useNotificationEvents, useNotifications } from "../notifications/NotificationsContext";
 
 type FriendBuckets = { pending_inbound: Friend[]; pending_outbound: Friend[]; accepted: Friend[]; blocked: Friend[] };
 const empty: FriendBuckets = { pending_inbound: [], pending_outbound: [], accepted: [], blocked: [] };
@@ -19,11 +20,14 @@ export function FriendsPage() {
     setFriends({ pending_inbound: result.pending_inbound ?? [], pending_outbound: result.pending_outbound ?? [], accepted: result.accepted ?? [], blocked: result.blocked ?? [] });
   };
   useEffect(() => { load().catch((err: Error) => setError(err.message)).finally(() => setLoading(false)); }, []);
+  // Requests sent, answered or withdrawn elsewhere show up without a reload.
+  useNotificationEvents((note) => { if (note.kind.startsWith("friend.")) load().catch(() => {}); });
+  const { refresh: refreshNotifications } = useNotifications();
   async function act(action: () => Promise<void>) {
     setBusy(true);
     setError("");
     setNotice("");
-    try { await action(); } catch (err) { setError(err instanceof Error ? err.message : "Could not update your friends."); } finally { setBusy(false); }
+    try { await action(); } catch (err) { setError(err instanceof Error ? err.message : "Could not update your friends."); } finally { setBusy(false); refreshNotifications().catch(() => {}); }
   }
   function request(e: FormEvent) {
     e.preventDefault();

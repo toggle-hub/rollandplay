@@ -1,23 +1,24 @@
 import { FormEvent, useState } from "react";
 import { ArrowCounterClockwise, Flask, MagicWand, Plus, Sword, Trash } from "@phosphor-icons/react";
-import type { ActionKind, RoomToken, TokenAction, TokenAttack, TokenItem } from "../api/types";
-import { damageTypes } from "../lib/actions";
+import type { ActionKind, ActionLists, TokenAction, TokenAttack, TokenItem } from "../api/types";
+import { compendiumSummary, damageTypes } from "../lib/actions";
 import { diceExpressionPattern, dndAbilities } from "../lib/attacks";
 import { humanizeKey } from "../lib/checks";
 
-type Lists = { attacks: TokenAttack[]; actions: TokenAction[]; items: TokenItem[] };
+type Limits = { attacks: number; actions: number; items: number };
 
 type Props = {
-  token: RoomToken;
+  owner: { id: string; name: string; attacks?: TokenAttack[]; actions?: TokenAction[]; items?: TokenItem[] };
+  /** Entries offered by "Add from compendium"; no picker without it. */
+  compendium?: ActionLists;
+  limits?: Limits;
   busy: boolean;
-  onSave: (lists: Lists) => void;
+  onSave: (lists: ActionLists) => void;
   onClose: () => void;
 };
 
-// Same caps as the server (Go `MaxAttacks`, `MaxActions`, `MaxItems`).
-const maxAttacks = 20;
-const maxActions = 30;
-const maxItems = 50;
+// Same caps as the server's character lists (Go `MaxAttacks`, `MaxActions`, `MaxItems`).
+const characterLimits: Limits = { attacks: 20, actions: 30, items: 50 };
 
 const actionKinds: { value: ActionKind; label: string }[] = [
   { value: "attack", label: "Attack roll" },
@@ -43,6 +44,20 @@ type DraftAction = DraftEffect & { limited: boolean; uses_max: string; uses_rema
 
 type DraftItem = DraftEffect & { quantity: string };
 
+function draftAttack(a: TokenAttack): DraftAttack {
+  return {
+    id: a.id,
+    name: a.name,
+    range_m: String(a.range_m),
+    ability: a.ability,
+    proficient: a.proficient,
+    attack_bonus: String(a.attack_bonus),
+    damage: a.damage,
+    damage_bonus: String(a.damage_bonus),
+    damage_type: a.damage_type,
+  };
+}
+
 function draftEffect(a: Omit<TokenAction, "uses">): DraftEffect {
   return {
     id: a.id,
@@ -60,6 +75,14 @@ function draftEffect(a: Omit<TokenAction, "uses">): DraftEffect {
     ability_to_dice: a.ability_to_dice,
     damage_type: a.damage_type,
   };
+}
+
+function draftAction(a: TokenAction): DraftAction {
+  return { ...draftEffect(a), limited: !!a.uses, uses_max: String(a.uses?.max ?? 1), uses_remaining: String(a.uses?.remaining ?? 1) };
+}
+
+function draftItem(i: TokenItem): DraftItem {
+  return { ...draftEffect(i), quantity: String(i.quantity) };
 }
 
 function newAction(): DraftAction {
@@ -117,27 +140,12 @@ function parseEffect(row: DraftEffect, fallbackName: string): Omit<TokenAction, 
   };
 }
 
-export function TokenActionsEditor({ token, busy, onSave, onClose }: Props) {
-  const [attacks, setAttacks] = useState<DraftAttack[]>(() => (token.attacks ?? []).map((attack) => ({
-    id: attack.id,
-    name: attack.name,
-    range_m: String(attack.range_m),
-    ability: attack.ability,
-    proficient: attack.proficient,
-    attack_bonus: String(attack.attack_bonus),
-    damage: attack.damage,
-    damage_bonus: String(attack.damage_bonus),
-    damage_type: attack.damage_type,
-  })));
-  const [actions, setActions] = useState<DraftAction[]>(() => (token.actions ?? []).map((action) => ({
-    ...draftEffect(action),
-    limited: !!action.uses,
-    uses_max: String(action.uses?.max ?? 1),
-    uses_remaining: String(action.uses?.remaining ?? 1),
-  })));
-  const [items, setItems] = useState<DraftItem[]>(() => (token.items ?? []).map((item) => ({ ...draftEffect(item), quantity: String(item.quantity) })));
+export function ActionsEditor({ owner, compendium, limits = characterLimits, busy, onSave, onClose }: Props) {
+  const [attacks, setAttacks] = useState<DraftAttack[]>(() => (owner.attacks ?? []).map(draftAttack));
+  const [actions, setActions] = useState<DraftAction[]>(() => (owner.actions ?? []).map(draftAction));
+  const [items, setItems] = useState<DraftItem[]>(() => (owner.items ?? []).map(draftItem));
   const [error, setError] = useState("");
-  const headingId = `actions-heading-${token.id}`;
+  const headingId = `actions-heading-${owner.id}`;
 
   function updateAttack(index: number, patch: Partial<DraftAttack>) {
     setAttacks((rows) => rows.map((row, rowIndex) => rowIndex === index ? { ...row, ...patch } : row));
@@ -149,11 +157,11 @@ export function TokenActionsEditor({ token, busy, onSave, onClose }: Props) {
     setItems((rows) => rows.map((row, rowIndex) => rowIndex === index ? { ...row, ...patch } : row));
   }
 
-  function validate(): Lists | string {
-    if (attacks.length > maxAttacks) return `A character can have at most ${maxAttacks} attacks.`;
-    if (actions.length > maxActions) return `A character can have at most ${maxActions} spells and abilities.`;
-    if (items.length > maxItems) return `A character can have at most ${maxItems} items.`;
-    const lists: Lists = { attacks: [], actions: [], items: [] };
+  function validate(): ActionLists | string {
+    if (attacks.length > limits.attacks) return `This list can have at most ${limits.attacks} attacks.`;
+    if (actions.length > limits.actions) return `This list can have at most ${limits.actions} spells and abilities.`;
+    if (items.length > limits.items) return `This list can have at most ${limits.items} items.`;
+    const lists: ActionLists = { attacks: [], actions: [], items: [] };
     for (const [index, row] of attacks.entries()) {
       const name = row.name.trim();
       if (!name) return `Attack ${index + 1} needs a name.`;
@@ -202,7 +210,7 @@ export function TokenActionsEditor({ token, busy, onSave, onClose }: Props) {
   }
 
   return <form className="card space-y-4 p-5!" onSubmit={submit} aria-labelledby={headingId}>
-    <h2 id={headingId} className="text-xl">Actions · {token.name}</h2>
+    <h2 id={headingId} className="text-xl">Actions · {owner.name}</h2>
 
     <section className="space-y-4" aria-labelledby={`${headingId}-attacks`}>
       <h3 id={`${headingId}-attacks`} className="flex items-center gap-2 text-lg"><Sword size={20} className="text-[var(--accent)]" aria-hidden="true" />Attacks</h3>
@@ -249,7 +257,9 @@ export function TokenActionsEditor({ token, busy, onSave, onClose }: Props) {
           </button>
         </fieldset>;
       })}
-      <button className="btn-secondary w-full" type="button" disabled={attacks.length >= maxAttacks} onClick={() => setAttacks((rows) => [...rows, {
+      {compendium && <CompendiumPicker label="Compendium weapon" entries={compendium.attacks} taken={attacks} disabled={attacks.length >= limits.attacks}
+        onAdd={(entry) => setAttacks((rows) => [...rows, draftAttack(entry)])} />}
+      <button className="btn-secondary w-full" type="button" disabled={attacks.length >= limits.attacks} onClick={() => setAttacks((rows) => [...rows, {
         id: crypto.randomUUID(),
         name: "",
         range_m: "1.5",
@@ -288,8 +298,10 @@ export function TokenActionsEditor({ token, busy, onSave, onClose }: Props) {
           </button>
         </fieldset>;
       })}
+      {compendium && <CompendiumPicker label="Compendium spell or ability" entries={compendium.actions} taken={actions} disabled={actions.length >= limits.actions}
+        onAdd={(entry) => setActions((rows) => [...rows, draftAction(entry)])} />}
       <div className="flex flex-wrap gap-3">
-        <button className="btn-secondary flex-1" type="button" disabled={actions.length >= maxActions} onClick={() => setActions((rows) => [...rows, newAction()])}>
+        <button className="btn-secondary flex-1" type="button" disabled={actions.length >= limits.actions} onClick={() => setActions((rows) => [...rows, newAction()])}>
           <Plus size={16} aria-hidden="true" />Add spell or ability
         </button>
         <button className="btn-secondary flex-1" type="button" disabled={!actions.some((row) => row.limited)}
@@ -316,7 +328,9 @@ export function TokenActionsEditor({ token, busy, onSave, onClose }: Props) {
           </button>
         </fieldset>;
       })}
-      <button className="btn-secondary w-full" type="button" disabled={items.length >= maxItems} onClick={() => setItems((rows) => [...rows, newItem()])}>
+      {compendium && <CompendiumPicker label="Compendium item" entries={compendium.items} taken={items} disabled={items.length >= limits.items}
+        onAdd={(entry) => setItems((rows) => [...rows, draftItem(entry)])} />}
+      <button className="btn-secondary w-full" type="button" disabled={items.length >= limits.items} onClick={() => setItems((rows) => [...rows, newItem()])}>
         <Plus size={16} aria-hidden="true" />Add item
       </button>
     </section>
@@ -327,6 +341,32 @@ export function TokenActionsEditor({ token, busy, onSave, onClose }: Props) {
       <button className="btn-secondary" type="button" onClick={onClose}>Close</button>
     </div>
   </form>;
+}
+
+/** "Add from compendium": offers the entries not already in the list. */
+function CompendiumPicker<T extends TokenAttack | TokenAction | TokenItem>({ label, entries, taken, disabled, onAdd }: {
+  label: string;
+  entries: T[];
+  taken: { id: string }[];
+  disabled: boolean;
+  onAdd: (entry: T) => void;
+}) {
+  const [selected, setSelected] = useState("");
+  const available = entries.filter((entry) => !taken.some((row) => row.id === entry.id));
+  const entry = available.find((item) => item.id === selected);
+  return <div className="flex flex-wrap items-end gap-3">
+    <label className="field-label min-w-0 flex-1">Add from compendium
+      <select aria-label={label} className="w-full min-w-0" value={entry ? selected : ""} onChange={(e) => setSelected(e.target.value)}>
+        <option value=""></option>
+        {available.map((item) => <option key={item.id} value={item.id}>{`${item.name} — ${compendiumSummary(item)}`}</option>)}
+      </select>
+    </label>
+    <button className="btn-secondary" type="button" aria-label={`Add ${label.toLowerCase()}`} disabled={!entry || disabled} onClick={() => {
+      if (!entry) return;
+      onAdd(entry);
+      setSelected("");
+    }}>Add</button>
+  </div>;
 }
 
 function DamageTypeSelect({ id, value, onChange }: { id: string; value: string; onChange: (value: string) => void }) {

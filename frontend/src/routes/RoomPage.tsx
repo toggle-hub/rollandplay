@@ -9,8 +9,9 @@ import { ChatPanel } from "../components/ChatPanel";
 import { CheckPromptForm } from "../components/CheckPromptForm";
 import { RoomChecks } from "../components/RoomChecks";
 import { PlayerName } from "../components/PlayerName";
-import { TokenActionsEditor } from "../components/TokenActionsEditor";
+import { ActionsEditor } from "../components/ActionsEditor";
 import { TokenSettingsPanel } from "../components/TokenSettingsPanel";
+import { RoomInvitePanel } from "../components/RoomInvitePanel";
 import { useToast } from "../components/Toast";
 import { defaultBlocksForKind, structureTypes, type StructureBlocks } from "../lib/structures";
 import { createFrameThrottle } from "../lib/frameThrottle";
@@ -132,7 +133,7 @@ export function RoomPage() {
           void load();
         }
       }
-      if (event.type === "token.updated" || event.type === "token.removed" || event.type === "structure.moved" || event.type === "structure.updated" || event.type === "structure.created" || event.type === "structure.removed" || event.type === "map.activated" || event.type === "vision.update" || event.type === "check.changed" || event.type === "state.snapshot") void load();
+      if (event.type === "token.updated" || event.type === "token.removed" || event.type === "structure.moved" || event.type === "structure.updated" || event.type === "structure.created" || event.type === "structure.removed" || event.type === "map.activated" || event.type === "vision.update" || event.type === "check.changed" || event.type === "member.joined" || event.type === "state.snapshot") void load();
       if (event.type === "map.activated" || event.type === "state.snapshot") setRemoteDrags(new Map());
       // The preview stays on the landing position until the reloaded state has the token there.
       if (event.type === "token.moved" && isTokenIdsBody(event.body)) {
@@ -424,7 +425,7 @@ export function RoomPage() {
 
         {isDM && <CheckPromptForm members={members} onPrompt={(request) => sendMap("check.prompt", request)} />}
 
-        {actionEditorToken && <TokenActionsEditor key={actionEditorToken.id} token={actionEditorToken} busy={busy}
+        {actionEditorToken && <ActionsEditor key={actionEditorToken.id} owner={actionEditorToken} busy={busy}
           onSave={(lists) => void update(() => patchJSON(`/api/rooms/${roomId}/tokens/${actionEditorToken.id}/actions`, lists))}
           onClose={() => setActionEditorTokenId(null)} />}
 
@@ -497,6 +498,7 @@ export function RoomPage() {
           <h2 className="flex items-center gap-2 text-xl"><UsersThree size={22} className="text-[var(--accent)]" aria-hidden="true" />At the table</h2>
           <div className="mt-5 space-y-4">{members.length === 0 ? <p className="text-muted text-sm">No members to display.</p> : members.map((member) => <div className="space-y-2 border-t border-[var(--paper)]/10 pt-3" key={member.user_id}><div className="flex items-start justify-between gap-3"><span className="min-w-0 break-words text-sm"><PlayerName player={{ id: member.user_id, username: member.username, pronouns: member.pronouns }} />{member.user_id === user?.id ? " (you)" : ""}</span><span className="shrink-0 text-xs text-[var(--muted)]">{member.is_dm ? "Game master" : "Player"}</span></div>{(isDM || member.user_id === user?.id) && <label className="block text-xs text-[var(--muted)]">{isDM ? "Assigned character" : "Your character"}<select className="mt-2 w-full text-sm" value={member.sheet_id ?? ""} disabled={busy} onChange={(e) => { const sheetId = e.target.value || null; void update(() => patchJSON(`/api/rooms/${roomId}/members/${member.user_id}`, { sheet_id: sheetId })); }}><option value="">No sheet</option>{roomSheets.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label>}</div>)}</div>
         </section>
+        {isDM && roomId && <RoomInvitePanel roomId={roomId} memberCount={members.length} />}
         <RoomChecks checks={state.checks ?? []} members={members} currentUserId={user?.id} isDM={isDM}
           onRoll={(checkId, userId) => sendMap("check.roll", userId ? { checkId, userId } : { checkId })}
           onClose={(checkId) => sendMap("check.close", { checkId })} />

@@ -34,6 +34,18 @@ type ResolvedAttack struct {
 }
 
 func ParseAttacks(raw []byte) ([]Attack, error) {
+	attacks, err := decodeAttacks(raw)
+	if err != nil {
+		return nil, err
+	}
+	if len(attacks) > MaxAttacks {
+		return nil, fmt.Errorf("a character can have at most %d attacks", MaxAttacks)
+	}
+	return attacks, nil
+}
+
+// decodeAttacks validates and normalizes an attacks list without a length cap.
+func decodeAttacks(raw []byte) ([]Attack, error) {
 	trimmed := bytes.TrimSpace(raw)
 	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
 		return []Attack{}, nil
@@ -46,9 +58,6 @@ func ParseAttacks(raw []byte) ([]Attack, error) {
 	}
 	if attacks == nil {
 		attacks = []Attack{}
-	}
-	if len(attacks) > MaxAttacks {
-		return nil, fmt.Errorf("a character can have at most %d attacks", MaxAttacks)
 	}
 	seen := make(map[string]struct{}, len(attacks))
 	for i := range attacks {

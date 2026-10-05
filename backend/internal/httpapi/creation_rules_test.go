@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"reflect"
 	"testing"
+
+	"rollandplay/backend/internal/game"
 )
 
 const customCreationRules = `{"classes":[{"id":"mage","name":"Mage","defaults":{"hit_die":6},"choices":[{"attribute":"skills","label":"Training","count":1,"options":["arcana","nature"]}]}],"point_buy":{"attributes":["focus","grit"],"min":0,"max":3,"budget":6,"costs":{"0":0,"1":1,"2":3,"3":5},"bonus_budget":1,"bonus_max":1}}`
@@ -11,7 +13,7 @@ const validCreation = `{"class_id":"mage","scores":{"focus":3,"grit":1},"bonuses
 
 func TestCreationAppliesClassChoicesAndSeparateBonuses(t *testing.T) {
 	attributes := map[string]any{"focus": float64(0), "skills": map[string]any{"arcana": false, "nature": false, "quiet": true}}
-	rules, err := parseCreationRules(json.RawMessage(customCreationRules), attributes)
+	rules, err := parseCreationRules(json.RawMessage(customCreationRules), attributes, game.Compendium{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -29,7 +31,7 @@ func TestCreationAppliesClassChoicesAndSeparateBonuses(t *testing.T) {
 }
 
 func TestCreationRejectsInvalidSelectionsAndJSONBypass(t *testing.T) {
-	rules, err := parseCreationRules(json.RawMessage(customCreationRules), nil)
+	rules, err := parseCreationRules(json.RawMessage(customCreationRules), nil, game.Compendium{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -79,10 +81,29 @@ func TestCreationRejectsInvalidRuleConfiguration(t *testing.T) {
 		`{"point_buy":{"attributes":["score"],"min":0,"max":1000,"budget":5,"costs":{},"bonus_budget":0,"bonus_max":0}}`,
 		`{"point_buy":{"attributes":["score"],"min":0,"max":1,"budget":-1,"costs":{"0":0,"1":1},"bonus_budget":0,"bonus_max":0}}`,
 		`{"point_buy":{"attributes":["class"],"min":0,"max":1,"budget":5,"costs":{"0":0,"1":1},"bonus_budget":0,"bonus_max":0}}`,
+		`{"classes":[{"id":"a","name":"A","defaults":{"attacks":[]}}]}`,
+		`{"classes":[{"id":"a","name":"A","defaults":{},"starting_equipment":{"attacks":["axe"]}}]}`,
 	}
 	for _, raw := range cases {
-		if _, err := parseCreationRules(json.RawMessage(raw), nil); err == nil {
+		if _, err := parseCreationRules(json.RawMessage(raw), nil, game.Compendium{}); err == nil {
 			t.Fatalf("invalid configuration accepted: %s", raw)
 		}
+	}
+}
+
+func TestCreationAcceptsStartingEquipmentFromCompendium(t *testing.T) {
+	compendium, err := game.ParseCompendium([]byte(`{"attacks":[{"id":"axe","name":"Axe","range_m":1.5,"damage":"1d6"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rules, err := parseCreationRules(json.RawMessage(`{"classes":[{"id":"a","name":"A","defaults":{},"starting_equipment":{"attacks":["axe"]}}]}`), nil, compendium)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if kit := rules.Classes[0].StartingEquipment; kit == nil || len(kit.Attacks) != 1 || kit.Attacks[0] != "axe" {
+		t.Fatalf("unexpected starting equipment: %+v", kit)
+	}
+	if _, err := parseCreationRules(json.RawMessage(`{"classes":[{"id":"a","name":"A","defaults":{},"starting_equipment":{"attacks":["axe","axe"]}}]}`), nil, compendium); err == nil {
+		t.Fatal("repeated starting equipment accepted")
 	}
 }

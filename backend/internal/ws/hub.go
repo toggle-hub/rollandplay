@@ -925,6 +925,11 @@ func (h *Hub) loadToken(ctx context.Context, roomID, tokenID string) (game.Token
 func (h *Hub) PublishTokenUpdated(roomID, tokenID string) {
 	h.publish(roomID, envelope{Type: "token.updated", Body: map[string]any{"room_id": roomID, "token_id": tokenID}})
 }
+
+// PublishMemberJoined tells room clients to reload the member list after someone joins over HTTP.
+func (h *Hub) PublishMemberJoined(roomID, userID string) {
+	h.publish(roomID, envelope{Type: "member.joined", Body: map[string]any{"room_id": roomID, "user_id": userID}})
+}
 func (h *Hub) bump(roomID string) {
 	if h.redis != nil {
 		_ = h.redis.Incr(context.Background(), "room:"+roomID+":version").Err()

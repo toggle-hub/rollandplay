@@ -1,11 +1,16 @@
 import type {
+  ActionLists,
   ActionRoll,
   ResolvedTokenAction,
   ResolvedTokenAttack,
   ResolvedTokenItem,
   RollResult,
   RoomToken,
+  RuleBook,
   TargetOutcome,
+  TokenAction,
+  TokenAttack,
+  TokenItem,
 } from "../api/types";
 import { formatModifier } from "./attacks";
 import { humanizeKey } from "./checks";
@@ -179,4 +184,63 @@ export function isDown(t: RoomToken): boolean {
 
 export function canDeathSave(t: RoomToken): boolean {
   return !!t.sheet_id && isDown(t) && !t.death_saves?.dead && !t.death_saves?.stable;
+}
+
+export function emptyActionLists(): ActionLists {
+  return { attacks: [], actions: [], items: [] };
+}
+
+function listOf<T>(value: unknown): T[] {
+  return Array.isArray(value) ? value as T[] : [];
+}
+
+/** The attacks, actions and items stored in sheet data; a missing or malformed list is empty. */
+export function sheetActionLists(data: Record<string, unknown>): ActionLists {
+  return { attacks: listOf<TokenAttack>(data.attacks), actions: listOf<TokenAction>(data.actions), items: listOf<TokenItem>(data.items) };
+}
+
+export function hasCompendium(lists: ActionLists): boolean {
+  return lists.attacks.length > 0 || lists.actions.length > 0 || lists.items.length > 0;
+}
+
+function byIds<T extends { id: string }>(entries: T[], ids: string[] = []): T[] {
+  return ids.flatMap((id) => entries.filter((entry) => entry.id === id).slice(0, 1));
+}
+
+/** The compendium entries a class grants as starting equipment, in kit order; unknown ids are skipped. */
+export function startingLists(book: RuleBook, classId?: string): ActionLists {
+  const kit = book.creation_rules.classes?.find((cls) => cls.id === classId)?.starting_equipment;
+  if (!kit) return emptyActionLists();
+  return {
+    attacks: byIds(book.compendium.attacks, kit.attacks),
+    actions: byIds(book.compendium.actions, kit.actions),
+    items: byIds(book.compendium.items, kit.items),
+  };
+}
+
+function picked<T extends { id: string }>(values: T[], picks: T[]): T[] {
+  return [...values.filter((entry) => !picks.some((pick) => pick.id === entry.id)), ...picks];
+}
+
+/** Appends the picks to the values, a pick replacing the value with the same id. */
+export function withPicks(values: ActionLists, picks: ActionLists): ActionLists {
+  return { attacks: picked(values.attacks, picks.attacks), actions: picked(values.actions, picks.actions), items: picked(values.items, picks.items) };
+}
+
+/** A one-line description of an unresolved entry, before any character's modifiers apply. */
+export function compendiumSummary(entry: TokenAttack | TokenAction | TokenItem): string {
+  if ("damage" in entry) return `${withType(entry.damage, entry.damage_bonus, entry.damage_type)} · ${entry.range_m} m`;
+  const parts: string[] = [];
+  if (entry.kind === "attack") {
+    parts.push("Attack roll", withType(entry.dice, entry.dice_bonus, entry.damage_type));
+  } else if (entry.kind === "save") {
+    parts.push(`${humanizeKey(entry.save_ability)} save`, withType(entry.dice, entry.dice_bonus, entry.damage_type));
+    if (entry.half_on_save) parts.push("half on save");
+    if (entry.area_radius_m > 0) parts.push(`${entry.area_radius_m} m radius`);
+  } else {
+    parts.push("Healing", `${entry.dice}${formatModifier(entry.dice_bonus)}${entry.ability_to_dice ? " + modifier" : ""}`);
+  }
+  parts.push(`${entry.range_m} m`);
+  if ("quantity" in entry) parts.push(`×${entry.quantity}`);
+  return parts.join(" · ");
 }

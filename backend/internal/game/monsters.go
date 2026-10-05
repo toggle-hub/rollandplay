@@ -67,23 +67,8 @@ func ParseMonsters(raw []byte) ([]Monster, error) {
 		if m.Stats == nil {
 			m.Stats = map[string]any{}
 		}
-		if attacks, ok := m.Stats["attacks"]; ok {
-			b, _ := json.Marshal(attacks)
-			if _, err := ParseAttacks(b); err != nil {
-				return nil, fmt.Errorf("monster %q: %w", m.Name, err)
-			}
-		}
-		if actions, ok := m.Stats["actions"]; ok {
-			b, _ := json.Marshal(actions)
-			if _, err := ParseActions(b); err != nil {
-				return nil, fmt.Errorf("monster %q: %w", m.Name, err)
-			}
-		}
-		if items, ok := m.Stats["items"]; ok {
-			b, _ := json.Marshal(items)
-			if _, err := ParseItems(b); err != nil {
-				return nil, fmt.Errorf("monster %q: %w", m.Name, err)
-			}
+		if err := ValidateStatLists(m.Stats); err != nil {
+			return nil, fmt.Errorf("monster %q: %w", m.Name, err)
 		}
 	}
 	return monsters, nil

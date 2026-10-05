@@ -33,12 +33,13 @@ import (
 )
 
 type Server struct {
-	Pool   *pgxpool.Pool
-	Redis  *redis.Client
-	Config config.Config
-	Assets assets.Store
-	Hub    *ws.Hub
-	Logger *zap.Logger
+	Pool     *pgxpool.Pool
+	Redis    *redis.Client
+	Config   config.Config
+	Assets   assets.Store
+	Hub      *ws.Hub
+	Notifier *ws.Notifier
+	Logger   *zap.Logger
 }
 
 func New(pool *pgxpool.Pool, rdb *redis.Client, cfg config.Config) (*Server, error) {
@@ -55,6 +56,7 @@ func NewWithLogger(pool *pgxpool.Pool, rdb *redis.Client, cfg config.Config, log
 	}
 	s := &Server{Pool: pool, Redis: rdb, Config: cfg, Assets: store, Logger: logger}
 	s.Hub = ws.NewHubWithLogger(pool, rdb, logger.Named("websocket"))
+	s.Notifier = ws.NewNotifier(rdb, logger.Named("notifications"))
 	return s, nil
 }
 
@@ -78,6 +80,13 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/friends", s.handleFriendCreate)
 	mux.HandleFunc("PATCH /api/friends/{friendID}", s.handleFriendPatch)
 	mux.HandleFunc("DELETE /api/friends/{friendID}", s.handleFriendDelete)
+	mux.HandleFunc("GET /api/notifications", s.handleNotifications)
+	mux.HandleFunc("GET /api/notifications/ws", s.Notifier.Handle)
+	mux.HandleFunc("GET /api/rooms/{roomID}/invite-candidates", s.handleInviteCandidates)
+	mux.HandleFunc("GET /api/rooms/{roomID}/invitations", s.handleRoomInvitationsList)
+	mux.HandleFunc("POST /api/rooms/{roomID}/invitations", s.handleRoomInvitationCreate)
+	mux.HandleFunc("POST /api/room-invitations/{invitationID}/accept", s.handleRoomInvitationAccept)
+	mux.HandleFunc("DELETE /api/room-invitations/{invitationID}", s.handleRoomInvitationDelete)
 	mux.HandleFunc("GET /api/rule-books", s.handleRuleBooksList)
 	mux.HandleFunc("POST /api/rule-books", s.handleRuleBookCreate)
 	mux.HandleFunc("GET /api/rule-books/{ruleBookID}", s.handleRuleBookGet)
@@ -87,6 +96,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/sheets", s.handleSheetCreate)
 	mux.HandleFunc("GET /api/sheets/{sheetID}", s.handleSheetGet)
 	mux.HandleFunc("PATCH /api/sheets/{sheetID}", s.handleSheetPatch)
+	mux.HandleFunc("PATCH /api/sheets/{sheetID}/actions", s.handleSheetActionsPatch)
 	mux.HandleFunc("GET /api/maps", s.handleMapsList)
 	mux.HandleFunc("POST /api/maps", s.handleMapCreate)
 	mux.HandleFunc("GET /api/maps/{mapID}", s.handleMapGet)
@@ -477,7 +487,22 @@ func (s *Server) handleRoomJoin(w http.ResponseWriter, r *http.Request) {
 		WriteError(w, 500, "db", err.Error())
 		return
 	}
-	// The invite carries the room's rule book so the client can ask for a matching character.
+	s.respondJoined(w, r, u, roomID)
+}
+
+// respondJoined answers a join with the room's rule book, so the client can ask for a matching
+// character, and the caller's membership. Room clients reload their member list, and a pending
+// invitation to the room is spent: it is deleted and its inviter told.
+func (s *Server) respondJoined(w http.ResponseWriter, r *http.Request, u auth.User, roomID string) {
+	s.Hub.PublishMemberJoined(roomID, u.ID)
+	var inviterID, roomName string
+	err := s.Pool.QueryRow(r.Context(), `delete from room_invitations i using rooms r where r.id=i.room_id and i.room_id=$1 and i.invitee_user_id=$2 returning i.inviter_user_id::text, r.name`, roomID, u.ID).Scan(&inviterID, &roomName)
+	if err == nil {
+		s.Notifier.Notify(inviterID, ws.Notification{Kind: ws.RoomInvitationAccepted, Actor: notificationActor(u), Room: &ws.NotificationRoom{ID: roomID, Name: roomName}})
+	} else if !errors.Is(err, pgx.ErrNoRows) {
+		WriteError(w, 500, "db", err.Error())
+		return
+	}
 	row, err := s.oneJSON(r.Context(), `select jsonb_build_object('room_id',r.id::text,'rule_book',jsonb_build_object('id',b.id::text,'name',b.name),'is_dm',m.is_dm,'sheet_id',m.sheet_id::text) from rooms r join rule_books b on b.id=r.rule_book_id join room_members m on m.room_id=r.id and m.user_id=$2 where r.id=$1`, roomID, u.ID)
 	respondRaw(w, row, err)
 }
@@ -557,7 +582,7 @@ func (s *Server) handleFriendsList(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	rows, err := s.queryJSON(r.Context(), `select jsonb_build_object('id',f.id::text,'requester_user_id',f.requester_user_id::text,'addressee_user_id',f.addressee_user_id::text,'status',f.status,'blocked_by_user_id',f.blocked_by_user_id::text,'other_user',jsonb_build_object('id',ou.id::text,'username',ou.username,'email',ou.email::text,'pronouns',ou.pronouns,'profile_complete',ou.profile_complete),'direction',case when f.addressee_user_id=$1 then 'inbound' else 'outbound' end) from friends f join users ou on ou.id=case when f.requester_user_id=$1 then f.addressee_user_id else f.requester_user_id end where f.requester_user_id=$1 or f.addressee_user_id=$1 order by f.updated_at desc`, u.ID)
+	rows, err := s.queryJSON(r.Context(), friendSelect+` where f.requester_user_id=$1 or f.addressee_user_id=$1 order by f.updated_at desc`, u.ID)
 	if err != nil {
 		WriteError(w, 500, "db", err.Error())
 		return
@@ -605,6 +630,7 @@ func (s *Server) handleFriendCreate(w http.ResponseWriter, r *http.Request) {
 		WriteError(w, 409, "friend_exists", "friendship already exists")
 		return
 	}
+	s.Notifier.Notify(target, ws.Notification{Kind: ws.FriendRequested, Actor: notificationActor(u)})
 	writeRaw(w, 201, row)
 }
 func (s *Server) handleFriendPatch(w http.ResponseWriter, r *http.Request) {
@@ -618,12 +644,22 @@ func (s *Server) handleFriendPatch(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = ReadJSON(r, &req)
 	if req.Status == "accepted" {
-		row, err := s.oneJSON(r.Context(), `update friends set status='accepted',blocked_by_user_id=null,updated_at=now() where id=$1 and addressee_user_id=$2 and status='pending' returning jsonb_build_object('id',id::text,'status',status)`, id, u.ID)
+		var row json.RawMessage
+		var requester string
+		err := s.Pool.QueryRow(r.Context(), `update friends set status='accepted',blocked_by_user_id=null,updated_at=now() where id=$1 and addressee_user_id=$2 and status='pending' returning jsonb_build_object('id',id::text,'status',status), requester_user_id::text`, id, u.ID).Scan(&row, &requester)
+		if err == nil {
+			s.Notifier.Notify(requester, ws.Notification{Kind: ws.FriendAccepted, Actor: notificationActor(u)})
+		}
 		respondRaw(w, row, err)
 		return
 	}
 	if req.Status == "blocked" {
-		row, err := s.oneJSON(r.Context(), `update friends set status='blocked',blocked_by_user_id=$2,updated_at=now() where id=$1 and (requester_user_id=$2 or addressee_user_id=$2) returning jsonb_build_object('id',id::text,'status',status,'blocked_by_user_id',blocked_by_user_id::text)`, id, u.ID)
+		var row json.RawMessage
+		var other string
+		err := s.Pool.QueryRow(r.Context(), `update friends set status='blocked',blocked_by_user_id=$2,updated_at=now() where id=$1 and (requester_user_id=$2 or addressee_user_id=$2) returning jsonb_build_object('id',id::text,'status',status,'blocked_by_user_id',blocked_by_user_id::text), `+friendOther+`::text`, id, u.ID).Scan(&row, &other)
+		if err == nil {
+			s.Notifier.Notify(other, ws.Notification{Kind: ws.FriendChanged})
+		}
 		respondRaw(w, row, err)
 		return
 	}
@@ -634,24 +670,32 @@ func (s *Server) handleFriendDelete(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	tag, err := s.Pool.Exec(r.Context(), `delete from friends where id=$1 and (requester_user_id=$2 or addressee_user_id=$2)`, r.PathValue("friendID"), u.ID)
+	var other string
+	err := s.Pool.QueryRow(r.Context(), `delete from friends where id=$1 and (requester_user_id=$2 or addressee_user_id=$2) returning `+friendOther+`::text`, r.PathValue("friendID"), u.ID).Scan(&other)
+	if errors.Is(err, pgx.ErrNoRows) {
+		WriteError(w, 404, "not_found", "friendship not found")
+		return
+	}
 	if err != nil {
 		WriteError(w, 500, "db", err.Error())
 		return
 	}
-	if tag.RowsAffected() == 0 {
-		WriteError(w, 404, "not_found", "friendship not found")
-		return
-	}
+	s.Notifier.Notify(other, ws.Notification{Kind: ws.FriendChanged})
 	w.WriteHeader(204)
 }
 
-const ruleBookJSON = `jsonb_build_object('id',id::text,'owner_id',owner_id::text,'name',name,'is_public',is_public,'attributes',attributes,'creation_rules',creation_rules,'monsters',monsters,'key_order',key_order)`
+// friendSelect renders friends rows from the side of the user bound to $1.
+const friendSelect = `select jsonb_build_object('id',f.id::text,'requester_user_id',f.requester_user_id::text,'addressee_user_id',f.addressee_user_id::text,'status',f.status,'blocked_by_user_id',f.blocked_by_user_id::text,'other_user',jsonb_build_object('id',ou.id::text,'username',ou.username,'email',ou.email::text,'pronouns',ou.pronouns,'profile_complete',ou.profile_complete),'direction',case when f.addressee_user_id=$1 then 'inbound' else 'outbound' end) from friends f join users ou on ou.id=case when f.requester_user_id=$1 then f.addressee_user_id else f.requester_user_id end`
+
+// friendOther is the friends row's user other than the one bound to $2.
+const friendOther = `case when requester_user_id=$2 then addressee_user_id else requester_user_id end`
+
+const ruleBookJSON = `jsonb_build_object('id',id::text,'owner_id',owner_id::text,'name',name,'is_public',is_public,'attributes',attributes,'creation_rules',creation_rules,'monsters',monsters,'compendium',compendium,'key_order',key_order)`
 
 const sheetJSON = `jsonb_build_object('id',id::text,'rule_book_id',rule_book_id::text,'user_id',user_id::text,'name',name,'data',data,'is_public',is_public,'creation',creation,'key_order',key_order)`
 
 // ruleBookOrderedFields are the rule book fields whose author key order is kept in key_order.
-var ruleBookOrderedFields = []string{"attributes", "creation_rules", "monsters"}
+var ruleBookOrderedFields = []string{"attributes", "creation_rules", "monsters", "compendium"}
 
 // requestMonsters validates req["monsters"] (a missing value is an empty list) and returns it as JSON.
 func requestMonsters(req map[string]any) ([]byte, error) {
@@ -661,6 +705,17 @@ func requestMonsters(req map[string]any) ([]byte, error) {
 		return nil, err
 	}
 	return json.Marshal(monsters)
+}
+
+// requestCompendium validates req["compendium"] (missing is empty) and returns it normalized.
+func requestCompendium(req map[string]any) ([]byte, game.Compendium, error) {
+	raw, _ := json.Marshal(req["compendium"])
+	compendium, err := game.ParseCompendium(raw)
+	if err != nil {
+		return nil, game.Compendium{}, err
+	}
+	encoded, err := json.Marshal(compendium)
+	return encoded, compendium, err
 }
 func (s *Server) handleRuleBooksList(w http.ResponseWriter, r *http.Request) {
 	u, _, ok := s.requireUser(w, r)
@@ -691,7 +746,12 @@ func (s *Server) handleRuleBookCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	rulesJSON := jsonRaw(rules)
-	if _, err := parseCreationRules(rulesJSON, attributes); err != nil {
+	compendiumJSON, compendium, err := requestCompendium(req)
+	if err != nil {
+		WriteError(w, 400, "invalid_compendium", err.Error())
+		return
+	}
+	if _, err := parseCreationRules(rulesJSON, attributes, compendium); err != nil {
 		WriteError(w, 400, "invalid_rules", err.Error())
 		return
 	}
@@ -705,7 +765,7 @@ func (s *Server) handleRuleBookCreate(w http.ResponseWriter, r *http.Request) {
 		WriteError(w, 400, "bad_json", err.Error())
 		return
 	}
-	row, err := s.oneJSON(r.Context(), `insert into rule_books(id,owner_id,name,is_public,attributes,creation_rules,monsters,key_order) values($1,$2,$3,$4,$5,$6,$7,$8) returning `+ruleBookJSON, uuid.New().String(), u.ID, str(req, "name", "Untitled Rule Book"), boolv(req, "is_public", false), jsonRaw(attributes), rulesJSON, monsters, order)
+	row, err := s.oneJSON(r.Context(), `insert into rule_books(id,owner_id,name,is_public,attributes,creation_rules,monsters,compendium,key_order) values($1,$2,$3,$4,$5,$6,$7,$8,$9) returning `+ruleBookJSON, uuid.New().String(), u.ID, str(req, "name", "Untitled Rule Book"), boolv(req, "is_public", false), jsonRaw(attributes), rulesJSON, monsters, compendiumJSON, order)
 	respondRawStatus(w, row, err, 201)
 }
 func (s *Server) handleRuleBookGet(w http.ResponseWriter, r *http.Request) {
@@ -745,7 +805,8 @@ func (s *Server) handleRuleBookPatch(w http.ResponseWriter, r *http.Request) {
 	}
 	defer tx.Rollback(r.Context())
 	var attributes, rules map[string]any
-	if err := tx.QueryRow(r.Context(), `select attributes,creation_rules from rule_books where id=$1 for update`, id).Scan(&attributes, &rules); err != nil {
+	var storedCompendium json.RawMessage
+	if err := tx.QueryRow(r.Context(), `select attributes,creation_rules,compendium from rule_books where id=$1 for update`, id).Scan(&attributes, &rules, &storedCompendium); err != nil {
 		respondRaw(w, nil, err)
 		return
 	}
@@ -763,8 +824,20 @@ func (s *Server) handleRuleBookPatch(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	// nil compendiumJSON keeps the stored compendium.
+	var compendiumJSON []byte
+	var compendium game.Compendium
+	if _, exists := req["compendium"]; exists {
+		if compendiumJSON, compendium, err = requestCompendium(req); err != nil {
+			WriteError(w, 400, "invalid_compendium", err.Error())
+			return
+		}
+	} else if compendium, err = game.ParseCompendium(storedCompendium); err != nil {
+		WriteError(w, 400, "invalid_compendium", err.Error())
+		return
+	}
 	rulesJSON := jsonRaw(rules)
-	if _, err := parseCreationRules(rulesJSON, attributes); err != nil {
+	if _, err := parseCreationRules(rulesJSON, attributes, compendium); err != nil {
 		WriteError(w, 400, "invalid_rules", err.Error())
 		return
 	}
@@ -777,7 +850,7 @@ func (s *Server) handleRuleBookPatch(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	var row json.RawMessage
-	err = tx.QueryRow(r.Context(), `update rule_books set name=coalesce($2,name),is_public=coalesce($3,is_public),attributes=$4,creation_rules=$5,monsters=coalesce($6,monsters),key_order=key_order||$7,updated_at=now() where id=$1 returning `+ruleBookJSON, id, nullableString(req, "name"), nullableBool(req, "is_public"), jsonRaw(attributes), rulesJSON, monsters, order).Scan(&row)
+	err = tx.QueryRow(r.Context(), `update rule_books set name=coalesce($2,name),is_public=coalesce($3,is_public),attributes=$4,creation_rules=$5,monsters=coalesce($6,monsters),compendium=coalesce($7,compendium),key_order=key_order||$8,updated_at=now() where id=$1 returning `+ruleBookJSON, id, nullableString(req, "name"), nullableBool(req, "is_public"), jsonRaw(attributes), rulesJSON, monsters, compendiumJSON, order).Scan(&row)
 	if err == nil {
 		err = tx.Commit(r.Context())
 	}
@@ -839,13 +912,18 @@ func (s *Server) handleSheetCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var attributes map[string]any
-	var rulesJSON, bookOrderJSON json.RawMessage
-	err = s.Pool.QueryRow(r.Context(), `select attributes,creation_rules,coalesce(key_order->'attributes','null'::jsonb) from rule_books where id=$1 and `+ruleBookReadable("$2"), rb, u.ID).Scan(&attributes, &rulesJSON, &bookOrderJSON)
+	var rulesJSON, compendiumJSON, bookOrderJSON json.RawMessage
+	err = s.Pool.QueryRow(r.Context(), `select attributes,creation_rules,compendium,coalesce(key_order->'attributes','null'::jsonb) from rule_books where id=$1 and `+ruleBookReadable("$2"), rb, u.ID).Scan(&attributes, &rulesJSON, &compendiumJSON, &bookOrderJSON)
 	if err != nil {
 		respondRaw(w, nil, err)
 		return
 	}
-	rules, err := parseCreationRules(rulesJSON, attributes)
+	compendium, err := game.ParseCompendium(compendiumJSON)
+	if err != nil {
+		WriteError(w, 400, "invalid_rules", err.Error())
+		return
+	}
+	rules, err := parseCreationRules(rulesJSON, attributes, compendium)
 	if err != nil {
 		WriteError(w, 400, "invalid_rules", err.Error())
 		return
@@ -853,6 +931,10 @@ func (s *Server) handleSheetCreate(w http.ResponseWriter, r *http.Request) {
 	data, metadata, err := applyCharacterCreation(attributes, rules, data, jsonRaw(creation))
 	if err != nil {
 		WriteError(w, 400, "invalid_creation", err.Error())
+		return
+	}
+	if err := game.ValidateStatLists(data); err != nil {
+		WriteError(w, 400, "invalid_actions", err.Error())
 		return
 	}
 	order, err := sheetKeyOrder(raw["data"], bookOrderJSON)
@@ -877,6 +959,12 @@ func (s *Server) handleSheetPatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	req, raw, _ := readJSONWithRaw(r)
+	if data, ok := req["data"].(map[string]any); ok {
+		if err := game.ValidateStatLists(data); err != nil {
+			WriteError(w, 400, "invalid_actions", err.Error())
+			return
+		}
+	}
 	order, err := requestKeyOrders(raw, "data")
 	if err != nil {
 		WriteError(w, 400, "bad_json", err.Error())
@@ -884,6 +972,52 @@ func (s *Server) handleSheetPatch(w http.ResponseWriter, r *http.Request) {
 	}
 	row, err := s.oneJSON(r.Context(), `update sheets set name=coalesce($3,name),data=coalesce($4,data),is_public=coalesce($5,is_public),key_order=key_order||$6,updated_at=now() where id=$1 and user_id=$2 returning `+sheetJSON, r.PathValue("sheetID"), u.ID, nullableString(req, "name"), nullableJSON(req, "data"), nullableBool(req, "is_public"), order)
 	respondRaw(w, row, err)
+}
+
+// handleSheetActionsPatch replaces the owner's sheet attacks, spells and abilities, and items,
+// then tells every room holding one of the sheet's tokens to reload it.
+func (s *Server) handleSheetActionsPatch(w http.ResponseWriter, r *http.Request) {
+	u, _, ok := s.requireUser(w, r)
+	if !ok {
+		return
+	}
+	sheetID := r.PathValue("sheetID")
+	if _, err := uuid.Parse(sheetID); err != nil {
+		WriteError(w, 404, "not_found", "sheet not found")
+		return
+	}
+	attacks, actions, items, ok := readActionLists(w, r)
+	if !ok {
+		return
+	}
+	encoded, err := json.Marshal(map[string]any{"attacks": attacks, "actions": actions, "items": items})
+	if err != nil {
+		WriteError(w, 500, "encode", err.Error())
+		return
+	}
+	ctx := r.Context()
+	row, err := s.oneJSON(ctx, `update sheets set data=data||$3::jsonb,updated_at=now() where id=$1 and user_id=$2 returning `+sheetJSON, sheetID, u.ID, json.RawMessage(encoded))
+	if err != nil {
+		respondRaw(w, nil, err)
+		return
+	}
+	// The write succeeded; a failed lookup only skips the live refresh.
+	rows, err := s.Pool.Query(ctx, `select rt.id::text, rm.room_id::text from room_tokens rt join room_maps rm on rm.id=rt.room_map_id where rt.sheet_id=$1`, sheetID)
+	if err == nil {
+		var tokens [][2]string
+		for rows.Next() {
+			var tokenID, roomID string
+			if rows.Scan(&tokenID, &roomID) == nil {
+				tokens = append(tokens, [2]string{tokenID, roomID})
+			}
+		}
+		rows.Close()
+		for _, t := range tokens {
+			s.bumpRoom(ctx, t[1])
+			s.Hub.PublishTokenUpdated(t[1], t[0])
+		}
+	}
+	respondRaw(w, row, nil)
 }
 
 func (s *Server) handleMapsList(w http.ResponseWriter, r *http.Request) {
@@ -1355,6 +1489,38 @@ func (s *Server) handleRoomMonsters(w http.ResponseWriter, r *http.Request) {
 	WriteJSON(w, 200, monsters)
 }
 
+// readActionLists decodes {attacks, actions, items} (all required) with character caps.
+// It writes the 400 response itself; ok is false when the caller must stop.
+func readActionLists(w http.ResponseWriter, r *http.Request) (attacks []game.Attack, actions []game.Action, items []game.Item, ok bool) {
+	var req struct {
+		Attacks json.RawMessage `json:"attacks"`
+		Actions json.RawMessage `json:"actions"`
+		Items   json.RawMessage `json:"items"`
+	}
+	if err := ReadJSON(r, &req); err != nil {
+		WriteError(w, 400, "bad_json", "invalid JSON")
+		return nil, nil, nil, false
+	}
+	if req.Attacks == nil || req.Actions == nil || req.Items == nil {
+		WriteError(w, 400, "invalid_actions", "attacks, actions and items are required")
+		return nil, nil, nil, false
+	}
+	var err error
+	if attacks, err = game.ParseAttacks(req.Attacks); err != nil {
+		WriteError(w, 400, "invalid_actions", err.Error())
+		return nil, nil, nil, false
+	}
+	if actions, err = game.ParseActions(req.Actions); err != nil {
+		WriteError(w, 400, "invalid_actions", err.Error())
+		return nil, nil, nil, false
+	}
+	if items, err = game.ParseItems(req.Items); err != nil {
+		WriteError(w, 400, "invalid_actions", err.Error())
+		return nil, nil, nil, false
+	}
+	return attacks, actions, items, true
+}
+
 // handleTokenActionsPatch replaces a token's attacks, spells and abilities, and items in one write.
 func (s *Server) handleTokenActionsPatch(w http.ResponseWriter, r *http.Request) {
 	u, _, ok := s.requireUser(w, r)
@@ -1383,32 +1549,8 @@ func (s *Server) handleTokenActionsPatch(w http.ResponseWriter, r *http.Request)
 		WriteError(w, 403, "forbidden", "only the character's owner, or the game master for tokens without a sheet, can edit actions")
 		return
 	}
-	var req struct {
-		Attacks json.RawMessage `json:"attacks"`
-		Actions json.RawMessage `json:"actions"`
-		Items   json.RawMessage `json:"items"`
-	}
-	if err := ReadJSON(r, &req); err != nil {
-		WriteError(w, 400, "bad_json", "invalid JSON")
-		return
-	}
-	if req.Attacks == nil || req.Actions == nil || req.Items == nil {
-		WriteError(w, 400, "invalid_actions", "attacks, actions and items are required")
-		return
-	}
-	attacks, err := game.ParseAttacks(req.Attacks)
-	if err != nil {
-		WriteError(w, 400, "invalid_actions", err.Error())
-		return
-	}
-	actions, err := game.ParseActions(req.Actions)
-	if err != nil {
-		WriteError(w, 400, "invalid_actions", err.Error())
-		return
-	}
-	items, err := game.ParseItems(req.Items)
-	if err != nil {
-		WriteError(w, 400, "invalid_actions", err.Error())
+	attacks, actions, items, ok := readActionLists(w, r)
+	if !ok {
 		return
 	}
 	encoded, err := json.Marshal(map[string]any{"attacks": attacks, "actions": actions, "items": items})

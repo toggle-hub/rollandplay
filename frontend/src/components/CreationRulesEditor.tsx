@@ -1,7 +1,15 @@
 import { useState } from "react";
 import { Plus, Trash } from "@phosphor-icons/react";
+import type { ActionLists } from "../api/types";
+import { hasCompendium } from "../lib/actions";
 import { creationRulesDraft, parseCreationRules, rulesFromDraft, scoreRange, type ClassDraft, type CreationRulesDraft } from "../lib/creationRulesConfig";
 import { AttributeFields } from "./AttributeFields";
+
+const equipmentGroups = [
+  { list: "attacks", label: "Weapons" },
+  { list: "actions", label: "Spells & abilities" },
+  { list: "items", label: "Items" },
+] as const;
 
 function NameList({ label, values, onChange }: { label: string; values: string[]; onChange: (values: string[]) => void }) {
   return <div className="min-w-0 space-y-2">
@@ -13,8 +21,8 @@ function NameList({ label, values, onChange }: { label: string; values: string[]
   </div>;
 }
 
-type Props = { draft: CreationRulesDraft; onChange: (draft: CreationRulesDraft) => void };
-export function CreationRulesEditor({ draft, onChange }: Props) {
+type Props = { draft: CreationRulesDraft; compendium: ActionLists; onChange: (draft: CreationRulesDraft) => void };
+export function CreationRulesEditor({ draft, compendium, onChange }: Props) {
   const [error, setError] = useState("");
   function switchMode(mode: CreationRulesDraft["mode"]) {
     if (mode === draft.mode) return;
@@ -25,6 +33,13 @@ export function CreationRulesEditor({ draft, onChange }: Props) {
   }
   function updateClass(key: string, changes: Partial<ClassDraft>) {
     onChange({ ...draft, classes: draft.classes.map((cls) => cls.key === key ? { ...cls, ...changes } : cls) });
+  }
+  /** Adds or removes a compendium id from a class kit, keeping compendium order. */
+  function toggleEquipment(cls: ClassDraft, list: keyof ClassDraft["startingEquipment"], id: string, checked: boolean) {
+    const picked = new Set(cls.startingEquipment[list]);
+    if (checked) picked.add(id); else picked.delete(id);
+    const ids = compendium[list].map((entry) => entry.id).filter((entryId) => picked.has(entryId));
+    updateClass(cls.key, { startingEquipment: { ...cls.startingEquipment, [list]: ids } });
   }
   function updatePoint(changes: Partial<CreationRulesDraft["point"]>) {
     const point = { ...draft.point, ...changes };
@@ -60,11 +75,21 @@ export function CreationRulesEditor({ draft, onChange }: Props) {
               <NameList label="Option" values={choice.options} onChange={(options) => updateClass(cls.key, { choices: cls.choices.map((item) => item.key === choice.key ? { ...item, options } : item) })} />
               <button type="button" className="btn-secondary" onClick={() => updateClass(cls.key, { choices: cls.choices.filter((item) => item.key !== choice.key) })}>Remove choice group</button>
             </fieldset>)}
+            {hasCompendium(compendium) && <fieldset className="min-w-0 space-y-3 rounded-lg border border-[var(--line)] p-3">
+              <legend className="px-1 text-sm">Starting equipment</legend>
+              <p className="text-muted mb-0 text-xs">Pre-picked for new characters of this class. Players can still uncheck them.</p>
+              {equipmentGroups.filter(({ list }) => compendium[list].length > 0).map(({ list, label }) => <fieldset key={list} className="min-w-0 space-y-1">
+                <legend className="field-label">{label}</legend>
+                <div className="grid gap-1 sm:grid-cols-2">{compendium[list].map((entry) => <label key={entry.id} className="flex items-center gap-2 text-sm">
+                  <input type="checkbox" checked={cls.startingEquipment[list].includes(entry.id)} onChange={(e) => toggleEquipment(cls, list, entry.id, e.target.checked)} />{entry.name}
+                </label>)}</div>
+              </fieldset>)}
+            </fieldset>}
             <div className="flex flex-wrap gap-3"><button type="button" className="btn-secondary" onClick={() => updateClass(cls.key, { choices: [...cls.choices, { key: crypto.randomUUID(), attribute: "", label: "", count: "1", options: [""] }] })}>Add choice group</button>
               <button type="button" className="btn-secondary" onClick={() => onChange({ ...draft, classes: draft.classes.filter((item) => item.key !== cls.key) })}>Remove class</button></div>
           </div>
         </details>)}
-        <button type="button" className="btn-secondary" onClick={() => onChange({ ...draft, classes: [...draft.classes, { key: crypto.randomUUID(), id: crypto.randomUUID(), name: "", description: "", defaults: [], choices: [] }] })}><Plus size={18} aria-hidden="true" />Add class</button>
+        <button type="button" className="btn-secondary" onClick={() => onChange({ ...draft, classes: [...draft.classes, { key: crypto.randomUUID(), id: crypto.randomUUID(), name: "", description: "", defaults: [], choices: [], startingEquipment: { attacks: [], actions: [], items: [] } }] })}><Plus size={18} aria-hidden="true" />Add class</button>
       </div>
       <div className="min-w-0 space-y-4 border-t border-[var(--line)] pt-4">
         <label className="flex items-center gap-3"><input type="checkbox" checked={draft.pointEnabled} onChange={(e) => onChange({ ...draft, pointEnabled: e.target.checked })} />Enable point allocation</label>

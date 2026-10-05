@@ -42,6 +42,30 @@ export type RoomMember = {
   sheet_id?: string | null;
   is_dm: boolean;
 };
+/** A user as shown in invitations and notifications. */
+export type PublicUser = { id: string; username: string; pronouns: string };
+/** A pending invitation to a room, as its invitee sees it. */
+export type RoomInvitation = {
+  id: string;
+  created_at: string;
+  room: { id: string; name: string; rule_book: RuleBookRef };
+  inviter: PublicUser;
+};
+/** A pending invitation to a room, as the room's game masters see it. */
+export type SentRoomInvitation = { id: string; room_id: string; created_at: string; invitee: PublicUser };
+/** A user a game master may invite; `invited` when an invitation is already pending. */
+export type InviteCandidate = PublicUser & { invited: boolean };
+/** Response of GET /api/notifications: what waits for the signed-in user. */
+export type NotificationsState = { friend_requests: Friend[]; room_invitations: RoomInvitation[] };
+export type NotificationKind =
+  | "friend.requested"
+  | "friend.accepted"
+  | "friend.changed"
+  | "room_invitation.created"
+  | "room_invitation.accepted"
+  | "room_invitation.removed";
+/** Pushed on GET /api/notifications/ws as `{type: "notification", body}`. */
+export type AppNotification = { kind: NotificationKind; actor?: PublicUser; room?: { id: string; name: string } };
 export type ClassChoice = {
   attribute: string;
   label: string;
@@ -54,7 +78,10 @@ export type CharacterClass = {
   description?: string;
   defaults: Record<string, unknown>;
   choices?: ClassChoice[];
+  /** Compendium ids the class pre-picks at character creation. */
+  starting_equipment?: StartingEquipment;
 };
+export type StartingEquipment = { attacks?: string[]; actions?: string[]; items?: string[] };
 export type PointBuyRules = {
   attributes: string[];
   min: number;
@@ -82,6 +109,8 @@ export type RuleBook = {
   attributes: Record<string, unknown>;
   creation_rules: CreationRules;
   monsters: Monster[];
+  /** Weapons, spells and items characters can pick at creation. */
+  compendium: ActionLists;
 };
 /** A rule book stat block. Placing it in a room copies `stats` (including `attacks`) into the token. */
 export type Monster = {
@@ -162,6 +191,7 @@ export type TokenAction = {
 export type ResolvedTokenAction = TokenAction & { to_hit: number; save_dc: number; dice_modifier: number };
 export type TokenItem = Omit<TokenAction, "uses"> & { quantity: number };
 export type ResolvedTokenItem = Omit<ResolvedTokenAction, "uses"> & { quantity: number };
+export type ActionLists = { attacks: TokenAttack[]; actions: TokenAction[]; items: TokenItem[] };
 export type DeathSaves = { successes: number; failures: number; stable: boolean; dead: boolean };
 export type TokenDefenses = { armor_class: number | null; resistances: string[]; immunities: string[]; vulnerabilities: string[] };
 export type RoomToken = {

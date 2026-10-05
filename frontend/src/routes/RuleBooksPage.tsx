@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { BookOpen, Copy } from "@phosphor-icons/react";
 import { apiFetch, patchJSON, postJSON } from "../api/client";
-import type { CreationRules, Monster, RuleBook } from "../api/types";
+import type { ActionLists, CreationRules, Monster, RuleBook } from "../api/types";
 import { RuleBookCreator } from "../components/RuleBookCreator";
 
 export function RuleBooksPage() {
@@ -15,10 +15,10 @@ export function RuleBooksPage() {
   const [error, setError] = useState("");
   const load = async () => setItems((await apiFetch<RuleBook[]>("/api/rule-books")) ?? []);
   useEffect(() => { load().catch((err: Error) => setError(err.message)).finally(() => setLoading(false)); }, []);
-  async function create(name: string, attributes: Record<string, unknown>, rules: CreationRules, monsters: Monster[]) {
+  async function create(name: string, attributes: Record<string, unknown>, rules: CreationRules, monsters: Monster[], compendium: ActionLists) {
     setCreating(true);
     try {
-      const book = await postJSON<RuleBook>("/api/rule-books", { name, attributes, creation_rules: rules, monsters });
+      const book = await postJSON<RuleBook>("/api/rule-books", { name, attributes, creation_rules: rules, monsters, compendium });
       setItems((current) => {
         const builtIns = current.filter((item) => item.owner_id === null);
         return [...builtIns, book, ...current.filter((item) => item.owner_id !== null)];

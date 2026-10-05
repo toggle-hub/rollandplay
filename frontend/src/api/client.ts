@@ -146,4 +146,12 @@ export function connectRoomSocket(
   ws.onmessage = (event) => onMessage(JSON.parse(event.data));
   return ws;
 }
+/** Opens the signed-in user's notification socket; it only carries `notification` envelopes. */
+export function connectNotificationSocket(
+  onMessage: (event: ServerEnvelope) => void,
+): WebSocket {
+  const ws = new WebSocket(wsURL("/api/notifications/ws"));
+  ws.onmessage = (event) => onMessage(JSON.parse(event.data));
+  return ws;
+}
 export const requestId = () => crypto.randomUUID();

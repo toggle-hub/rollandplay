@@ -87,6 +87,18 @@ type Defenses struct {
 }
 
 func ParseActions(raw []byte) ([]Action, error) {
+	actions, err := decodeActions(raw)
+	if err != nil {
+		return nil, err
+	}
+	if len(actions) > MaxActions {
+		return nil, fmt.Errorf("a character can have at most %d spells and abilities", MaxActions)
+	}
+	return actions, nil
+}
+
+// decodeActions validates and normalizes an actions list without a length cap.
+func decodeActions(raw []byte) ([]Action, error) {
 	trimmed := bytes.TrimSpace(raw)
 	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
 		return []Action{}, nil
@@ -100,9 +112,6 @@ func ParseActions(raw []byte) ([]Action, error) {
 	if actions == nil {
 		actions = []Action{}
 	}
-	if len(actions) > MaxActions {
-		return nil, fmt.Errorf("a character can have at most %d spells and abilities", MaxActions)
-	}
 	seen := make(map[string]struct{}, len(actions))
 	for i := range actions {
 		if err := validateAction(&actions[i], i, "action", seen); err != nil {
@@ -113,6 +122,18 @@ func ParseActions(raw []byte) ([]Action, error) {
 }
 
 func ParseItems(raw []byte) ([]Item, error) {
+	items, err := decodeItems(raw)
+	if err != nil {
+		return nil, err
+	}
+	if len(items) > MaxItems {
+		return nil, fmt.Errorf("a character can have at most %d items", MaxItems)
+	}
+	return items, nil
+}
+
+// decodeItems validates and normalizes an items list without a length cap.
+func decodeItems(raw []byte) ([]Item, error) {
 	trimmed := bytes.TrimSpace(raw)
 	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
 		return []Item{}, nil
@@ -125,9 +146,6 @@ func ParseItems(raw []byte) ([]Item, error) {
 	}
 	if items == nil {
 		items = []Item{}
-	}
-	if len(items) > MaxItems {
-		return nil, fmt.Errorf("a character can have at most %d items", MaxItems)
 	}
 	seen := make(map[string]struct{}, len(items))
 	for i := range items {
@@ -143,6 +161,30 @@ func ParseItems(raw []byte) ([]Item, error) {
 		}
 	}
 	return items, nil
+}
+
+// ValidateStatLists checks stats.attacks, stats.actions and stats.items with the character
+// caps; missing keys are fine.
+func ValidateStatLists(stats map[string]any) error {
+	if v, ok := stats["attacks"]; ok {
+		b, _ := json.Marshal(v)
+		if _, err := ParseAttacks(b); err != nil {
+			return err
+		}
+	}
+	if v, ok := stats["actions"]; ok {
+		b, _ := json.Marshal(v)
+		if _, err := ParseActions(b); err != nil {
+			return err
+		}
+	}
+	if v, ok := stats["items"]; ok {
+		b, _ := json.Marshal(v)
+		if _, err := ParseItems(b); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // validateAction normalizes a and checks it; label ("action" or "item") prefixes errors.

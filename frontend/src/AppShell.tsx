@@ -3,6 +3,7 @@ import type { ReactNode } from "react";
 import { Link, Navigate, NavLink, Outlet, Route, Routes, useLocation, useNavigate } from "react-router-dom";
 import { ArrowRight, List, SignOut, X } from "@phosphor-icons/react";
 import { Brand } from "./components/Brand";
+import { NotificationsMenu } from "./components/NotificationsMenu";
 import { PlayerName } from "./components/PlayerName";
 import { ProfileOnboarding } from "./components/ProfileOnboarding";
 import { LoginPage } from "./routes/LoginPage";
@@ -99,10 +100,13 @@ export function AppShell() {
       <header className="site-header">
         <Link to="/" aria-label="Rollandplay home"><Brand /></Link>
         {profileReady ? <>
-          <div className="ml-auto lg:hidden">
-            <button type="button" className="btn-secondary" aria-label={menuOpen ? "Close navigation" : "Open navigation"} aria-expanded={menuOpen} aria-controls="workspace-navigation" onClick={() => setMenuOpen(!menuOpen)}>
-              {menuOpen ? <X size={22} aria-hidden="true" /> : <List size={22} aria-hidden="true" />}
-            </button>
+          <div className="relative ml-auto flex items-center gap-2 lg:order-last lg:ml-0">
+            <NotificationsMenu />
+            <div className="lg:hidden">
+              <button type="button" className="btn-secondary" aria-label={menuOpen ? "Close navigation" : "Open navigation"} aria-expanded={menuOpen} aria-controls="workspace-navigation" onClick={() => setMenuOpen(!menuOpen)}>
+                {menuOpen ? <X size={22} aria-hidden="true" /> : <List size={22} aria-hidden="true" />}
+              </button>
+            </div>
           </div>
           <div id="workspace-navigation" className={`${menuOpen ? "flex" : "hidden"} w-full flex-col gap-6 lg:flex lg:w-auto lg:flex-1 lg:flex-row lg:items-center lg:justify-between lg:gap-4`}>
             <nav aria-label="Workspace" className="workspace-nav flex flex-wrap gap-1">

@@ -1,11 +1,11 @@
-import { CheckCircle, WarningCircle, X } from "@phosphor-icons/react";
+import { Bell, CheckCircle, WarningCircle, X } from "@phosphor-icons/react";
 import { createContext, useCallback, useContext, useEffect, useRef, useState, type ReactNode } from "react";
 
-export type ToastInput = { kind: "success" | "error"; message: string };
+export type ToastInput = { kind: "success" | "error" | "info"; message: string };
 type ToastItem = ToastInput & { id: number };
 
 const MAX_TOASTS = 4;
-const DURATION_MS: Record<ToastInput["kind"], number> = { success: 5000, error: 8000 };
+const DURATION_MS: Record<ToastInput["kind"], number> = { success: 5000, error: 8000, info: 7000 };
 
 const ToastContext = createContext<((toast: ToastInput) => void) | null>(null);
 
@@ -59,6 +59,8 @@ export function ToastProvider({ children }: { children: ReactNode }) {
           >
             {toast.kind === "error" ? (
               <WarningCircle aria-hidden="true" size={20} weight="fill" className="shrink-0 text-[var(--pink)]" />
+            ) : toast.kind === "info" ? (
+              <Bell aria-hidden="true" size={20} weight="fill" className="shrink-0 text-[var(--accent)]" />
             ) : (
               <CheckCircle aria-hidden="true" size={20} weight="fill" className="shrink-0 text-[var(--green)]" />
             )}

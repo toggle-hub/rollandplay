@@ -59,7 +59,7 @@ func newTestApp(t *testing.T) *testApp {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, name := range []string{"004_default_dnd_rule_book.sql", "005_character_creation_rules.sql", "009_rule_book_monsters.sql", "012_key_order.sql"} {
+	for _, name := range []string{"004_default_dnd_rule_book.sql", "005_character_creation_rules.sql", "009_rule_book_monsters.sql", "012_key_order.sql", "014_rule_book_compendium.sql"} {
 		seed, err := migrations.Files.ReadFile(name)
 		if err != nil {
 			t.Fatal(err)
@@ -563,6 +563,135 @@ func TestFriendsLifecycle(t *testing.T) {
 	}
 }
 
+// readNotification reads notification socket events until one of the given kind arrives.
+func readNotification(t *testing.T, c *websocket.Conn, kind string) map[string]any {
+	t.Helper()
+	for {
+		body := readType(t, c, "notification")["body"].(map[string]any)
+		if body["kind"] == kind {
+			return body
+		}
+	}
+}
+
+func TestFriendRequestNotifications(t *testing.T) {
+	a := newTestApp(t)
+	ca, _ := login(t, a, "notify-a@example.com")
+	cb, _ := login(t, a, "notify-b@example.com")
+	patch[map[string]any](t, ca, a.server.URL, "/api/me", map[string]string{"username": "Asha", "pronouns": "she/her"})
+	aWS := dialPath(t, a, ca, "/api/notifications/ws")
+	defer aWS.Close()
+	bWS := dialPath(t, a, cb, "/api/notifications/ws")
+	defer bWS.Close()
+
+	fr := post[map[string]any](t, ca, a.server.URL, "/api/friends", map[string]string{"email": "notify-b@example.com"})
+	if actor := readNotification(t, bWS, "friend.requested")["actor"].(map[string]any); actor["username"] != "Asha" {
+		t.Fatalf("request should name the requester: %+v", actor)
+	}
+	waiting := get[map[string][]map[string]any](t, cb, a.server.URL, "/api/notifications")
+	if len(waiting["friend_requests"]) != 1 || waiting["friend_requests"][0]["id"] != fr["id"] || len(waiting["room_invitations"]) != 0 {
+		t.Fatalf("expected the pending request: %+v", waiting)
+	}
+	patch[map[string]any](t, cb, a.server.URL, "/api/friends/"+fr["id"].(string), map[string]string{"status": "accepted"})
+	readNotification(t, aWS, "friend.accepted")
+	if waiting := get[map[string][]map[string]any](t, cb, a.server.URL, "/api/notifications"); len(waiting["friend_requests"]) != 0 {
+		t.Fatalf("an accepted request no longer waits: %+v", waiting)
+	}
+	if status := statusOf(t, cb, "DELETE", a.server.URL+"/api/friends/"+fr["id"].(string), nil); status != 204 {
+		t.Fatalf("remove status=%d", status)
+	}
+	readNotification(t, aWS, "friend.changed")
+}
+
+func TestRoomInvitationsByUsername(t *testing.T) {
+	a := newTestApp(t)
+	dm, du := login(t, a, "invite-by-name-dm@example.com")
+	player, pu := login(t, a, "invite-by-name-player@example.com")
+	other, _ := login(t, a, "invite-by-name-other@example.com")
+	blocker, _ := login(t, a, "invite-by-name-blocker@example.com")
+	for c, name := range map[*http.Client]string{dm: "Gwen", player: "Paladin Pete", other: "Petra", blocker: "Pete the Blocker"} {
+		patch[map[string]any](t, c, a.server.URL, "/api/me", map[string]string{"username": name, "pronouns": "they/them"})
+	}
+	fr := post[map[string]any](t, blocker, a.server.URL, "/api/friends", map[string]string{"email": "invite-by-name-dm@example.com"})
+	patch[map[string]any](t, blocker, a.server.URL, "/api/friends/"+fr["id"].(string), map[string]string{"status": "blocked"})
+	room := post[map[string]any](t, dm, a.server.URL, "/api/rooms", map[string]any{"name": "Invited Table"})
+	roomID := room["id"].(string)
+	base := a.server.URL + "/api/rooms/" + roomID
+
+	candidates := get[[]map[string]any](t, dm, a.server.URL, "/api/rooms/"+roomID+"/invite-candidates?q=pet")
+	if len(candidates) != 2 || candidates[0]["username"] != "Petra" || candidates[1]["username"] != "Paladin Pete" {
+		t.Fatalf("expected prefix match first and the blocker left out: %+v", candidates)
+	}
+	if short := get[[]map[string]any](t, dm, a.server.URL, "/api/rooms/"+roomID+"/invite-candidates?q=p"); len(short) != 0 {
+		t.Fatalf("one letter should not search: %+v", short)
+	}
+	if status, code := errorOf(t, dm, "POST", base+"/invitations", map[string]string{"username": "Pete the Blocker"}); status != 404 || code != "not_found" {
+		t.Fatalf("a block must look like an unknown user, got %d %s", status, code)
+	}
+	if status := statusOf(t, player, "GET", base+"/invite-candidates?q=pet", nil); status != 403 {
+		t.Fatalf("non-members may not search, got %d", status)
+	}
+
+	pWS := dialPath(t, a, player, "/api/notifications/ws")
+	defer pWS.Close()
+	dmNotes := dialPath(t, a, dm, "/api/notifications/ws")
+	defer dmNotes.Close()
+	dmRoom := dialWS(t, a, dm, roomID)
+	defer dmRoom.Close()
+	readType(t, dmRoom, "state.snapshot")
+
+	invitation := post[map[string]any](t, dm, a.server.URL, "/api/rooms/"+roomID+"/invitations", map[string]string{"username": "Paladin Pete"})
+	if invitee := invitation["invitee"].(map[string]any); invitee["id"] != pu["id"] {
+		t.Fatalf("invitation should name the invitee: %+v", invitation)
+	}
+	note := readNotification(t, pWS, "room_invitation.created")
+	if note["room"].(map[string]any)["name"] != "Invited Table" || note["actor"].(map[string]any)["id"] != du["id"] {
+		t.Fatalf("invitation notification should name the room and game master: %+v", note)
+	}
+	if status, code := errorOf(t, dm, "POST", base+"/invitations", map[string]string{"username": "Paladin Pete"}); status != 409 || code != "invitation_exists" {
+		t.Fatalf("second invitation: %d %s", status, code)
+	}
+	if marked := get[[]map[string]any](t, dm, a.server.URL, "/api/rooms/"+roomID+"/invite-candidates?q=paladin"); len(marked) != 1 || marked[0]["invited"] != true {
+		t.Fatalf("pending invitee should be marked: %+v", marked)
+	}
+	waiting := get[map[string][]map[string]any](t, player, a.server.URL, "/api/notifications")
+	if len(waiting["room_invitations"]) != 1 || waiting["room_invitations"][0]["id"] != invitation["id"] {
+		t.Fatalf("player should see the invitation: %+v", waiting)
+	}
+	if status := statusOf(t, other, "POST", a.server.URL+"/api/room-invitations/"+invitation["id"].(string)+"/accept", nil); status != 404 {
+		t.Fatalf("only the invitee may accept, got %d", status)
+	}
+
+	joined := post[map[string]any](t, player, a.server.URL, "/api/room-invitations/"+invitation["id"].(string)+"/accept", nil)
+	if joined["room_id"] != roomID || joined["is_dm"] != false {
+		t.Fatalf("accept should join as a player: %+v", joined)
+	}
+	readType(t, dmRoom, "member.joined")
+	readNotification(t, dmNotes, "room_invitation.accepted")
+	members := get[[]map[string]any](t, dm, a.server.URL, "/api/rooms/"+roomID+"/members")
+	if len(members) != 2 {
+		t.Fatalf("player should be a member: %+v", members)
+	}
+	if pending := get[[]map[string]any](t, dm, a.server.URL, "/api/rooms/"+roomID+"/invitations"); len(pending) != 0 {
+		t.Fatalf("an accepted invitation is spent: %+v", pending)
+	}
+	if status, code := errorOf(t, dm, "POST", base+"/invitations", map[string]string{"username": "Paladin Pete"}); status != 409 || code != "already_member" {
+		t.Fatalf("inviting a member: %d %s", status, code)
+	}
+	if status := statusOf(t, player, "POST", base+"/invitations", map[string]string{"username": "Petra"}); status != 403 {
+		t.Fatalf("players may not invite, got %d", status)
+	}
+
+	declined := post[map[string]any](t, dm, a.server.URL, "/api/rooms/"+roomID+"/invitations", map[string]string{"username": "Petra"})
+	if status := statusOf(t, other, "DELETE", a.server.URL+"/api/room-invitations/"+declined["id"].(string), nil); status != 204 {
+		t.Fatalf("decline status=%d", status)
+	}
+	readNotification(t, dmNotes, "room_invitation.removed")
+	if status := statusOf(t, other, "GET", base, nil); status != 403 {
+		t.Fatalf("declining must not join, got %d", status)
+	}
+}
+
 func TestRoomCreatorIsDMAndCanUseMapWithoutSheet(t *testing.T) {
 	a := newTestApp(t)
 	dm, u := login(t, a, "dm-nosheet@example.com")
@@ -838,6 +967,26 @@ func statusOf(t *testing.T, c *http.Client, method, url string, body any) int {
 	}
 	res.Body.Close()
 	return res.StatusCode
+}
+
+// errorOf sends a request and returns its status and error code.
+func errorOf(t *testing.T, c *http.Client, method, url string, body any) (int, string) {
+	t.Helper()
+	b, _ := json.Marshal(body)
+	req, _ := http.NewRequest(method, url, bytes.NewReader(b))
+	req.Header.Set("Content-Type", "application/json")
+	res, err := c.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	var out struct {
+		Error struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	_ = json.NewDecoder(res.Body).Decode(&out)
+	return res.StatusCode, out.Error.Code
 }
 
 func TestRoomWebsocketMovementAndChat(t *testing.T) {
@@ -1647,6 +1796,100 @@ func TestRuleBookMonsters(t *testing.T) {
 	}
 }
 
+func TestRuleBookCompendium(t *testing.T) {
+	a := newTestApp(t)
+	const dndID = "00000000-0000-4000-8000-000000000005"
+	dm, _ := login(t, a, "compendium-dm@example.com")
+	player, _ := login(t, a, "compendium-player@example.com")
+	stranger, _ := login(t, a, "compendium-stranger@example.com")
+
+	builtIn := get[map[string]any](t, dm, a.server.URL, "/api/rule-books/"+dndID)
+	compendium := builtIn["compendium"].(map[string]any)
+	if len(compendium["attacks"].([]any)) != 42 || len(compendium["actions"].([]any)) != 18 || len(compendium["items"].([]any)) != 5 {
+		t.Fatalf("built-in compendium sizes: %d %d %d", len(compendium["attacks"].([]any)), len(compendium["actions"].([]any)), len(compendium["items"].([]any)))
+	}
+	if id := at(t, compendium, "attacks", 0, "id"); id != "club" {
+		t.Fatalf("first SRD weapon: %v", id)
+	}
+	var fighterKit any
+	for _, class := range at(t, builtIn, "creation_rules", "classes").([]any) {
+		if class.(map[string]any)["id"] == "fighter" {
+			fighterKit = at(t, class, "starting_equipment", "attacks")
+		}
+	}
+	if !reflect.DeepEqual(fighterKit, []any{"longsword", "light_crossbow"}) {
+		t.Fatalf("fighter kit: %v", fighterKit)
+	}
+	if got := orderKeys(t, at(t, builtIn["key_order"], "compendium", "children", "attacks", "items", 0)); !reflect.DeepEqual(got[:2], []string{"id", "name"}) {
+		t.Fatalf("compendium weapon key order: %v", got)
+	}
+
+	axe := map[string]any{"id": "axe", "name": "Axe", "range_m": 1.5, "ability": "strength", "proficient": true, "attack_bonus": 0, "damage": "1d6", "damage_bonus": 0, "damage_type": "slashing"}
+	banana := map[string]any{"id": "axe", "name": "Axe", "range_m": 1.5, "damage": "banana"}
+	book := func(kit ...string) map[string]any {
+		return map[string]any{
+			"name": "Brute Rules", "is_public": true,
+			"compendium":     map[string]any{"attacks": []any{axe}, "actions": []any{}, "items": []any{}},
+			"creation_rules": map[string]any{"classes": []any{map[string]any{"id": "brute", "name": "Brute", "defaults": map[string]any{}, "starting_equipment": map[string]any{"attacks": kit}}}},
+		}
+	}
+	custom := post[map[string]any](t, dm, a.server.URL, "/api/rule-books", book("axe"))
+	bookPath := a.server.URL + "/api/rule-books/" + custom["id"].(string)
+	if status, code := errorOf(t, dm, "POST", a.server.URL+"/api/rule-books", book("sword")); status != 400 || code != "invalid_rules" {
+		t.Fatalf("kit outside the compendium: %d %s", status, code)
+	}
+	bad := book()
+	bad["compendium"] = map[string]any{"attacks": []any{banana}}
+	if status, code := errorOf(t, dm, "POST", a.server.URL+"/api/rule-books", bad); status != 400 || code != "invalid_compendium" {
+		t.Fatalf("invalid compendium weapon: %d %s", status, code)
+	}
+	renamed := patch[map[string]any](t, dm, a.server.URL, "/api/rule-books/"+custom["id"].(string), map[string]any{"name": "x"})
+	if id := at(t, renamed, "compendium", "attacks", 0, "id"); id != "axe" {
+		t.Fatalf("a patch without a compendium should keep it: %v", renamed["compendium"])
+	}
+	emptied := map[string]any{"compendium": map[string]any{"attacks": []any{}, "actions": []any{}, "items": []any{}}}
+	if status, code := errorOf(t, dm, "PATCH", bookPath, emptied); status != 400 || code != "invalid_rules" {
+		t.Fatalf("removing a kit weapon from the compendium: %d %s", status, code)
+	}
+
+	sheetBody := func(attack map[string]any) map[string]any {
+		return map[string]any{"rule_book_id": custom["id"], "name": "Grok", "creation": map[string]any{"class_id": "brute"}, "data": map[string]any{"attacks": []any{attack}}}
+	}
+	if status, code := errorOf(t, player, "POST", a.server.URL+"/api/sheets", sheetBody(banana)); status != 400 || code != "invalid_actions" {
+		t.Fatalf("sheet with invalid attack: %d %s", status, code)
+	}
+	sheet := post[map[string]any](t, player, a.server.URL, "/api/sheets", sheetBody(axe))
+	if id := at(t, sheet, "data", "attacks", 0, "id"); id != "axe" {
+		t.Fatalf("sheet attacks: %v", sheet["data"])
+	}
+	sheetPath := a.server.URL + "/api/sheets/" + sheet["id"].(string)
+	if status, code := errorOf(t, player, "PATCH", sheetPath, map[string]any{"data": map[string]any{"attacks": []any{banana}}}); status != 400 || code != "invalid_actions" {
+		t.Fatalf("sheet patch with invalid attack: %d %s", status, code)
+	}
+
+	room := post[map[string]any](t, dm, a.server.URL, "/api/rooms", map[string]any{"name": "Pit", "rule_book_id": custom["id"]})
+	roomPath := "/api/rooms/" + room["id"].(string)
+	post[map[string]any](t, player, a.server.URL, "/api/rooms/join", map[string]any{"invite_code": room["invite_code"]})
+	post[map[string]any](t, dm, a.server.URL, roomPath+"/maps/new", map[string]any{"name": "Pit", "width_m": 10, "height_m": 10})
+	token := post[map[string]any](t, player, a.server.URL, roomPath+"/tokens", map[string]any{"sheet_id": sheet["id"], "name": "Grok", "x_m": 1, "y_m": 1})
+
+	lists := map[string]any{"attacks": []any{axe}, "actions": []any{}, "items": []any{map[string]any{"id": "p", "name": "Potion", "kind": "heal", "range_m": 1.5, "dice": "2d4", "quantity": 1}}}
+	saved := patch[map[string]any](t, player, a.server.URL, "/api/sheets/"+sheet["id"].(string)+"/actions", lists)
+	if q := at(t, saved, "data", "items", 0, "quantity"); q != float64(1) {
+		t.Fatalf("sheet actions patch: %v", saved["data"])
+	}
+	if status, _ := errorOf(t, stranger, "PATCH", sheetPath+"/actions", lists); status != 404 {
+		t.Fatalf("another user edited the sheet: %d", status)
+	}
+	if status, code := errorOf(t, player, "PATCH", sheetPath+"/actions", map[string]any{"attacks": []any{}, "actions": []any{}}); status != 400 || code != "invalid_actions" {
+		t.Fatalf("missing items: %d %s", status, code)
+	}
+	held := entityByID(t, get[map[string]any](t, player, a.server.URL, roomPath+"/state")["visibleTokens"], token["id"].(string))
+	if name := at(t, held, "items", 0, "name"); name != "Potion" {
+		t.Fatalf("room token should show the sheet's new items: %+v", held)
+	}
+}
+
 func TestRoomTokenControls(t *testing.T) {
 	a := newTestApp(t)
 	dm, _ := login(t, a, "controls-dm@example.com")
@@ -1971,7 +2214,11 @@ func TestRoomTokenDragStreaming(t *testing.T) {
 
 func dialWS(t *testing.T, a *testApp, c *http.Client, roomID string) *websocket.Conn {
 	t.Helper()
-	u := "ws" + strings.TrimPrefix(a.server.URL, "http") + "/api/rooms/" + roomID + "/ws"
+	return dialPath(t, a, c, "/api/rooms/"+roomID+"/ws")
+}
+func dialPath(t *testing.T, a *testApp, c *http.Client, path string) *websocket.Conn {
+	t.Helper()
+	u := "ws" + strings.TrimPrefix(a.server.URL, "http") + path
 	hdr := http.Header{}
 	parsed, _ := url.Parse(a.server.URL)
 	for _, ck := range c.Jar.Cookies(parsed) {

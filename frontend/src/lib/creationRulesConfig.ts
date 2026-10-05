@@ -1,4 +1,4 @@
-import type { CreationRules } from "../api/types";
+import type { ActionLists, CreationRules } from "../api/types";
 import { fieldFromValue, objectFromFields, parseAttributes, type Field } from "./attributeFields";
 
 function object(value: unknown, label: string): Record<string, unknown> {
@@ -25,7 +25,9 @@ function names(value: unknown, label: string): asserts value is string[] {
   });
 }
 
-export function validateCreationRules(value: unknown, attributes?: Record<string, unknown>): CreationRules {
+const equipmentLists = ["attacks", "actions", "items"] as const;
+
+export function validateCreationRules(value: unknown, attributes?: Record<string, unknown>, compendium?: ActionLists): CreationRules {
   const rules = object(value, "Creation rules");
   keys(rules, ["classes", "point_buy"], "Creation rules");
   const classIds = new Set<string>();
@@ -36,7 +38,7 @@ export function validateCreationRules(value: unknown, attributes?: Record<string
     rules.classes.forEach((entry, index) => {
       const label = `Class ${index + 1}`;
       const cls = object(entry, label);
-      keys(cls, ["id", "name", "description", "defaults", "choices"], label);
+      keys(cls, ["id", "name", "description", "defaults", "choices", "starting_equipment"], label);
       text(cls.id, `${label} ID`);
       text(cls.name, `${label} name`);
       if (classIds.has(cls.id) || classNames.has(cls.name)) throw new Error(`${label}: class IDs and names must be unique.`);
@@ -45,6 +47,22 @@ export function validateCreationRules(value: unknown, attributes?: Record<string
       const defaults = object(cls.defaults, `${label} defaults`);
       if (Object.hasOwn(defaults, "class")) throw new Error(`${label}: “class” is set from the class name; remove it from defaults.`);
       Object.keys(defaults).forEach((key) => { text(key, `${label} default attribute`); owned.add(key); });
+      if (equipmentLists.some((list) => Object.hasOwn(defaults, list))) throw new Error(`${label}: give attacks, spells and items as starting equipment, not defaults.`);
+      if (cls.starting_equipment !== undefined) {
+        const kit = object(cls.starting_equipment, `${label} starting equipment`);
+        keys(kit, [...equipmentLists], `${label} starting equipment`);
+        for (const list of equipmentLists) {
+          if (kit[list] === undefined) continue;
+          if (!Array.isArray(kit[list])) throw new Error(`${label} starting equipment ${list} must be a list.`);
+          const seen = new Set<string>();
+          for (const id of kit[list]) {
+            text(id, `${label} starting equipment entry`);
+            if (seen.has(id)) throw new Error(`${label}: starting equipment repeats “${id}”.`);
+            seen.add(id);
+            if (compendium && !compendium[list].some((entry) => entry.id === id)) throw new Error(`${label}: starting equipment “${id}” is not in the compendium.`);
+          }
+        }
+      }
       if (cls.choices !== undefined) {
         if (!Array.isArray(cls.choices)) throw new Error(`${label} choices must be a list.`);
         const choiceNames = new Set<string>();
@@ -94,12 +112,12 @@ export function validateCreationRules(value: unknown, attributes?: Record<string
   return rules as CreationRules;
 }
 
-export function parseCreationRules(json: string, attributes?: Record<string, unknown>): CreationRules {
-  return validateCreationRules(parseAttributes(json, "Creation rules"), attributes);
+export function parseCreationRules(json: string, attributes?: Record<string, unknown>, compendium?: ActionLists): CreationRules {
+  return validateCreationRules(parseAttributes(json, "Creation rules"), attributes, compendium);
 }
 
 type ChoiceDraft = { key: string; attribute: string; label: string; count: string; options: string[] };
-export type ClassDraft = { key: string; id: string; name: string; description: string; defaults: Field[]; choices: ChoiceDraft[] };
+export type ClassDraft = { key: string; id: string; name: string; description: string; defaults: Field[]; choices: ChoiceDraft[]; startingEquipment: { attacks: string[]; actions: string[]; items: string[] } };
 type PointDraft = { attributes: string[]; min: string; max: string; budget: string; costs: Record<string, string>; bonus_budget: string; bonus_max: string };
 export type CreationRulesDraft = { mode: "fields" | "json"; json: string; classes: ClassDraft[]; pointEnabled: boolean; point: PointDraft };
 
@@ -107,7 +125,11 @@ export function creationRulesDraft(rules: CreationRules = {}): CreationRulesDraf
   const point = rules.point_buy;
   return {
     mode: "fields", json: "",
-    classes: (rules.classes ?? []).map((cls) => ({ key: crypto.randomUUID(), id: cls.id, name: cls.name, description: cls.description ?? "", defaults: Object.entries(cls.defaults).map(([key, value]) => fieldFromValue(key, value)), choices: (cls.choices ?? []).map((choice) => ({ ...choice, key: crypto.randomUUID(), count: String(choice.count), options: [...choice.options] })) })),
+    classes: (rules.classes ?? []).map((cls) => ({
+      key: crypto.randomUUID(), id: cls.id, name: cls.name, description: cls.description ?? "", defaults: Object.entries(cls.defaults).map(([key, value]) => fieldFromValue(key, value)),
+      choices: (cls.choices ?? []).map((choice) => ({ ...choice, key: crypto.randomUUID(), count: String(choice.count), options: [...choice.options] })),
+      startingEquipment: { attacks: [...cls.starting_equipment?.attacks ?? []], actions: [...cls.starting_equipment?.actions ?? []], items: [...cls.starting_equipment?.items ?? []] },
+    })),
     pointEnabled: point !== undefined,
     point: point ? { attributes: [...point.attributes], min: String(point.min), max: String(point.max), budget: String(point.budget), costs: Object.fromEntries(Object.entries(point.costs).map(([score, cost]) => [score, String(cost)])), bonus_budget: String(point.bonus_budget), bonus_max: String(point.bonus_max) } : { attributes: [], min: "0", max: "5", budget: "10", costs: { "0": "0", "1": "1", "2": "2", "3": "3", "4": "4", "5": "5" }, bonus_budget: "0", bonus_max: "0" },
   };
@@ -126,16 +148,17 @@ function draftInteger(value: string, label: string) {
   return number;
 }
 
-export function rulesFromDraft(draft: CreationRulesDraft, attributes?: Record<string, unknown>): CreationRules {
-  if (draft.mode === "json") return parseCreationRules(draft.json, attributes);
+export function rulesFromDraft(draft: CreationRulesDraft, attributes?: Record<string, unknown>, compendium?: ActionLists): CreationRules {
+  if (draft.mode === "json") return parseCreationRules(draft.json, attributes, compendium);
   const rules: CreationRules = {};
   if (draft.classes.length) rules.classes = draft.classes.map((cls) => ({
     id: cls.id, name: cls.name, ...(cls.description ? { description: cls.description } : {}), defaults: objectFromFields(cls.defaults, `${cls.name || "Class"} defaults`),
     choices: cls.choices.map((choice) => ({ attribute: choice.attribute, label: choice.label, count: draftInteger(choice.count, `${choice.label || "Choice group"} selection count`), options: [...choice.options] })),
+    ...(equipmentLists.some((list) => cls.startingEquipment[list].length) ? { starting_equipment: { attacks: [...cls.startingEquipment.attacks], actions: [...cls.startingEquipment.actions], items: [...cls.startingEquipment.items] } } : {}),
   }));
   if (draft.pointEnabled) {
     const point = draft.point;
     rules.point_buy = { attributes: [...point.attributes], min: draftInteger(point.min, "Minimum score"), max: draftInteger(point.max, "Maximum score"), budget: draftInteger(point.budget, "Point budget"), bonus_budget: draftInteger(point.bonus_budget, "Bonus budget"), bonus_max: draftInteger(point.bonus_max, "Per-score bonus cap"), costs: Object.fromEntries(scoreRange(point).map((score) => [String(score), draftInteger(point.costs[String(score)] ?? "", `Cost for score ${score}`)])) };
   }
-  return validateCreationRules(rules, attributes);
+  return validateCreationRules(rules, attributes, compendium);
 }

@@ -7,6 +7,8 @@ import (
 	"math"
 	"reflect"
 	"strings"
+
+	"rollandplay/backend/internal/game"
 )
 
 type creationChoice struct {
@@ -16,11 +18,20 @@ type creationChoice struct {
 	Options   []string `json:"options"`
 }
 type creationClass struct {
-	ID          string           `json:"id"`
-	Name        string           `json:"name"`
-	Description string           `json:"description,omitempty"`
-	Defaults    map[string]any   `json:"defaults"`
-	Choices     []creationChoice `json:"choices,omitempty"`
+	ID                string             `json:"id"`
+	Name              string             `json:"name"`
+	Description       string             `json:"description,omitempty"`
+	Defaults          map[string]any     `json:"defaults"`
+	Choices           []creationChoice   `json:"choices,omitempty"`
+	StartingEquipment *startingEquipment `json:"starting_equipment,omitempty"`
+}
+
+// startingEquipment names compendium entries a class's characters start with; the client
+// pre-checks them at creation.
+type startingEquipment struct {
+	Attacks []string `json:"attacks"`
+	Actions []string `json:"actions"`
+	Items   []string `json:"items"`
 }
 type pointBuyRules struct {
 	Attributes  []string       `json:"attributes"`
@@ -93,7 +104,7 @@ func distinctNames(names []string) bool {
 	return true
 }
 
-func parseCreationRules(raw json.RawMessage, attributes map[string]any) (creationRules, error) {
+func parseCreationRules(raw json.RawMessage, attributes map[string]any, compendium game.Compendium) (creationRules, error) {
 	var rules creationRules
 	var wire struct {
 		Classes  json.RawMessage `json:"classes"`
@@ -132,7 +143,25 @@ func parseCreationRules(raw json.RawMessage, attributes map[string]any) (creatio
 			if strings.TrimSpace(key) == "" || key == "class" {
 				return rules, fmt.Errorf("%s: default attributes must be named and cannot be class", class.Name)
 			}
+			if key == "attacks" || key == "actions" || key == "items" {
+				return rules, fmt.Errorf("%s: give attacks, actions and items as starting equipment, not defaults", class.Name)
+			}
 			owned[key] = true
+		}
+		if kit := class.StartingEquipment; kit != nil {
+			for _, list := range []struct {
+				name string
+				ids  []string
+			}{{"attacks", kit.Attacks}, {"actions", kit.Actions}, {"items", kit.Items}} {
+				if !distinctNames(list.ids) {
+					return rules, fmt.Errorf("%s: starting equipment repeats an entry", class.Name)
+				}
+				for _, id := range list.ids {
+					if !compendium.Has(list.name, id) {
+						return rules, fmt.Errorf("%s: starting equipment %q is not in the compendium", class.Name, id)
+					}
+				}
+			}
 		}
 		groups := make(map[string]bool)
 		for _, choice := range class.Choices {

@@ -1,11 +1,13 @@
 import { useEffect, useState } from "react";
-import { Scroll } from "@phosphor-icons/react";
+import { Scroll, Sword } from "@phosphor-icons/react";
 import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import { apiFetch, patchJSON, postJSON } from "../api/client";
-import type { CharacterCreation, Room, RuleBook, Sheet } from "../api/types";
+import type { ActionLists, CharacterCreation, Room, RuleBook, Sheet } from "../api/types";
 import { useSession } from "../auth/SessionContext";
+import { ActionsEditor } from "../components/ActionsEditor";
 import { CharacterCreator } from "../components/CharacterCreator";
 import { useToast } from "../components/Toast";
+import { sheetActionLists } from "../lib/actions";
 
 export function SheetsPage() {
   const [sheets, setSheets] = useState<Sheet[]>([]);
@@ -14,6 +16,8 @@ export function SheetsPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [renameError, setRenameError] = useState<{ id: string; message: string } | null>(null);
+  const [editingSheetId, setEditingSheetId] = useState<string | null>(null);
+  const [savingLists, setSavingLists] = useState(false);
   const toast = useToast();
   const [params] = useSearchParams();
   const roomId = params.get("room");
@@ -60,6 +64,17 @@ export function SheetsPage() {
       toast({ kind: "error", message });
     }
   }
+  async function saveLists(id: string, lists: ActionLists) {
+    setSavingLists(true);
+    try {
+      const saved = await patchJSON<Sheet>(`/api/sheets/${id}/actions`, lists);
+      setSheets((current) => current.map((sheet) => sheet.id === id ? saved : sheet));
+      setEditingSheetId(null);
+      toast({ kind: "success", message: "Attacks, spells and items saved." });
+    } catch (err) {
+      toast({ kind: "error", message: err instanceof Error ? err.message : "Could not save attacks, spells and items." });
+    } finally { setSavingLists(false); }
+  }
   return <div className="workspace-page">
     <header><p className="eyebrow">A character worth becoming</p><h1 className="page-heading max-w-5xl">Character sheets</h1><p className="page-description">Give your heroes a name, a set of strengths, and a place in the story. Start with your rule book’s defaults and make them your own.</p></header>
     {error && <p role="alert" className="text-[var(--pink)]">{error}</p>}
@@ -86,6 +101,13 @@ export function SheetsPage() {
           <p className="text-muted text-xs">Name saves when you leave the field.</p>
           <p className="text-sm text-[var(--accent)]">{books.find((item) => item.id === sheet.rule_book_id)?.name ?? "Linked rule book"}</p>
           {typeof sheet.data.class === "string" && <p className="text-sm text-[var(--lavender)]">{sheet.data.class}</p>}
+          {sheet.user_id === userId && <>
+            <button type="button" className="btn-secondary w-full" aria-expanded={editingSheetId === sheet.id} onClick={() => setEditingSheetId((open) => open === sheet.id ? null : sheet.id)}>
+              <Sword size={18} aria-hidden="true" />Attacks & spells
+            </button>
+            {editingSheetId === sheet.id && <ActionsEditor owner={{ id: sheet.id, name: sheet.name, ...sheetActionLists(sheet.data) }} compendium={books.find((b) => b.id === sheet.rule_book_id)?.compendium}
+              busy={savingLists} onSave={(lists) => void saveLists(sheet.id, lists)} onClose={() => setEditingSheetId(null)} />}
+          </>}
           <details><summary className="cursor-pointer text-sm text-[var(--lavender)]">View character data (JSON)</summary><pre className="mt-3 max-h-72 overflow-auto rounded-lg border border-[var(--paper)]/10 bg-[var(--input)]/20 p-4 text-xs leading-relaxed">{JSON.stringify(sheet.data, null, 2)}</pre></details>
         </article>)}</div>}
       </section>
