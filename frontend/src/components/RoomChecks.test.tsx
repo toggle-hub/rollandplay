@@ -35,7 +35,7 @@ describe("RoomChecks", () => {
     expect(screen.queryByRole("button", { name: /for Bob/ })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Close check" })).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Roll Stealth check" }));
-    expect(onRoll).toHaveBeenCalledWith("c1", undefined);
+    expect(onRoll).toHaveBeenCalledWith("c1", undefined, {});
   });
 
   it("lets the game master roll for a player and close the check", () => {
@@ -43,9 +43,19 @@ describe("RoomChecks", () => {
     const onClose = vi.fn();
     render(<RoomChecks checks={[ambush()]} members={members} currentUserId="dm" isDM onRoll={onRoll} onClose={onClose} />);
     fireEvent.click(screen.getByRole("button", { name: "Roll Stealth check for Bob (he/him)" }));
-    expect(onRoll).toHaveBeenCalledWith("c1", "bob");
+    expect(onRoll).toHaveBeenCalledWith("c1", "bob", {});
     fireEvent.click(screen.getByRole("button", { name: "Close check" }));
     expect(onClose).toHaveBeenCalledWith("c1");
+  });
+
+  it("rolls with the advantage and bonus chosen for that check", () => {
+    const onRoll = vi.fn();
+    render(<RoomChecks checks={[ambush()]} members={members} currentUserId="alice" isDM={false} onRoll={onRoll} onClose={vi.fn()} />);
+    fireEvent.click(screen.getByRole("button", { name: "Disadvantage" }));
+    fireEvent.change(screen.getByLabelText("Bonus"), { target: { value: "-2" } });
+    expect(screen.getByText("Rolls 2d20 and keeps the lower, -2 bonus")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Roll Stealth check" }));
+    expect(onRoll).toHaveBeenCalledWith("c1", undefined, { mode: "disadvantage", bonus: -2 });
   });
 
   it("shows each outcome and who did not roll once the check is closed", () => {

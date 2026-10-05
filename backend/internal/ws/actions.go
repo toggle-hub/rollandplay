@@ -180,7 +180,8 @@ func (c *client) lockError(requestID string, err error) {
 
 // actionResolve rolls an attack, action or item from a token the sender controls and
 // applies its damage or healing to the targets' stats.
-// Body: {sourceTokenId, source: attack|action|item, actionId, targetTokenId?, point?}.
+// Body: {sourceTokenId, source: attack|action|item, actionId, targetTokenId?, point?, mode?, bonus?};
+// mode and bonus change attack rolls only.
 func (c *client) actionResolve(msg clientEnvelope) {
 	var req struct {
 		SourceTokenID string      `json:"sourceTokenId"`
@@ -188,9 +189,14 @@ func (c *client) actionResolve(msg clientEnvelope) {
 		ActionID      string      `json:"actionId"`
 		TargetTokenID string      `json:"targetTokenId"`
 		Point         *game.Point `json:"point"`
+		game.RollOptions
 	}
 	if json.Unmarshal(msg.Body, &req) != nil || !slices.Contains([]string{"attack", "action", "item"}, req.Source) {
 		c.error(msg.RequestID, "bad_json", "invalid body")
+		return
+	}
+	if err := req.RollOptions.Validate(); err != nil {
+		c.error(msg.RequestID, "invalid_roll", err.Error())
 		return
 	}
 	ctx := context.Background()
@@ -210,6 +216,10 @@ func (c *client) actionResolve(msg clientEnvelope) {
 	def, err := lookupAction(source.Stats, req.Source, req.ActionID)
 	if err != nil {
 		c.actionLookupError(msg.RequestID, err)
+		return
+	}
+	if def.Kind != game.ActionAttack && !req.RollOptions.IsNormal() {
+		c.error(msg.RequestID, "invalid_roll", "advantage, disadvantage and bonuses apply to attack rolls only")
 		return
 	}
 	from := game.Point{X: source.X, Y: source.Y}
@@ -333,7 +343,7 @@ func (c *client) actionResolve(msg clientEnvelope) {
 		var patch map[string]any
 		switch def.Kind {
 		case game.ActionAttack:
-			out, outcome.Effect, patch, err = game.RollAttack(resolved, target, rand.Reader)
+			out, outcome.Effect, patch, err = game.RollAttack(resolved, target, req.RollOptions, rand.Reader)
 		case game.ActionSave:
 			out, patch, err = game.ResolveSave(resolved, effectTotal, target, rand.Reader)
 		case game.ActionHeal:
@@ -362,16 +372,29 @@ func (c *client) actionResolve(msg clientEnvelope) {
 	default:
 		body = fmt.Sprintf("%s uses %s on %s", source.Name, def.Name, targets[0].Name)
 	}
-	c.finishRoll(ctx, tx, msg.RequestID, body, game.ActionRoll{Action: outcome}, true)
+	c.finishRoll(ctx, tx, msg.RequestID, withNote(body, req.RollOptions), game.ActionRoll{Action: outcome}, true)
 }
 
-// deathSave rolls a dying character's death saving throw. Body: {tokenId}.
+// withNote adds the roll options to a chat line, e.g. "Hero attacks Goblin with Sword (advantage)".
+func withNote(body string, opts game.RollOptions) string {
+	if note := opts.Note(); note != "" {
+		return body + " (" + note + ")"
+	}
+	return body
+}
+
+// deathSave rolls a dying character's death saving throw. Body: {tokenId, mode?, bonus?}.
 func (c *client) deathSave(msg clientEnvelope) {
 	var req struct {
 		TokenID string `json:"tokenId"`
+		game.RollOptions
 	}
 	if json.Unmarshal(msg.Body, &req) != nil {
 		c.error(msg.RequestID, "bad_json", "invalid body")
+		return
+	}
+	if err := req.RollOptions.Validate(); err != nil {
+		c.error(msg.RequestID, "invalid_roll", err.Error())
 		return
 	}
 	ctx := context.Background()
@@ -407,7 +430,7 @@ func (c *client) deathSave(msg clientEnvelope) {
 		c.error(msg.RequestID, "not_dying", "only a dying character makes death saves")
 		return
 	}
-	out, patch, err := game.DeathSave(stats.target(token), rand.Reader)
+	out, patch, err := game.DeathSave(stats.target(token), req.RollOptions, rand.Reader)
 	if err != nil {
 		c.error(msg.RequestID, "bad_roll", err.Error())
 		return
@@ -418,19 +441,24 @@ func (c *client) deathSave(msg clientEnvelope) {
 		return
 	}
 	roll := game.ActionRoll{Action: game.ActionOutcome{Name: "Death save", Kind: "death_save", Source: "death_save", SourceTokenID: token.ID, Targets: []game.TargetOutcome{out}}}
-	c.finishRoll(ctx, tx, msg.RequestID, fmt.Sprintf("%s makes a death saving throw", token.Name), roll, true)
+	c.finishRoll(ctx, tx, msg.RequestID, withNote(fmt.Sprintf("%s makes a death saving throw", token.Name), req.RollOptions), roll, true)
 }
 
 // checkQuick rolls an ability check, saving throw or skill check for a token the sender
-// controls, without a DC. Body: {tokenId, kind, key}.
+// controls, without a DC. Body: {tokenId, kind, key, mode?, bonus?}.
 func (c *client) checkQuick(msg clientEnvelope) {
 	var req struct {
 		TokenID string `json:"tokenId"`
 		Kind    string `json:"kind"`
 		Key     string `json:"key"`
+		game.RollOptions
 	}
 	if json.Unmarshal(msg.Body, &req) != nil {
 		c.error(msg.RequestID, "bad_json", "invalid body")
+		return
+	}
+	if err := req.RollOptions.Validate(); err != nil {
+		c.error(msg.RequestID, "invalid_roll", err.Error())
 		return
 	}
 	ctx := context.Background()
@@ -456,7 +484,7 @@ func (c *client) checkQuick(msg clientEnvelope) {
 		c.error(msg.RequestID, "source_down", "this character cannot act right now")
 		return
 	}
-	roll, err := game.RollExpression(check.Expression(token.Stats), rand.Reader)
+	roll, err := game.RollExpression(req.RollOptions.D20(check.Modifier(token.Stats)), rand.Reader)
 	if err != nil {
 		c.error(msg.RequestID, "bad_roll", err.Error())
 		return
@@ -467,7 +495,7 @@ func (c *client) checkQuick(msg clientEnvelope) {
 		return
 	}
 	defer tx.Rollback(ctx)
-	c.finishRoll(ctx, tx, msg.RequestID, fmt.Sprintf("%s: %s", token.Name, check.Label()), roll, false)
+	c.finishRoll(ctx, tx, msg.RequestID, withNote(fmt.Sprintf("%s: %s", token.Name, check.Label()), req.RollOptions), roll, false)
 }
 
 // finishRoll posts the roll to chat for everyone, commits, and broadcasts it. Rolls that

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { ActionLists, ResolvedTokenAction, RuleBook, TargetOutcome, TokenAction, TokenAttack, TokenItem } from "../api/types";
-import { actionSummary, compendiumSummary, floatText, startingLists, withPicks } from "./actions";
+import { actionSummary, choiceRequest, compendiumSummary, floatText, startingLists, withPicks } from "./actions";
 
 const base: ResolvedTokenAction = {
   id: "a",
@@ -36,6 +36,23 @@ describe("actionSummary", () => {
   it("describes an item with its quantity", () => {
     const potion = { ...base, kind: "heal" as const, dice: "2d4", dice_modifier: 2, quantity: 3 };
     expect(actionSummary(potion)).toBe("2d4+2 healing · 1.5 m · ×3");
+  });
+});
+
+describe("choiceRequest", () => {
+  const advantage = { mode: "advantage" as const, bonus: 2 };
+
+  it("sends advantage and a bonus with checks and attack-roll actions", () => {
+    expect(choiceRequest("hero", { kind: "check", check: { kind: "skill", key: "stealth" } }, undefined, undefined, advantage))
+      .toEqual({ type: "check.quick", body: { tokenId: "hero", kind: "skill", key: "stealth", mode: "advantage", bonus: 2 } });
+    expect(choiceRequest("hero", { kind: "action", action: { ...base, kind: "attack" } }, "goblin", undefined, advantage).body)
+      .toMatchObject({ actionId: "a", targetTokenId: "goblin", mode: "advantage", bonus: 2 });
+  });
+
+  it("leaves them off saves and heals, and off normal rolls", () => {
+    const save = { ...base, kind: "save" as const, area_radius_m: 3 };
+    expect(choiceRequest("hero", { kind: "action", action: save }, undefined, { x: 1, y: 1 }, advantage).body).not.toHaveProperty("mode");
+    expect(choiceRequest("hero", { kind: "death_save" }).body).toEqual({ tokenId: "hero" });
   });
 });
 

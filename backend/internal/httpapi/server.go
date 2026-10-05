@@ -1876,7 +1876,11 @@ func (s *Server) visibleState(ctx context.Context, roomID, userID string) (map[s
 	if err != nil {
 		return nil, err
 	}
-	return map[string]any{"room": json.RawMessage(room), "activeMap": json.RawMessage(active), "structures": structRows, "visibleTokens": tokRows, "ownTokens": own, "chatHistory": chat, "chatHasEarlier": chatHasEarlier, "checks": checks, "metersPerGrid": gridFromRaw(active), "visibility": vis}, nil
+	combat, err := ws.LoadCombat(ctx, s.Pool, roomID, false)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{"room": json.RawMessage(room), "activeMap": json.RawMessage(active), "structures": structRows, "visibleTokens": tokRows, "ownTokens": own, "chatHistory": chat, "chatHasEarlier": chatHasEarlier, "checks": checks, "combat": combat.ForViewer(isDM), "metersPerGrid": gridFromRaw(active), "visibility": vis}, nil
 }
 
 // visibleChecks lists open checks and the most recent closed ones, newest first. Game masters

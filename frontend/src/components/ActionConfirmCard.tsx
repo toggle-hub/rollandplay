@@ -1,17 +1,22 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { DiceFive } from "@phosphor-icons/react";
+import { normalRoll, type RollOptions } from "../lib/rolls";
+import { RollOptionsControl } from "./RollOptionsControl";
 
 type Props = {
   title: string;
   subtitle: string;
   lines: string[];
-  onRoll: () => void;
+  /** Offer advantage, disadvantage and a one-off bonus: for attack rolls, checks and death saves. */
+  rollOptions?: boolean;
+  onRoll: (options: RollOptions) => void;
   onBack?: () => void;
   onCancel: () => void;
 };
 
-export function ActionConfirmCard({ title, subtitle, lines, onRoll, onBack, onCancel }: Props) {
+export function ActionConfirmCard({ title, subtitle, lines, rollOptions, onRoll, onBack, onCancel }: Props) {
   const rollButton = useRef<HTMLButtonElement>(null);
+  const [options, setOptions] = useState<RollOptions>(normalRoll);
 
   useEffect(() => {
     rollButton.current?.focus({ preventScroll: true });
@@ -40,10 +45,11 @@ export function ActionConfirmCard({ title, subtitle, lines, onRoll, onBack, onCa
     <ul className="space-y-0.5">
       {lines.map((line, index) => <li key={index}>{line}</li>)}
     </ul>
+    {rollOptions && <RollOptionsControl value={options} onChange={setOptions} label={`${title} roll options`} />}
     <div className="flex flex-wrap justify-end gap-2">
       {onBack && <button className="btn-secondary min-h-9 px-3 py-1.5 text-xs" type="button" onClick={onBack}>Back</button>}
       <button className="btn-secondary min-h-9 px-3 py-1.5 text-xs" type="button" onClick={onCancel}>Cancel</button>
-      <button ref={rollButton} className="btn min-h-9 px-3 py-1.5 text-xs" type="button" onClick={onRoll}>
+      <button ref={rollButton} className="btn min-h-9 px-3 py-1.5 text-xs" type="button" onClick={() => onRoll(rollOptions ? options : normalRoll)}>
         <DiceFive size={16} aria-hidden="true" />Roll
       </button>
     </div>

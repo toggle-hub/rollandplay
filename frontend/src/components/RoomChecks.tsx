@@ -1,19 +1,24 @@
+import { useState } from "react";
 import { CheckCircle, DiceFive, LockSimple, XCircle } from "@phosphor-icons/react";
 import type { RoomCheck, RoomCheckTarget, RoomMember } from "../api/types";
+import { normalRoll, rollOptionsBody, type RollOptions, type RollOptionsBody } from "../lib/rolls";
 import { playerLabel } from "./PlayerName";
+import { RollOptionsControl } from "./RollOptionsControl";
 
 type Props = {
   checks: RoomCheck[];
   members: RoomMember[];
   currentUserId?: string;
   isDM: boolean;
-  /** Rolls for the current user, or for `userId` when a game master rolls on a player's behalf. */
-  onRoll: (checkId: string, userId?: string) => void;
+  /** Rolls for the current user, or for `userId` when a game master rolls on a player's behalf, with advantage, disadvantage or a bonus. */
+  onRoll: (checkId: string, userId: string | undefined, options: RollOptionsBody) => void;
   onClose: (checkId: string) => void;
 };
 
 /** Checks the game master prompted: open ones can be rolled, closed ones keep each player's outcome. */
 export function RoomChecks({ checks, members, currentUserId, isDM, onRoll, onClose }: Props) {
+  // Advantage and bonus chosen per check, applied to the next Roll on it.
+  const [options, setOptions] = useState<Record<string, RollOptions>>({});
   if (checks.length === 0) return null;
   return <section className="card space-y-4" aria-labelledby="room-checks-heading">
     <h2 id="room-checks-heading" className="flex items-center gap-2 text-xl"><DiceFive size={22} className="text-[var(--accent)]" aria-hidden="true" />Checks</h2>
@@ -21,6 +26,8 @@ export function RoomChecks({ checks, members, currentUserId, isDM, onRoll, onClo
       {checks.map((check) => {
         const open = !check.closed_at;
         const heading = check.title || check.label;
+        const checkOptions = options[check.id] ?? normalRoll;
+        const rollable = open && check.targets.some((target) => !target.roll && (isDM || target.user_id === currentUserId));
         return <li key={check.id} className="space-y-2 border-t border-[var(--paper)]/10 pt-3" aria-label={heading}>
           <div className="flex items-start justify-between gap-3">
             <div className="min-w-0">
@@ -32,6 +39,7 @@ export function RoomChecks({ checks, members, currentUserId, isDM, onRoll, onClo
               {check.is_private && <span className="inline-flex items-center gap-1 text-[var(--lavender)]"><LockSimple size={11} aria-hidden="true" />Private</span>}
             </div>
           </div>
+          {rollable && <RollOptionsControl value={checkOptions} label={`${heading} roll options`} onChange={(next) => setOptions((current) => ({ ...current, [check.id]: next }))} />}
           <ul className="space-y-1.5">
             {check.targets.map((target) => {
               const member = members.find((item) => item.user_id === target.user_id);
@@ -43,7 +51,7 @@ export function RoomChecks({ checks, members, currentUserId, isDM, onRoll, onClo
                 {target.roll
                   ? <TargetOutcome target={target} />
                   : canRoll
-                    ? <button className={isMe ? "btn min-h-8 shrink-0 px-3 py-1 text-xs" : "btn-secondary min-h-8 shrink-0 px-3 py-1 text-xs"} type="button" aria-label={isMe ? `Roll ${check.label}` : `Roll ${check.label} for ${name}`} onClick={() => onRoll(check.id, isMe ? undefined : target.user_id)}>{isMe ? "Roll" : "Roll for them"}</button>
+                    ? <button className={isMe ? "btn min-h-8 shrink-0 px-3 py-1 text-xs" : "btn-secondary min-h-8 shrink-0 px-3 py-1 text-xs"} type="button" aria-label={isMe ? `Roll ${check.label}` : `Roll ${check.label} for ${name}`} onClick={() => onRoll(check.id, isMe ? undefined : target.user_id, rollOptionsBody(checkOptions))}>{isMe ? "Roll" : "Roll for them"}</button>
                     : <span className="shrink-0 text-xs text-[var(--muted)]">{open ? "Waiting" : "Did not roll"}</span>}
               </li>;
             })}

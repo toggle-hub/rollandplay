@@ -75,20 +75,34 @@ Tokens carry attacks, spells and abilities (`actions`), and items. A sheet-backe
 
 Owners can also edit a character's lists outside a room: **Attacks & spells** on a sheet card in **Sheets** sends `PATCH /api/sheets/{sheetID}/actions` with the same `{attacks, actions, items}` body (all three required), returns the updated sheet, and refreshes every room token that uses the sheet. Other users get 404. `POST /api/sheets` and `PATCH /api/sheets/{sheetID}` validate any `attacks`, `actions` and `items` in `data` the same way and reject bad lists with `400 invalid_actions`.
 
-Right-clicking a token you control without dragging (players: their own tokens; game masters: every token) opens its action wheel: **Attacks**, **Spells & abilities**, **Items**, **Checks** (any ability check, saving throw or skill check, with no DC), **Death save** while a sheet-backed character is dying, and **Edit actions**. Pick an entry, then click a highlighted target (heals may target their own token) or the point where an area lands; a confirm card shows the dice, and **Roll** sends it. The websocket actions are:
+Right-clicking a token you control without dragging (players: their own tokens; game masters: every token) opens its action wheel: **Attacks**, **Spells & abilities**, **Items**, **Checks** (any ability check, saving throw or skill check, with no DC), **Death save** while a sheet-backed character is dying, and **Edit actions**. Pick an entry, then click a highlighted target (heals may target their own token) or the point where an area lands; a confirm card shows the dice, and **Roll** sends it. For attack rolls, checks and death saves the confirm card also offers **Disadvantage / Normal / Advantage** and a one-off **Bonus** (−20 to +20, for situational modifiers). Saves forced on targets and heals have no such choice. The websocket actions are:
 
-- `action.resolve` with `{sourceTokenId, source: "attack"|"action"|"item", actionId, targetTokenId?, point?}`.
-- `check.quick` with `{tokenId, kind: "ability"|"save"|"skill", key}`.
-- `death.save` with `{tokenId}`.
+- `action.resolve` with `{sourceTokenId, source: "attack"|"action"|"item", actionId, targetTokenId?, point?, mode?, bonus?}`. Only attack-roll entries accept a non-normal `mode` or a `bonus`; others answer with an `invalid_roll` error, as does an unknown mode or a bonus outside −20…20.
+- `check.quick` with `{tokenId, kind: "ability"|"save"|"skill", key, mode?, bonus?}`.
+- `death.save` with `{tokenId, mode?, bonus?}`.
+
+`mode` is `"normal"` (the default), `"advantage"` (roll `2d20kh1`: two d20s, keep the higher) or `"disadvantage"` (`2d20kl1`, keep the lower); `bonus` is added to the total. The chat line names the choice, e.g. "Hero attacks Goblin with Sword (advantage, +2 bonus)", and the dice line shows both d20s with the dropped one struck through.
 
 The server checks ownership, center-to-center range, and attack-blocking structures (unless `pass_rules.attacks` is set). An area hits every token within its radius of the point that the point has a clear line to; hidden tokens are only hit by the game master's areas and are left out of the chat result. Resolution follows D&D 5e on the built-in keys, and hit points change at once:
 
-- **Attack rolls:** `1d20 + to hit` against `armor_class` (10 when unset). A natural 20 always hits and doubles the damage dice; a natural 1 always misses.
+- **Attack rolls:** `1d20 + to hit` (or `2d20kh1`/`2d20kl1` with advantage/disadvantage, plus any one-off bonus) against `armor_class` (10 when unset). Natural results use the kept die: a natural 20 always hits and doubles the damage dice; a natural 1 always misses.
 - **Damage:** `temporary_hit_points` absorb it first, then `hit_points` drop, never below 0. Immunity (`immunities`) prevents it, resistance (`resistances`) halves it rounding down, and vulnerability (`vulnerabilities`) doubles it.
 - **Healing:** raises `hit_points` up to `max_hit_points`. It does nothing to the dead, and brings a dying character back with its death saves cleared.
-- **Down and dying:** a token at 0 of a positive `max_hit_points` cannot act. A sheet-backed character then makes death saves (`death_save_successes`, `death_save_failures`, `stable`, `dead` on the sheet): 10 or more succeeds and three successes stabilize, a 20 brings it back with 1 HP, a 1 counts as two failures, and three failures kill. Damage while down is one failure, two on a critical hit. Tokens without a sheet just stay down.
+- **Down and dying:** a token at 0 of a positive `max_hit_points` cannot act. A sheet-backed character then makes death saves (`death_save_successes`, `death_save_failures`, `stable`, `dead` on the sheet): a total of 10 or more succeeds and three successes stabilize, a natural 20 brings it back with 1 HP, a natural 1 counts as two failures, and three failures kill. Damage while down is one failure, two on a critical hit. Tokens without a sheet just stay down.
 
 Each result is one `roll.result` chat roll whose `roll.action` holds `{name, kind, source, source_token_id, dc?, save_ability?, damage_type?, effect?, targets: [{token_id, name, roll?, result, damage?, healing?, defense?, down?, dead?}], uses_left?, quantity_left?}`; it never includes a target's armor class or health. Clients float each target's result above its token and reload the room state. Attack, action and item lists for other players' and NPC tokens are never sent to players.
+
+Freeform dice (the chat's **Dice roll** box) and every dice field use the same grammar: terms `NdM` (`d8` means `1d8`), whole numbers, and keep terms `NdMkhK` / `NdMklK` (roll N, keep the K highest or lowest, e.g. `4d6kh3`), joined by `+` and `-`. A term rolls at most 100 dice of at most 1000 sides, and K must be between 1 and N. A roll's `dice` entries are `{count, sides, values}`; keep terms add `keep: "kh"|"kl"` and `kept: [bool…]`, one flag per value, and only kept dice count toward `total`.
+
+Game masters run fights from the turn-order strip above the map:
+
+- **Start combat** lists the tokens on the active map, with every visible token pre-checked; **Roll initiative** rolls `1d20 + initiative` for each on the server (the sheet's or stat block's `initiative` when it is a non-zero number, otherwise the Dexterity modifier). Ties go to the higher Dexterity score, then at random. Chat announces the order and whose turn it is.
+- **The strip** shows the round and each combatant with their initiative; the current turn is highlighted. Players never see hidden tokens in it, nor who is acting while a hidden token has the turn ("Waiting for the game master"); its turns are not named in chat.
+- **Next turn** (game master) and **End my turn** (the player of the current combatant: its sheet's owner, else the token's owner) pass the turn on; after the last combatant the order wraps and a new round starts. Each turn change posts "Round N: Name's turn." in chat. When one of a player's characters is up, they get a "Your turn" toast and the strip is highlighted.
+- **Arrange the order:** the game master can move combatants earlier or later (the turn stays with whoever has it), remove them (removing the current combatant passes the turn), **Add** tokens mid-fight (they roll initiative and go after everyone who beats or ties them) and **End combat**.
+- **Not enforced:** anyone may still move and act at any time; the order only makes whose turn it is clear.
+- **Websocket actions** (all but `combat.next` are game master only): `combat.start` with `{tokenIds}`, `combat.next` with `{combatantId}` (the combatant whose turn is ending; a stale one is refused with `stale_turn`), `combat.add` with `{tokenIds}`, `combat.remove` with `{combatantId}`, `combat.move` with `{combatantId, toIndex}`, and `combat.end` with `{}`. Every change sends `combat.changed`, and clients reload the room state.
+- **Storage:** the room state's `combat` is `null` or `{round, current_combatant_id, combatants: [{id, token_id, name, initiative, player_user_id, is_hidden}]}` in turn order. Fights are stored in `room_combats` and `room_combatants` (migration `016_room_combat.sql`), so reloads keep them. A fight belongs to the map it started on: switching maps hides it until that map is active again, and starting a fight on another map replaces it. Deleting a token removes it from the order.
 
 Rule books carry monsters: stat blocks with `{id, name, description, size_m, stats}`, where `stats` uses the book's attribute keys plus optional `attacks`, `actions` and `items` lists. Add them in the rule book creator's **Monsters** section, either starting blank or by extending a book, which copies its monsters. They are sent and validated as `monsters` on `POST`/`PATCH /api/rule-books`; a `PATCH` without `monsters` keeps the stored list.
 
@@ -105,7 +119,7 @@ Rule books also carry a **compendium**: `{attacks, actions, items}` in exactly t
 
 Game masters can prompt checks with **Prompt a check** in the room sidebar. Optionally name it as an encounter (for example "Goblin ambush"). Then pick the check, a DC from 1 to 100, the players who roll (only members with a character assigned at this table can be chosen), and whether results are public or private.
 
-- **Rolling:** each targeted player gets a **Roll** button in the **Checks** panel next to chat. The server rolls `1d20 + modifier` from the player's currently assigned character, and the result succeeds when the total meets or beats the DC. Game masters can **Roll for them** on any pending target, and can **Close check** to stop further rolls (pending players show "Did not roll"). A check closes by itself once everyone has rolled.
+- **Rolling:** each targeted player gets a **Roll** button in the **Checks** panel next to chat. Above it, **Disadvantage / Normal / Advantage** and a one-off **Bonus** apply to the next roll on that check (also when a game master rolls for a player). The server rolls `1d20 + modifier` (`2d20kh1`/`2d20kl1` with advantage/disadvantage, plus the bonus) from the player's currently assigned character, and the result succeeds when the total meets or beats the DC; the chat line names the choice, e.g. "Shadow: Stealth check (DC 13, advantage), success". Game masters can **Roll for them** on any pending target, and can **Close check** to stop further rolls (pending players show "Did not roll"). A check closes by itself once everyone has rolled.
 - **Modifiers:**
   - Ability check: ability modifier.
   - Saving throw: ability modifier, plus `proficiency_bonus` when `saving_throw_proficiencies.<ability>` is true.
@@ -118,7 +132,7 @@ Game masters can prompt checks with **Prompt a check** in the room sidebar. Opti
   - Private: only the targets see the prompt, and its chat announcement doesn't name the other targets. Each target sees only their own roll, in the panel and in chat. Game masters see everything.
 - **Websocket actions:**
   - `check.prompt` with `{title?, kind: "ability"|"save"|"skill"|"attribute", key, dc, targetUserIds, isPrivate}`.
-  - `check.roll` with `{checkId, userId?}`; `userId` is for game masters only.
+  - `check.roll` with `{checkId, userId?, mode?, bonus?}`; `userId` is for game masters only, and `mode`/`bonus` work as for `check.quick`.
   - `check.close` with `{checkId}`.
 - **Events and storage:**
   - Prompts post a chat announcement.

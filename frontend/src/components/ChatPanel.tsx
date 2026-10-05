@@ -2,6 +2,7 @@ import { FormEvent, useLayoutEffect, useRef, useState } from "react";
 import { ChatCircle, CheckCircle, DiceFive, LockSimple, PaperPlaneTilt, XCircle } from "@phosphor-icons/react";
 import { apiFetch } from "../api/client";
 import { PlayerName } from "./PlayerName";
+import { DiceValues } from "./DiceValues";
 import type { ActionOutcome, ChatMessage, ChatPage, RollResult, RoomMember, TargetOutcome, TargetResult } from "../api/types";
 import { isActionRoll } from "../lib/actions";
 import { humanizeKey } from "../lib/checks";
@@ -126,13 +127,13 @@ export function ChatPanel({ roomId, messages, hasEarlier, members, isDM, onSend 
                 <span className="inline-flex items-center gap-1.5 font-medium"><DiceFive size={18} aria-hidden="true" />{message.roll.damage ? `Attack · ${message.roll.expression}` : message.roll.expression}</span>
                 <strong className="rounded-md bg-[var(--peach)]/10 px-2 py-1 tabular-nums">total {message.roll.total}</strong>
               </div>
-              <p className="mb-0 mt-2 text-xs text-[var(--muted)]">{message.roll.dice.map((die, index) => <span key={index}>d{die.sides} [{die.values.join(", ")}] </span>)}<span>· modifier {message.roll.modifier}</span></p>
+              <DiceValues roll={message.roll} className="mb-0 mt-2 text-xs text-[var(--muted)]" />
               {message.roll.damage && <div className="mt-3">
                 <div className="flex flex-wrap items-center justify-between gap-2 text-[var(--peach)]">
                   <span className="inline-flex items-center gap-1.5 font-medium"><DiceFive size={18} aria-hidden="true" />Damage · {message.roll.damage.expression}</span>
                   <strong className="rounded-md bg-[var(--peach)]/10 px-2 py-1 tabular-nums">total {message.roll.damage.total}</strong>
                 </div>
-                <p className="mb-0 mt-2 text-xs text-[var(--muted)]">{message.roll.damage.dice.map((die, index) => <span key={index}>d{die.sides} [{die.values.join(", ")}] </span>)}<span>· modifier {message.roll.damage.modifier}</span></p>
+                <DiceValues roll={message.roll.damage} className="mb-0 mt-2 text-xs text-[var(--muted)]" />
               </div>}
             </div>)}
           </div>
@@ -193,7 +194,7 @@ const resultBadges: Record<TargetResult, { label: string; good: boolean }> = {
 };
 
 function DiceDetail({ roll }: { roll: RollResult }) {
-  return <p className="mb-0 mt-1 text-xs text-[var(--muted)]">{roll.dice.map((die, index) => <span key={index}>d{die.sides} [{die.values.join(", ")}] </span>)}<span>· modifier {roll.modifier}</span></p>;
+  return <DiceValues roll={roll} />;
 }
 
 function ResultBadge({ result }: { result: TargetResult }) {

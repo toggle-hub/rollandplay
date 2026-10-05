@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"slices"
 	"testing"
 )
 
@@ -24,23 +25,42 @@ func target(stats map[string]any, sheet bool) Target {
 var sword = ResolvedAction{Action: Action{Kind: ActionAttack, Dice: "1d8"}, ToHit: 2, DiceModifier: 3}
 
 func TestRollAttack(t *testing.T) {
-	out, dmg, patch, err := RollAttack(sword, target(map[string]any{"armor_class": 30.0, "hit_points": 20.0}, false), dice(19, 4, 4))
+	out, dmg, patch, err := RollAttack(sword, target(map[string]any{"armor_class": 30.0, "hit_points": 20.0}, false), RollOptions{}, dice(19, 4, 4))
 	if err != nil || out.Result != ResultCritical || dmg.Expression != "2d8+3" || dmg.Total != 13 || out.Damage != 13 || patch["hit_points"] != 7 {
 		t.Fatalf("natural 20 should crit through any armor: %+v %+v %+v %v", out, dmg, patch, err)
 	}
-	out, dmg, patch, _ = RollAttack(sword, target(map[string]any{"armor_class": 1.0, "hit_points": 20.0}, false), dice(0))
+	out, dmg, patch, _ = RollAttack(sword, target(map[string]any{"armor_class": 1.0, "hit_points": 20.0}, false), RollOptions{}, dice(0))
 	if out.Result != ResultMiss || dmg != nil || patch != nil {
 		t.Fatalf("natural 1 should always miss: %+v %+v %+v", out, dmg, patch)
 	}
-	out, _, patch, _ = RollAttack(sword, target(map[string]any{"armor_class": 12.0, "hit_points": 20.0}, false), dice(9, 0))
+	out, _, patch, _ = RollAttack(sword, target(map[string]any{"armor_class": 12.0, "hit_points": 20.0}, false), RollOptions{}, dice(9, 0))
 	if out.Result != ResultHit || out.Roll.Total != 12 || patch["hit_points"] != 16 {
 		t.Fatalf("a total equal to armor class should hit: %+v %+v", out, patch)
 	}
-	if out, _, _, _ := RollAttack(sword, target(map[string]any{}, false), dice(6)); out.Result != ResultMiss {
+	if out, _, _, _ := RollAttack(sword, target(map[string]any{}, false), RollOptions{}, dice(6)); out.Result != ResultMiss {
 		t.Fatalf("missing armor class counts as 10, so 7+2 misses: %+v", out)
 	}
-	if out, _, _, _ := RollAttack(sword, target(map[string]any{}, false), dice(7, 0)); out.Result != ResultHit {
+	if out, _, _, _ := RollAttack(sword, target(map[string]any{}, false), RollOptions{}, dice(7, 0)); out.Result != ResultHit {
 		t.Fatalf("missing armor class counts as 10, so 8+2 hits: %+v", out)
+	}
+}
+
+func TestRollAttackWithAdvantageUsesTheKeptDie(t *testing.T) {
+	adv := RollOptions{Mode: RollAdvantage}
+	out, dmg, _, err := RollAttack(sword, target(map[string]any{"armor_class": 30.0, "hit_points": 20.0}, false), adv, dice(0, 19, 4, 4))
+	if err != nil || out.Result != ResultCritical || out.Roll.Expression != "2d20kh1+2" || dmg.Expression != "2d8+3" || !slices.Equal(out.Roll.Dice[0].Kept, []bool{false, true}) {
+		t.Fatalf("advantage keeps the natural 20 over the 1: %+v %+v %v", out, dmg, err)
+	}
+	dis := RollOptions{Mode: RollDisadvantage}
+	if out, dmg, _, _ := RollAttack(sword, target(map[string]any{"armor_class": 1.0}, false), dis, dice(19, 0)); out.Result != ResultMiss || dmg != nil || out.Roll.Total != 3 {
+		t.Fatalf("disadvantage keeps the natural 1, which always misses: %+v", out)
+	}
+	if out, _, _, _ := RollAttack(sword, target(map[string]any{"armor_class": 30.0}, false), dis, dice(19, 18, 0)); out.Result != ResultMiss || out.Roll.Total != 21 {
+		t.Fatalf("a dropped 20 is no critical: %+v", out)
+	}
+	bonus := RollOptions{Bonus: 2}
+	if out, _, _, _ := RollAttack(sword, target(map[string]any{"armor_class": 13.0}, false), bonus, dice(8, 0)); out.Result != ResultHit || out.Roll.Total != 13 || out.Roll.Expression != "1d20+4" {
+		t.Fatalf("a one-off bonus adds to the attack roll: %+v", out)
 	}
 }
 
@@ -125,20 +145,30 @@ func TestDeathSave(t *testing.T) {
 		}
 		return target(stats, true)
 	}
-	if out, patch, _ := DeathSave(dying(nil), dice(19)); out.Result != ResultRevived || patch["hit_points"] != 1 {
+	if out, patch, _ := DeathSave(dying(nil), RollOptions{}, dice(19)); out.Result != ResultRevived || patch["hit_points"] != 1 {
 		t.Fatalf("a 20 revives: %+v %+v", out, patch)
 	}
-	if out, patch, _ := DeathSave(dying(map[string]any{"death_save_successes": 2.0}), dice(9)); out.Result != ResultStable || patch["stable"] != true || patch["death_save_successes"] != 0 {
+	if out, patch, _ := DeathSave(dying(map[string]any{"death_save_successes": 2.0}), RollOptions{}, dice(9)); out.Result != ResultStable || patch["stable"] != true || patch["death_save_successes"] != 0 {
 		t.Fatalf("a third success stabilizes: %+v %+v", out, patch)
 	}
-	if out, patch, _ := DeathSave(dying(nil), dice(9)); out.Result != ResultSuccess || patch["death_save_successes"] != 1 {
+	if out, patch, _ := DeathSave(dying(nil), RollOptions{}, dice(9)); out.Result != ResultSuccess || patch["death_save_successes"] != 1 {
 		t.Fatalf("10 succeeds: %+v %+v", out, patch)
 	}
-	if out, patch, _ := DeathSave(dying(nil), dice(8)); out.Result != ResultFailure || patch["death_save_failures"] != 1 {
+	if out, patch, _ := DeathSave(dying(nil), RollOptions{}, dice(8)); out.Result != ResultFailure || patch["death_save_failures"] != 1 {
 		t.Fatalf("9 fails: %+v %+v", out, patch)
 	}
-	if out, patch, _ := DeathSave(dying(map[string]any{"death_save_failures": 2.0}), dice(0)); out.Result != ResultDead || !out.Dead || patch["dead"] != true || patch["death_save_failures"] != 4 {
+	if out, patch, _ := DeathSave(dying(map[string]any{"death_save_failures": 2.0}), RollOptions{}, dice(0)); out.Result != ResultDead || !out.Dead || patch["dead"] != true || patch["death_save_failures"] != 4 {
 		t.Fatalf("a 1 at two failures kills: %+v %+v", out, patch)
+	}
+	bonus := RollOptions{Bonus: 1}
+	if out, patch, _ := DeathSave(dying(nil), bonus, dice(8)); out.Result != ResultSuccess || patch["death_save_successes"] != 1 || out.Roll.Total != 10 {
+		t.Fatalf("a 9 plus a bonus of 1 succeeds: %+v %+v", out, patch)
+	}
+	if out, patch, _ := DeathSave(dying(nil), RollOptions{Bonus: 15}, dice(0)); out.Result != ResultFailure || patch["death_save_failures"] != 2 {
+		t.Fatalf("a natural 1 is two failures whatever the bonus: %+v %+v", out, patch)
+	}
+	if out, _, _ := DeathSave(dying(nil), RollOptions{Mode: RollAdvantage}, dice(0, 19)); out.Result != ResultRevived {
+		t.Fatalf("advantage keeps the natural 20: %+v", out)
 	}
 }
 
