@@ -2,13 +2,14 @@ import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { ArrowLeft, Circle, Eye, EyeSlash, MapTrifold, Trash, UsersThree } from "@phosphor-icons/react";
 import { apiFetch, connectRoomSocket, patchJSON, postJSON, requestId } from "../api/client";
-import type { ChatMessage, GameMap, Monster, RoomMember, ServerEnvelope, Sheet, TokenDragFrame, TokenPatch, VisibleRoomState } from "../api/types";
+import type { ChatMessage, GameMap, Monster, PresenceChange, RoomMember, ServerEnvelope, Sheet, TokenDragFrame, TokenPatch, VisibleRoomState } from "../api/types";
 import { useSession } from "../auth/SessionContext";
 import { MapCanvas, type FloatingResult, type MapSelection } from "../components/MapCanvas";
 import { ChatPanel } from "../components/ChatPanel";
 import { CheckPromptForm } from "../components/CheckPromptForm";
 import { RoomChecks } from "../components/RoomChecks";
 import { PlayerName } from "../components/PlayerName";
+import { PresenceDot } from "../components/PresenceDot";
 import { ActionsEditor } from "../components/ActionsEditor";
 import { TokenSettingsPanel } from "../components/TokenSettingsPanel";
 import { RoomInvitePanel } from "../components/RoomInvitePanel";
@@ -48,6 +49,8 @@ export function RoomPage() {
   const [blankMap, setBlankMap] = useState({ name: "", width: "30", height: "30" });
   // Tokens someone else is dragging right now, drawn at their live position until the drag ends or the move lands.
   const [remoteDrags, setRemoteDrags] = useState<ReadonlyMap<string, Point>>(() => new Map());
+  // Members with the room open right now, from the room socket's presence.changed events.
+  const [onlineUserIds, setOnlineUserIds] = useState<ReadonlySet<string>>(() => new Set());
   const previousMapId = useRef("");
   const toolsToggleRef = useRef<HTMLButtonElement>(null);
   const wsRef = useRef<WebSocket | null>(null);
@@ -156,6 +159,7 @@ export function RoomPage() {
         const id = event.body.token_id;
         setRemoteDrags((current) => withoutKeys(current, [id]));
       }
+      if (event.type === "presence.changed" && isPresenceBody(event.body)) setOnlineUserIds(new Set(event.body.online_user_ids));
       if (event.type === "ruler.result" && isMetersBody(event.body)) setRuler(Number(event.body.meters));
       if (event.type === "error" && isErrorBody(event.body)) {
         toast({ kind: "error", message: event.body.message });
@@ -170,6 +174,7 @@ export function RoomPage() {
     ws.onclose = () => {
       setConnected(false);
       setRemoteDrags(new Map());
+      setOnlineUserIds(new Set());
     };
     ws.onerror = () => toast({ kind: "error", message: "The live connection was interrupted. Reload this room to reconnect." });
     return () => {
@@ -496,13 +501,13 @@ export function RoomPage() {
       <aside className="col-start-1 row-start-3 min-w-0 space-y-6 md:col-start-2 md:row-start-2 2xl:col-start-3 2xl:row-start-1 2xl:[&_.card]:p-5!" aria-label="Room members and chat">
         <section className="card">
           <h2 className="flex items-center gap-2 text-xl"><UsersThree size={22} className="text-[var(--accent)]" aria-hidden="true" />At the table</h2>
-          <div className="mt-5 space-y-4">{members.length === 0 ? <p className="text-muted text-sm">No members to display.</p> : members.map((member) => <div className="space-y-2 border-t border-[var(--paper)]/10 pt-3" key={member.user_id}><div className="flex items-start justify-between gap-3"><span className="min-w-0 break-words text-sm"><PlayerName player={{ id: member.user_id, username: member.username, pronouns: member.pronouns }} />{member.user_id === user?.id ? " (you)" : ""}</span><span className="shrink-0 text-xs text-[var(--muted)]">{member.is_dm ? "Game master" : "Player"}</span></div>{(isDM || member.user_id === user?.id) && <label className="block text-xs text-[var(--muted)]">{isDM ? "Assigned character" : "Your character"}<select className="mt-2 w-full text-sm" value={member.sheet_id ?? ""} disabled={busy} onChange={(e) => { const sheetId = e.target.value || null; void update(() => patchJSON(`/api/rooms/${roomId}/members/${member.user_id}`, { sheet_id: sheetId })); }}><option value="">No sheet</option>{roomSheets.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label>}</div>)}</div>
+          <div className="mt-5 space-y-4">{members.length === 0 ? <p className="text-muted text-sm">No members to display.</p> : members.map((member) => <div className="space-y-2 border-t border-[var(--paper)]/10 pt-3" key={member.user_id}><div className="flex items-start justify-between gap-3"><span className="min-w-0 break-words text-sm"><PresenceDot online={onlineUserIds.has(member.user_id)} /><PlayerName player={{ id: member.user_id, username: member.username, pronouns: member.pronouns }} />{member.user_id === user?.id ? " (you)" : ""}</span><span className="shrink-0 text-xs text-[var(--muted)]">{member.is_dm ? "Game master" : "Player"}</span></div>{(isDM || member.user_id === user?.id) && <label className="block text-xs text-[var(--muted)]">{isDM ? "Assigned character" : "Your character"}<select className="mt-2 w-full text-sm" value={member.sheet_id ?? ""} disabled={busy} onChange={(e) => { const sheetId = e.target.value || null; void update(() => patchJSON(`/api/rooms/${roomId}/members/${member.user_id}`, { sheet_id: sheetId })); }}><option value="">No sheet</option>{roomSheets.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label>}</div>)}</div>
         </section>
         {isDM && roomId && <RoomInvitePanel roomId={roomId} memberCount={members.length} />}
         <RoomChecks checks={state.checks ?? []} members={members} currentUserId={user?.id} isDM={isDM}
           onRoll={(checkId, userId) => sendMap("check.roll", userId ? { checkId, userId } : { checkId })}
           onClose={(checkId) => sendMap("check.close", { checkId })} />
-        <ChatPanel messages={state.chatHistory ?? []} members={members} isDM={isDM} onSend={(text, recipientUserIds, rollExpression) => send("chat.send", { text, recipientUserIds, rollExpression })} />
+        <ChatPanel key={roomId} roomId={roomId ?? ""} messages={state.chatHistory ?? []} hasEarlier={!!state.chatHasEarlier} members={members} isDM={isDM} onSend={(text, recipientUserIds, rollExpression) => send("chat.send", { text, recipientUserIds, rollExpression })} />
       </aside>
     </div>
   </div>;
@@ -525,6 +530,10 @@ function activeMapId(state: VisibleRoomState) {
 
 function isChatMessage(body: unknown): body is ChatMessage {
   return !!body && typeof body === "object" && "id" in body && "room_id" in body && "sender_user_id" in body && "kind" in body && "body" in body && "created_at" in body;
+}
+
+function isPresenceBody(body: unknown): body is PresenceChange {
+  return !!body && typeof body === "object" && "online_user_ids" in body && Array.isArray(body.online_user_ids);
 }
 
 function isMetersBody(body: unknown): body is { meters: number } {

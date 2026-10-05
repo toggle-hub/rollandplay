@@ -1,34 +1,88 @@
 import { FormEvent, useLayoutEffect, useRef, useState } from "react";
 import { ChatCircle, CheckCircle, DiceFive, LockSimple, PaperPlaneTilt, XCircle } from "@phosphor-icons/react";
+import { apiFetch } from "../api/client";
 import { PlayerName } from "./PlayerName";
-import type { ActionOutcome, ChatMessage, RollResult, RoomMember, TargetOutcome, TargetResult } from "../api/types";
+import type { ActionOutcome, ChatMessage, ChatPage, RollResult, RoomMember, TargetOutcome, TargetResult } from "../api/types";
 import { isActionRoll } from "../lib/actions";
 import { humanizeKey } from "../lib/checks";
+import { messageTime, withEarlier, withLatest, type ChatFeed } from "../lib/chat";
 
 type Props = {
+  roomId: string;
+  /** The room state's newest messages plus live arrivals, oldest first. */
   messages: ChatMessage[];
+  /** Whether messages older than `messages` exist. */
+  hasEarlier: boolean;
   members: RoomMember[];
   isDM: boolean;
   onSend: (text: string, recipientUserIds: string[], rollExpression?: string) => void;
 };
-export function ChatPanel({ messages, members, isDM, onSend }: Props) {
+
+// Within this many pixels of the bottom, the feed follows new messages.
+const FOLLOW_DISTANCE_PX = 48;
+
+export function ChatPanel({ roomId, messages, hasEarlier, members, isDM, onSend }: Props) {
   const [text, setText] = useState("");
   const [roll, setRoll] = useState("");
   const [recipients, setRecipients] = useState<string[]>([]);
   const [error, setError] = useState("");
+  // Messages stay once shown, even after they drop out of the room state's newest window.
+  const [feed, setFeed] = useState<ChatFeed>(() => withLatest({ messages: [], canLoadEarlier: false }, messages, hasEarlier));
+  const [latestSeen, setLatestSeen] = useState(messages);
+  const [loadingEarlier, setLoadingEarlier] = useState(false);
+  const [earlierError, setEarlierError] = useState("");
   const feedRef = useRef<HTMLDivElement>(null);
-  const lastMessageId = messages[messages.length - 1]?.id;
+  // The feed's scroll height after the last change, and the position to restore once earlier messages are in.
+  const lastScrollHeight = useRef(0);
+  const restoreScroll = useRef<{ height: number; top: number } | null>(null);
+  const justSent = useRef(false);
+  if (latestSeen !== messages) {
+    setLatestSeen(messages);
+    setFeed((current) => withLatest(current, messages, hasEarlier));
+  }
+  const lastMessageId = feed.messages[feed.messages.length - 1]?.id;
+  // Game masters may whisper any player; players may whisper the game masters.
+  const recipientChoices = members.filter((member) => isDM ? !member.is_dm : member.is_dm);
+  const chosenRecipients = recipients.filter((id) => recipientChoices.some((member) => member.user_id === id));
 
   useLayoutEffect(() => {
-    const feed = feedRef.current;
-    if (feed) feed.scrollTop = feed.scrollHeight;
-  }, [lastMessageId, messages.length]);
+    const el = feedRef.current;
+    if (!el) return;
+    const restore = restoreScroll.current;
+    if (restore) {
+      // Earlier messages went in above; keep the same messages in view.
+      restoreScroll.current = null;
+      el.scrollTop = restore.top + el.scrollHeight - restore.height;
+    } else if (justSent.current || lastScrollHeight.current - el.scrollTop - el.clientHeight <= FOLLOW_DISTANCE_PX) {
+      // Follow new messages unless the reader scrolled up to older ones.
+      el.scrollTop = el.scrollHeight;
+    }
+    justSent.current = false;
+    lastScrollHeight.current = el.scrollHeight;
+  }, [lastMessageId, feed.messages.length]);
+
+  async function loadEarlier() {
+    const oldest = feed.messages[0];
+    if (!oldest || loadingEarlier) return;
+    setLoadingEarlier(true);
+    setEarlierError("");
+    try {
+      const page = await apiFetch<ChatPage>(`/api/rooms/${roomId}/chat?before=${encodeURIComponent(oldest.id)}`);
+      const el = feedRef.current;
+      if (el && page.messages.length > 0) restoreScroll.current = { height: el.scrollHeight, top: el.scrollTop };
+      setFeed((current) => withEarlier(current, page));
+    } catch (err) {
+      setEarlierError(err instanceof Error ? err.message : "Could not load earlier messages.");
+    } finally {
+      setLoadingEarlier(false);
+    }
+  }
 
   function submit(e: FormEvent) {
     e.preventDefault();
     if (!text.trim() && !roll.trim()) return;
     setError("");
-    try { onSend(text, isDM ? recipients : [], roll.trim() || undefined); setText(""); setRoll(""); }
+    try { onSend(text, chosenRecipients, roll.trim() || undefined); justSent.current = true; setText(""); setRoll(""); }
     catch (err) { setError(err instanceof Error ? err.message : "Could not send your message."); }
   }
   return <section className="flex min-w-0 flex-col overflow-hidden rounded-xl border border-[var(--line)] bg-[var(--surface)]" aria-labelledby="chat-heading">
@@ -40,18 +94,24 @@ export function ChatPanel({ messages, members, isDM, onSend }: Props) {
       </div>
     </header>
     <div ref={feedRef} role="log" aria-label="Room messages" aria-live="polite" aria-relevant="additions" tabIndex={0} className="h-80 max-h-[50dvh] min-h-48 space-y-4 overflow-y-auto overscroll-contain p-4">
-      {messages.length === 0 && <div className="flex h-full flex-col items-center justify-center px-2 text-center">
+      {feed.canLoadEarlier && feed.messages.length > 0 && <div className="flex flex-col items-center gap-1.5">
+        <button type="button" className="rounded-md border border-[var(--line)] px-3 py-1.5 text-xs text-[var(--lavender)] transition-colors hover:border-[var(--lavender)] disabled:opacity-60" onClick={() => void loadEarlier()} disabled={loadingEarlier}>{loadingEarlier ? "Loading earlier messages…" : "Load earlier messages"}</button>
+        {earlierError && <p role="alert" className="mb-0 text-xs text-[var(--pink)]">{earlierError}</p>}
+      </div>}
+      {feed.messages.length === 0 && <div className="flex h-full flex-col items-center justify-center px-2 text-center">
         <ChatCircle size={32} weight="light" className="mb-3 text-[var(--lavender)]" aria-hidden="true" />
         <p className="mb-1 text-sm text-[var(--paper)]">The table is quiet.</p>
         <p className="mb-0 text-xs leading-relaxed text-[var(--muted)]">Say hello, set the scene,<br />or roll the first die.</p>
       </div>}
-      {messages.map((message) => {
+      {feed.messages.map((message) => {
         const member = members.find((item) => item.user_id === message.sender_user_id);
         const privateMessage = message.kind === "dm" || !!message.recipient_user_ids?.length;
+        const time = messageTime(message.created_at);
         return <article key={message.id} className="min-w-0 text-sm [overflow-wrap:anywhere]">
           <div className="mb-1.5 flex flex-wrap items-center gap-x-2 gap-y-1 text-xs">
             {message.kind === "system" ? <span className="text-[var(--muted)]">Table update</span> : <PlayerName className="font-medium text-[var(--lavender)]" player={member ? { id: member.user_id, username: member.username, pronouns: member.pronouns } : null} />}
             {privateMessage && <span className="inline-flex items-center gap-1 rounded bg-[var(--lavender)]/10 px-1.5 py-0.5 text-[var(--lavender)]"><LockSimple size={11} aria-hidden="true" />Private{message.recipient_user_ids?.length ? ` · ${message.recipient_user_ids.length}` : ""}</span>}
+            {time && <time className="ml-auto tabular-nums text-[var(--muted)]" dateTime={message.created_at} title={time.full}>{time.short}</time>}
           </div>
           <div className={message.kind === "system" ? "border-l-2 border-[var(--line)] pl-3 text-xs leading-relaxed text-[var(--muted)]" : `rounded-xl rounded-tl-sm border p-3 leading-relaxed ${privateMessage ? "border-[var(--lavender)]/20 bg-[var(--lavender)]/5" : "border-[var(--paper)]/5 bg-[var(--input)]/60"}`}>
             {message.body && <p className="mb-0 whitespace-pre-wrap">{message.body}</p>}
@@ -80,15 +140,15 @@ export function ChatPanel({ messages, members, isDM, onSend }: Props) {
       })}
     </div>
     <form className="relative space-y-3 border-t border-[var(--line)] bg-[var(--input)]/30 p-4" onSubmit={submit}>
-      {isDM && <details className="text-xs">
+      {recipientChoices.length > 0 && <details className="text-xs">
         <summary className="cursor-pointer rounded-md py-1 text-[var(--lavender)]">
-          <span className="ml-1 inline-flex items-center gap-1.5 align-middle"><LockSimple size={13} aria-hidden="true" />{recipients.length ? `Private · ${recipients.length} selected` : "To everyone"}</span>
+          <span className="ml-1 inline-flex items-center gap-1.5 align-middle"><LockSimple size={13} aria-hidden="true" />{chosenRecipients.length ? `Private · ${chosenRecipients.length} selected` : "To everyone"}</span>
         </summary>
         <fieldset className="absolute inset-x-4 bottom-full z-20 mb-2 rounded-lg border border-[var(--line)] bg-[var(--ink)] p-3 shadow-xl">
-          <legend className="px-1 text-[var(--paper)]">Private recipients</legend>
-          <p className="mb-3 leading-relaxed text-[var(--muted)]">Leave everyone unchecked to send to the whole table.</p>
+          <legend className="px-1 text-[var(--paper)]">{isDM ? "Private recipients" : "Whisper the game master"}</legend>
+          <p className="mb-3 leading-relaxed text-[var(--muted)]">{isDM ? "Leave everyone unchecked to send to the whole table." : "Only you and the game masters you check will see the message and its roll. Leave everyone unchecked to send to the whole table."}</p>
           <div className="max-h-32 space-y-2 overflow-y-auto overscroll-contain">
-            {members.filter((member) => !member.is_dm).map((member) => <label className="flex items-start gap-2" key={member.user_id}>
+            {recipientChoices.map((member) => <label className="flex items-start gap-2" key={member.user_id}>
               <input className="mt-1 shrink-0" type="checkbox" checked={recipients.includes(member.user_id)} onChange={(e) => setRecipients((current) => e.target.checked ? [...current, member.user_id] : current.filter((id) => id !== member.user_id))} />
               <PlayerName className="min-w-0 break-words text-xs leading-relaxed" player={{ id: member.user_id, username: member.username, pronouns: member.pronouns }} />
             </label>)}

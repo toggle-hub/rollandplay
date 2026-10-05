@@ -1,12 +1,72 @@
-import { cleanup, render, screen, within } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { apiFetch } from "../api/client";
+import type { ChatMessage, RoomMember } from "../api/types";
 import { ChatPanel } from "./ChatPanel";
 
+vi.mock("../api/client", () => ({ apiFetch: vi.fn() }));
+
+const member = (user_id: string, username: string, is_dm: boolean): RoomMember => ({ id: `rm-${user_id}`, room_id: "r", user_id, username, pronouns: "", sheet_id: null, is_dm });
+const chat = (id: string, minute: number, body = id): ChatMessage => ({ id, room_id: "r", sender_user_id: "u", kind: "chat", body, created_at: new Date(Date.UTC(2026, 9, 5, 10, minute)).toISOString() });
+const table = [member("gm", "Keeper", true), member("p1", "Ash", false), member("p2", "Birch", false)];
+const bodies = () => screen.getAllByRole("article").map((article) => article.querySelector("p")?.textContent);
+
 describe("ChatPanel", () => {
-  afterEach(cleanup);
+  afterEach(() => {
+    cleanup();
+    vi.mocked(apiFetch).mockReset();
+  });
+
+  it("lets players whisper only the game master, and game masters whisper players", () => {
+    const onSend = vi.fn();
+    const { unmount } = render(<ChatPanel roomId="r" hasEarlier={false} isDM={false} members={table} onSend={onSend} messages={[]} />);
+    expect(screen.getByText("Whisper the game master")).toBeInTheDocument();
+    const choices = screen.getAllByRole("checkbox");
+    expect(choices).toHaveLength(1);
+    fireEvent.click(choices[0]);
+    fireEvent.change(screen.getByLabelText("Message"), { target: { value: "I pocket the gem" } });
+    fireEvent.change(screen.getByLabelText(/Dice roll/), { target: { value: "1d20+3" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+    expect(onSend).toHaveBeenCalledWith("I pocket the gem", ["gm"], "1d20+3");
+    unmount();
+
+    render(<ChatPanel roomId="r" hasEarlier={false} isDM members={table} onSend={vi.fn()} messages={[]} />);
+    expect(screen.getAllByRole("checkbox")).toHaveLength(2);
+    expect(screen.getByText("Private recipients")).toBeInTheDocument();
+  });
+
+  it("loads earlier messages above the feed until none are left", async () => {
+    vi.mocked(apiFetch).mockResolvedValueOnce({ messages: [chat("a", 1), chat("b", 2)], hasEarlier: false });
+    render(<ChatPanel roomId="room-1" hasEarlier isDM={false} members={[]} onSend={vi.fn()} messages={[chat("c", 3), chat("d", 4)]} />);
+    fireEvent.click(screen.getByRole("button", { name: "Load earlier messages" }));
+    await waitFor(() => expect(bodies()).toEqual(["a", "b", "c", "d"]));
+    expect(apiFetch).toHaveBeenCalledWith("/api/rooms/room-1/chat?before=c");
+    expect(screen.queryByRole("button", { name: "Load earlier messages" })).not.toBeInTheDocument();
+  });
+
+  it("keeps loaded and shown messages when the room's newest messages move on", async () => {
+    vi.mocked(apiFetch).mockResolvedValueOnce({ messages: [chat("a", 1)], hasEarlier: true });
+    const props = { roomId: "r", isDM: false, members: [], onSend: vi.fn() };
+    const { rerender } = render(<ChatPanel {...props} hasEarlier messages={[chat("b", 2), chat("c", 3)]} />);
+    fireEvent.click(screen.getByRole("button", { name: "Load earlier messages" }));
+    await waitFor(() => expect(bodies()).toEqual(["a", "b", "c"]));
+    // A reload whose newest window no longer includes "b".
+    rerender(<ChatPanel {...props} hasEarlier messages={[chat("c", 3), chat("d", 4)]} />);
+    expect(bodies()).toEqual(["a", "b", "c", "d"]);
+    expect(screen.getByRole("button", { name: "Load earlier messages" })).toBeInTheDocument();
+  });
+
+  it("shows each message's time with the full date on hover", () => {
+    render(<ChatPanel roomId="r" hasEarlier={false} isDM={false} members={[]} onSend={vi.fn()} messages={[chat("a", 7)]} />);
+    const time = within(screen.getByRole("article")).getByText((_, element) => element?.tagName === "TIME");
+    expect(time).toHaveAttribute("datetime", "2026-10-05T10:07:00.000Z");
+    expect(time.getAttribute("title")).toContain("2026");
+  });
   it("renders roll details and hides DM controls for non-DMs", () => {
     render(
       <ChatPanel
+        roomId="r"
+        hasEarlier={false}
         isDM={false}
         members={[]}
         onSend={vi.fn()}
@@ -36,6 +96,8 @@ describe("ChatPanel", () => {
   it("renders the attack and damage rolls of an attack", () => {
     render(
       <ChatPanel
+        roomId="r"
+        hasEarlier={false}
         isDM={false}
         members={[]}
         onSend={vi.fn()}
@@ -73,6 +135,8 @@ describe("ChatPanel", () => {
     const d20 = (value: number, modifier: number) => ({ expression: `1d20+${modifier}`, dice: [{ count: 1, sides: 20, values: [value] }], modifier, total: value + modifier });
     render(
       <ChatPanel
+        roomId="r"
+        hasEarlier={false}
         isDM={false}
         members={[]}
         onSend={vi.fn()}
@@ -122,6 +186,8 @@ describe("ChatPanel", () => {
   it("says so when an area action catches no creatures", () => {
     render(
       <ChatPanel
+        roomId="r"
+        hasEarlier={false}
         isDM={false}
         members={[]}
         onSend={vi.fn()}
@@ -145,6 +211,8 @@ describe("ChatPanel", () => {
     });
     render(
       <ChatPanel
+        roomId="r"
+        hasEarlier={false}
         isDM={false}
         members={[]}
         onSend={vi.fn()}

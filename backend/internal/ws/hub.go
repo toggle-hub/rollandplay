@@ -2,7 +2,6 @@ package ws
 
 import (
 	"context"
-	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -96,6 +95,7 @@ func NewHubWithLogger(pool *pgxpool.Pool, rdb *redis.Client, logger *zap.Logger)
 	}
 	if rdb != nil {
 		go h.subscribe(context.Background())
+		go h.presenceHeartbeat(context.Background())
 	}
 	return h
 }
@@ -126,6 +126,7 @@ func (h *Hub) Handle(w http.ResponseWriter, r *http.Request) {
 	go c.writeLoop()
 	go c.readLoop()
 	c.send <- envelope{Type: "state.snapshot", Body: h.snapshot(r.Context(), roomID, u.ID)}
+	h.presenceJoin(c)
 }
 
 func (h *Hub) subscribe(ctx context.Context) {
@@ -285,6 +286,7 @@ func (c *client) close() {
 		c.hub.logger.Info("websocket disconnected", zap.String("room_id", c.roomID), zap.String("user_id", c.userID))
 	}
 	c.conn.Close()
+	c.hub.presenceLeave(c)
 }
 func (c *client) error(id, code, msg string) {
 	fields := []zap.Field{zap.String("request_id", id), zap.String("code", code), zap.String("room_id", c.roomID), zap.String("user_id", c.userID)}
@@ -345,70 +347,6 @@ func (c *client) handle(msg clientEnvelope) {
 	default:
 		c.error(msg.RequestID, "unknown_type", "unknown websocket message type")
 	}
-}
-
-func (c *client) chatSend(msg clientEnvelope) {
-	var req struct {
-		Text             string   `json:"text"`
-		RecipientUserIDs []string `json:"recipientUserIds"`
-		RollExpression   string   `json:"rollExpression"`
-	}
-	if json.Unmarshal(msg.Body, &req) != nil {
-		c.error(msg.RequestID, "bad_json", "invalid body")
-		return
-	}
-	if len(req.RecipientUserIDs) > 0 && !c.isDM {
-		c.error(msg.RequestID, "forbidden", "only DMs can send private messages")
-		return
-	}
-	kind := "chat"
-	if len(req.RecipientUserIDs) > 0 {
-		kind = "dm"
-	}
-	var roll any
-	body := req.Text
-	if req.RollExpression != "" {
-		rr, err := game.RollExpression(req.RollExpression, rand.Reader)
-		if err != nil {
-			c.error(msg.RequestID, "bad_roll", err.Error())
-			return
-		}
-		kind = "roll"
-		roll = rr
-		b, _ := json.Marshal(rr)
-		body = string(b)
-	}
-	tx, err := c.hub.pool.Begin(context.Background())
-	if err != nil {
-		c.error(msg.RequestID, "db", err.Error())
-		return
-	}
-	defer tx.Rollback(context.Background())
-	id := uuid.New().String()
-	rollJSON, _ := json.Marshal(roll)
-	if roll == nil {
-		rollJSON = nil
-	}
-	_, err = tx.Exec(context.Background(), `insert into chat_messages(id,room_id,sender_user_id,kind,body,roll) values($1,$2,$3,$4,$5,$6)`, id, c.roomID, c.userID, kind, body, rollJSON)
-	if err == nil {
-		for _, uid := range req.RecipientUserIDs {
-			_, err = tx.Exec(context.Background(), `insert into chat_message_recipients(message_id,user_id) values($1,$2)`, id, uid)
-			if err != nil {
-				break
-			}
-		}
-	}
-	if err != nil {
-		c.error(msg.RequestID, "db", err.Error())
-		return
-	}
-	_ = tx.Commit(context.Background())
-	bodyMap := map[string]any{"id": id, "room_id": c.roomID, "sender_user_id": c.userID, "kind": kind, "body": body, "roll": roll, "recipient_user_ids": req.RecipientUserIDs, "created_at": time.Now()}
-	evType := "chat.message"
-	if kind == "roll" {
-		evType = "roll.result"
-	}
-	c.hub.publish(c.roomID, envelope{Type: evType, RequestID: &msg.RequestID, Body: bodyMap})
 }
 
 func (c *client) tokenMove(msg clientEnvelope) {

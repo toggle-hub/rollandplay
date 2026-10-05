@@ -112,6 +112,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/rooms/{roomID}/maps/new", s.handleRoomMapNew)
 	mux.HandleFunc("PATCH /api/rooms/{roomID}/maps/{roomMapID}", s.handleRoomMapPatch)
 	mux.HandleFunc("GET /api/rooms/{roomID}/state", s.handleRoomState)
+	mux.HandleFunc("GET /api/rooms/{roomID}/chat", s.handleRoomChat)
 	mux.HandleFunc("POST /api/rooms/{roomID}/tokens", s.handleTokenCreate)
 	mux.HandleFunc("GET /api/rooms/{roomID}/monsters", s.handleRoomMonsters)
 	mux.HandleFunc("PATCH /api/rooms/{roomID}/tokens/{tokenID}", s.handleTokenPatch)
@@ -1832,7 +1833,7 @@ func (s *Server) visibleState(ctx context.Context, roomID, userID string) (map[s
 			tokRows = append(tokRows, t)
 		}
 	}
-	chat, err := s.queryJSON(ctx, `select jsonb_build_object('id',cm.id::text,'room_id',cm.room_id::text,'sender_user_id',cm.sender_user_id::text,'kind',cm.kind,'body',cm.body,'roll',cm.roll,'created_at',cm.created_at,'recipient_user_ids',coalesce((select jsonb_agg(user_id::text) from chat_message_recipients where message_id=cm.id),'[]'::jsonb)) from chat_messages cm where cm.room_id=$1 and (not exists(select 1 from chat_message_recipients r where r.message_id=cm.id) or cm.sender_user_id=$2 or exists(select 1 from room_members rm where rm.room_id=$1 and rm.user_id=$2 and rm.is_dm) or exists(select 1 from chat_message_recipients r where r.message_id=cm.id and r.user_id=$2)) order by cm.created_at limit 200`, roomID, userID)
+	chat, chatHasEarlier, err := s.visibleChat(ctx, roomID, userID, isDM, "", chatWindow)
 	if err != nil {
 		return nil, err
 	}
@@ -1840,7 +1841,7 @@ func (s *Server) visibleState(ctx context.Context, roomID, userID string) (map[s
 	if err != nil {
 		return nil, err
 	}
-	return map[string]any{"room": json.RawMessage(room), "activeMap": json.RawMessage(active), "structures": structRows, "visibleTokens": tokRows, "ownTokens": own, "chatHistory": chat, "checks": checks, "metersPerGrid": gridFromRaw(active), "visibility": vis}, nil
+	return map[string]any{"room": json.RawMessage(room), "activeMap": json.RawMessage(active), "structures": structRows, "visibleTokens": tokRows, "ownTokens": own, "chatHistory": chat, "chatHasEarlier": chatHasEarlier, "checks": checks, "metersPerGrid": gridFromRaw(active), "visibility": vis}, nil
 }
 
 // visibleChecks lists open checks and the most recent closed ones, newest first. Game masters
