@@ -1,14 +1,16 @@
 import { useEffect, useRef, useState, type ComponentType, type KeyboardEvent } from "react";
 import { DiceFive, Flask, Heartbeat, MagicWand, PencilSimple, Sword, X, type IconProps } from "@phosphor-icons/react";
 import type { RoomToken } from "../api/types";
-import { actionSummary, canDeathSave, checkLabel, isDown, type QuickCheck, type WheelChoice } from "../lib/actions";
-import { attackSummary, dndAbilities } from "../lib/attacks";
-import { dndSkills } from "../lib/checks";
+import { actionSummary, canDeathSave, checkLabel, isDown, type WheelChoice } from "../lib/actions";
+import { attackSummary } from "../lib/attacks";
+import { quickCheckGroups, type QuickCheckGroup } from "../lib/checks";
 
 type Props = {
   x: number;
   y: number;
   token: RoomToken;
+  /** The Checks menu, built from the room's rule book; D&D saving throws, skills and ability checks when absent. */
+  checkGroups?: QuickCheckGroup[];
   onPreview: (rangeM: number | null) => void;
   onChoose: (choice: WheelChoice) => void;
   onEdit?: () => void;
@@ -23,12 +25,6 @@ type EntryGroup = { label?: string; entries: Entry[] };
 const wheelRadiusPx = 84;
 const wheelCenterPx = 112;
 const buttonSizePx = 56;
-
-const checkGroups: { label: string; kind: QuickCheck["kind"]; keys: string[] }[] = [
-  { label: "Saving throws", kind: "save", keys: dndAbilities },
-  { label: "Skills", kind: "skill", keys: dndSkills },
-  { label: "Ability checks", kind: "ability", keys: dndAbilities },
-];
 
 function stopMenuEvents() {
   return {
@@ -52,7 +48,7 @@ function cycleFocus(container: HTMLElement | null, event: KeyboardEvent, keys: s
   return true;
 }
 
-export function TokenActionWheel({ x, y, token, onPreview, onChoose, onEdit, onClose }: Props) {
+export function TokenActionWheel({ x, y, token, checkGroups = quickCheckGroups(), onPreview, onChoose, onEdit, onClose }: Props) {
   const wheel = useRef<HTMLDivElement>(null);
   const list = useRef<HTMLDivElement>(null);
   const closeButton = useRef<HTMLButtonElement>(null);
@@ -68,7 +64,7 @@ export function TokenActionWheel({ x, y, token, onPreview, onChoose, onEdit, onC
     { key: "attacks", label: "Attacks", icon: Sword, disabled: !!blocked || attacks.length === 0, title: blocked ?? (attacks.length === 0 ? "No attacks yet" : undefined) },
     { key: "actions", label: "Spells & abilities", icon: MagicWand, disabled: !!blocked || actions.length === 0, title: blocked ?? (actions.length === 0 ? "No spells or abilities yet" : undefined) },
     { key: "items", label: "Items", icon: Flask, disabled: !!blocked || items.length === 0, title: blocked ?? (items.length === 0 ? "No items" : undefined) },
-    { key: "checks", label: "Checks", icon: DiceFive, disabled: !!blocked, title: blocked },
+    { key: "checks", label: "Checks", icon: DiceFive, disabled: !!blocked || checkGroups.length === 0, title: blocked ?? (checkGroups.length === 0 ? "This rule book has no numbers to roll checks with" : undefined) },
   ];
   if (canDeathSave(token)) categories.push({ key: "death_save", label: "Death save", icon: Heartbeat, disabled: dead });
   if (onEdit) categories.push({ key: "edit", label: "Edit actions", icon: PencilSimple, disabled: false });

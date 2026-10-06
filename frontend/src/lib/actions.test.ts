@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { ActionLists, ResolvedTokenAction, RuleBook, TargetOutcome, TokenAction, TokenAttack, TokenItem } from "../api/types";
-import { actionSummary, compendiumSummary, floatText, startingLists, withPicks } from "./actions";
+import { actionSummary, compendiumSummary, floatText, rollPreview, startingLists, withPicks } from "./actions";
 
 const base: ResolvedTokenAction = {
   id: "a",
@@ -89,5 +89,18 @@ describe("startingLists", () => {
     } as unknown as RuleBook;
     expect(startingLists(book, "brute")).toEqual({ attacks: [axe, longsword], actions: [], items: [potion] });
     expect(startingLists(book)).toEqual({ attacks: [], actions: [], items: [] });
+  });
+});
+
+describe("rollPreview", () => {
+  const fireball = { kind: "save" as const, ability: "intelligence", proficient: true, bonus: 1, dice: "8d6", diceBonus: 0, abilityToDice: false, damageType: "fire" };
+
+  it("works out the save DC and damage from the owner's stats like the server", () => {
+    expect(rollPreview(fireball, { intelligence: 17, proficiency_bonus: 3 })).toEqual(["Save DC: 15 (8, Intelligence +3, proficiency +3, bonus +1)", "Damage: 8d6 fire"]);
+    expect(rollPreview({ ...fireball, kind: "attack", abilityToDice: true, bonus: 0 }, { intelligence: 7 })).toEqual(["To hit: -2 (Intelligence -2, proficiency +0)", "Damage: 8d6-2 fire"]);
+  });
+
+  it("names the formula when no stats are known", () => {
+    expect(rollPreview({ ...fireball, kind: "attack", abilityToDice: true, diceBonus: -1 })).toEqual(["To hit: 1d20 + Intelligence modifier + proficiency bonus + 1", "Damage: 8d6 + Intelligence modifier - 1 fire"]);
   });
 });

@@ -1,7 +1,7 @@
-import { FormEvent, useState } from "react";
+import { FormEvent, KeyboardEvent, useState } from "react";
 import { ArrowCounterClockwise, Flask, MagicWand, Plus, Sword, Trash } from "@phosphor-icons/react";
 import type { ActionKind, ActionLists, TokenAction, TokenAttack, TokenItem } from "../api/types";
-import { compendiumSummary, damageTypes } from "../lib/actions";
+import { compendiumSummary, damageTypes, rollPreview, type RollPreviewInput } from "../lib/actions";
 import { diceExpressionPattern, dndAbilities } from "../lib/attacks";
 import { humanizeKey } from "../lib/checks";
 
@@ -12,6 +12,11 @@ type Props = {
   /** Entries offered by "Add from compendium"; no picker without it. */
   compendium?: ActionLists;
   limits?: Limits;
+  /** The owner's stats; with them the editor works out to-hit bonuses and save DCs, without them it names the formula. */
+  stats?: Record<string, unknown>;
+  /** Renders without its own form, so it can sit inside another form; Save then applies the lists to that form's draft. */
+  embedded?: boolean;
+  saveLabel?: string;
   busy: boolean;
   onSave: (lists: ActionLists) => void;
   onClose: () => void;
@@ -105,6 +110,24 @@ function wholeNumber(text: string): number {
   return text.trim() ? Number(text) : 0;
 }
 
+/** A half-typed number previews as 0. */
+function previewNumber(text: string): number {
+  const n = wholeNumber(text);
+  return Number.isFinite(n) ? n : 0;
+}
+
+function attackPreview(row: DraftAttack): RollPreviewInput {
+  return { kind: "attack", ability: row.ability, proficient: row.proficient, bonus: previewNumber(row.attack_bonus), dice: row.damage, diceBonus: previewNumber(row.damage_bonus), abilityToDice: true, damageType: row.damage_type };
+}
+
+function effectPreview(row: DraftEffect): RollPreviewInput {
+  return { kind: row.kind, ability: row.ability, proficient: row.proficient, bonus: row.kind === "heal" ? 0 : previewNumber(row.bonus), dice: row.dice, diceBonus: previewNumber(row.dice_bonus), abilityToDice: row.ability_to_dice, damageType: row.damage_type };
+}
+
+function RollPreview({ input, stats }: { input: RollPreviewInput; stats?: Record<string, unknown> }) {
+  return <p className="mb-0 rounded-lg bg-[var(--input)]/40 px-3 py-2 text-xs text-[var(--lavender)]">{rollPreview(input, stats).join(" · ")}</p>;
+}
+
 function inRange(n: number, min: number, max: number): boolean {
   return Number.isInteger(n) && n >= min && n <= max;
 }
@@ -140,7 +163,7 @@ function parseEffect(row: DraftEffect, fallbackName: string): Omit<TokenAction, 
   };
 }
 
-export function ActionsEditor({ owner, compendium, limits = characterLimits, busy, onSave, onClose }: Props) {
+export function ActionsEditor({ owner, compendium, limits = characterLimits, stats, embedded = false, saveLabel = "Save actions", busy, onSave, onClose }: Props) {
   const [attacks, setAttacks] = useState<DraftAttack[]>(() => (owner.attacks ?? []).map(draftAttack));
   const [actions, setActions] = useState<DraftAction[]>(() => (owner.actions ?? []).map(draftAction));
   const [items, setItems] = useState<DraftItem[]>(() => (owner.items ?? []).map(draftItem));
@@ -201,15 +224,27 @@ export function ActionsEditor({ owner, compendium, limits = characterLimits, bus
     return lists;
   }
 
-  function submit(event: FormEvent) {
-    event.preventDefault();
+  function apply() {
     const lists = validate();
     if (typeof lists === "string") return setError(lists);
     setError("");
     onSave(lists);
   }
 
-  return <form className="card space-y-4 p-5!" onSubmit={submit} aria-labelledby={headingId}>
+  function submit(event: FormEvent) {
+    event.preventDefault();
+    apply();
+  }
+
+  /** Inside another form, Enter in a field applies these lists instead of submitting that form. */
+  function applyOnEnter(event: KeyboardEvent<HTMLElement>) {
+    if (event.key !== "Enter" || !(event.target instanceof HTMLInputElement)) return;
+    event.preventDefault();
+    apply();
+  }
+
+  const Shell = embedded ? "div" : "form";
+  return <Shell className="card space-y-4 p-5!" role={embedded ? "group" : undefined} onSubmit={embedded ? undefined : submit} onKeyDown={embedded ? applyOnEnter : undefined} aria-labelledby={headingId}>
     <h2 id={headingId} className="text-xl">Actions · {owner.name}</h2>
 
     <section className="space-y-4" aria-labelledby={`${headingId}-attacks`}>
@@ -232,7 +267,7 @@ export function ActionsEditor({ owner, compendium, limits = characterLimits, bus
               <label className="field-label block" htmlFor={`${id}-ability`}>Ability modifier</label>
               <select id={`${id}-ability`} className="w-full min-w-0" value={row.ability} onChange={(e) => updateAttack(index, { ability: e.target.value })}>
                 <option value="">None</option>
-                {withStored(dndAbilities, row.ability).map((ability) => <option key={ability} value={ability}>{ability}</option>)}
+                {withStored(dndAbilities, row.ability).map((ability) => <option key={ability} value={ability}>{humanizeKey(ability)}</option>)}
               </select>
             </div>
           </div>
@@ -252,6 +287,7 @@ export function ActionsEditor({ owner, compendium, limits = characterLimits, bus
             </div>
             <DamageTypeSelect id={`${id}-damage-type`} value={row.damage_type} onChange={(damage_type) => updateAttack(index, { damage_type })} />
           </div>
+          <RollPreview input={attackPreview(row)} stats={stats} />
           <button className="btn-secondary min-h-9 px-3 py-1.5 text-xs" type="button" onClick={() => setAttacks((rows) => rows.filter((_, rowIndex) => rowIndex !== index))}>
             <Trash size={14} aria-hidden="true" />Remove {row.name || "attack"}
           </button>
@@ -281,7 +317,7 @@ export function ActionsEditor({ owner, compendium, limits = characterLimits, bus
         const id = `action-${row.id}`;
         return <fieldset key={row.id} className="min-w-0 space-y-3 border-t border-[var(--line)] pt-4">
           <legend className="sr-only">{row.name || `Spell or ability ${index + 1}`}</legend>
-          <EffectFields id={id} row={row} onChange={(patch) => updateAction(index, patch)} />
+          <EffectFields id={id} row={row} stats={stats} onChange={(patch) => updateAction(index, patch)} />
           <label className="flex items-center gap-3 text-sm"><input type="checkbox" checked={row.limited} onChange={(e) => updateAction(index, { limited: e.target.checked })} />Limited uses</label>
           {row.limited && <div className="grid grid-cols-2 gap-3">
             <div>
@@ -318,7 +354,7 @@ export function ActionsEditor({ owner, compendium, limits = characterLimits, bus
         const id = `item-${row.id}`;
         return <fieldset key={row.id} className="min-w-0 space-y-3 border-t border-[var(--line)] pt-4">
           <legend className="sr-only">{row.name || `Item ${index + 1}`}</legend>
-          <EffectFields id={id} row={row} onChange={(patch) => updateItem(index, patch)} />
+          <EffectFields id={id} row={row} stats={stats} onChange={(patch) => updateItem(index, patch)} />
           <div>
             <label className="field-label block" htmlFor={`${id}-quantity`}>Quantity</label>
             <input id={`${id}-quantity`} className="w-full" type="number" step={1} min={1} max={999} value={row.quantity} onChange={(e) => updateItem(index, { quantity: e.target.value })} />
@@ -337,10 +373,10 @@ export function ActionsEditor({ owner, compendium, limits = characterLimits, bus
 
     {error && <p role="alert" className="mb-0 text-sm text-[var(--pink)]">{error}</p>}
     <div className="flex flex-wrap gap-3">
-      <button className="btn" disabled={busy}>{busy ? "Saving…" : "Save actions"}</button>
+      <button className="btn" type={embedded ? "button" : "submit"} onClick={embedded ? apply : undefined} disabled={busy}>{busy ? "Saving…" : saveLabel}</button>
       <button className="btn-secondary" type="button" onClick={onClose}>Close</button>
     </div>
-  </form>;
+  </Shell>;
 }
 
 /** "Add from compendium": offers the entries not already in the list. */
@@ -380,7 +416,7 @@ function DamageTypeSelect({ id, value, onChange }: { id: string; value: string; 
 }
 
 /** The fields spells, abilities and items share; uses and quantity are added by the caller. */
-function EffectFields({ id, row, onChange }: { id: string; row: DraftEffect; onChange: (patch: Partial<DraftEffect>) => void }) {
+function EffectFields({ id, row, stats, onChange }: { id: string; row: DraftEffect; stats?: Record<string, unknown>; onChange: (patch: Partial<DraftEffect>) => void }) {
   const heal = row.kind === "heal";
   return <>
     <div>
@@ -411,7 +447,7 @@ function EffectFields({ id, row, onChange }: { id: string; row: DraftEffect; onC
         <label className="field-label block" htmlFor={`${id}-ability`}>Ability modifier</label>
         <select id={`${id}-ability`} className="w-full min-w-0" value={row.ability} onChange={(e) => onChange({ ability: e.target.value })}>
           <option value="">None</option>
-          {withStored(dndAbilities, row.ability).map((ability) => <option key={ability} value={ability}>{ability}</option>)}
+          {withStored(dndAbilities, row.ability).map((ability) => <option key={ability} value={ability}>{humanizeKey(ability)}</option>)}
         </select>
       </div>
       {!heal && <div>
@@ -442,5 +478,6 @@ function EffectFields({ id, row, onChange }: { id: string; row: DraftEffect; onC
       {!heal && <DamageTypeSelect id={`${id}-damage-type`} value={row.damage_type} onChange={(damage_type) => onChange({ damage_type })} />}
     </div>
     <label className="flex items-center gap-3 text-sm"><input type="checkbox" checked={row.ability_to_dice} onChange={(e) => onChange({ ability_to_dice: e.target.checked })} />Add ability modifier to dice</label>
+    <RollPreview input={effectPreview(row)} stats={stats} />
   </>;
 }

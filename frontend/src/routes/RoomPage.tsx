@@ -16,6 +16,8 @@ import { useToast } from "../components/Toast";
 import { defaultBlocksForKind, structureTypes, type StructureBlocks } from "../lib/structures";
 import { createFrameThrottle } from "../lib/frameThrottle";
 import { floatText, isActionRoll } from "../lib/actions";
+import { quickCheckGroups } from "../lib/checks";
+import { useRuleBook } from "../lib/useRuleBook";
 
 type Point = { x: number; y: number };
 
@@ -54,6 +56,7 @@ export function RoomPage() {
   // Once the room has loaded, later failures become toasts instead of replacing the page.
   const loaded = useRef(false);
   const toast = useToast();
+  const ruleBook = useRuleBook(state?.room.rule_book.id);
   const myMember = members.find((member) => member.user_id === user?.id);
   const isDM = !!myMember?.is_dm;
   // Characters usable at this table: the room's rule book, and for players only their own sheets.
@@ -426,6 +429,7 @@ export function RoomPage() {
         {isDM && <CheckPromptForm members={members} onPrompt={(request) => sendMap("check.prompt", request)} />}
 
         {actionEditorToken && <ActionsEditor key={actionEditorToken.id} owner={actionEditorToken} busy={busy}
+          stats={actionEditorToken.sheet_id ? sheets.find((item) => item.id === actionEditorToken.sheet_id)?.data : actionEditorToken.attributes}
           onSave={(lists) => void update(() => patchJSON(`/api/rooms/${roomId}/tokens/${actionEditorToken.id}/actions`, lists))}
           onClose={() => setActionEditorTokenId(null)} />}
 
@@ -483,6 +487,7 @@ export function RoomPage() {
             onMoveStructure={moveRoomStructure}
             onMeasure={measure}
             onAction={(request) => sendMap(request.type, request.body)}
+            checkGroups={quickCheckGroups(ruleBook?.attributes)}
             onEditActions={(tokenId) => {
               setActionEditorTokenId(tokenId);
               setToolsOpen(true);
