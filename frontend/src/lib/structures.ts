@@ -1,8 +1,14 @@
+import type { MapStructure } from "../api/types";
 import { geometryCenter, rotateGeometry, scaleGeometry, type Point } from "./geometryTransforms";
 
 export type StructureBlocks = { blocks_vision: boolean; blocks_movement: boolean; blocks_attacks: boolean };
 
 export const wallBlocks: StructureBlocks = { blocks_vision: true, blocks_movement: true, blocks_attacks: true };
+
+/** Port of the server's `Structure.Passable`: hidden structures and open doors block nothing at the table. */
+export function structurePassable(structure: Pick<MapStructure, "kind" | "is_hidden" | "is_open">) {
+  return !!structure.is_hidden || (structure.kind === "door" && !!structure.is_open);
+}
 
 export const structureTypes = [
   { value: "wall", label: "Wall", hint: "Long barrier", swatch: "bg-[var(--purple)]" },

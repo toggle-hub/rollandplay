@@ -1,7 +1,7 @@
 import type { MapStructure } from "../api/types";
 import type { Point } from "./geometryTransforms";
 import { segmentsIntersect, structureSegments, type Segment } from "./segments";
-import { placed } from "./structures";
+import { placed, structurePassable } from "./structures";
 
 /** Legs one step may take, enough to slide into a corner or around a wall's end. */
 const maxLegs = 6;
@@ -10,7 +10,7 @@ const eps = 1e-9;
 /** The segments the server's movement rule checks: visible structures that block movement and do not let it pass. */
 export function movementBarriers(structures: MapStructure[]): Segment[] {
   return structures
-    .filter((structure) => !structure.is_hidden && structure.blocks_movement && !structure.pass_rules?.movement)
+    .filter((structure) => !structurePassable(structure) && structure.blocks_movement && !structure.pass_rules?.movement)
     .flatMap(structureSegments);
 }
 

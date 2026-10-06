@@ -1,6 +1,7 @@
 import type { MapStructure } from "../api/types";
 import type { Point } from "./geometryTransforms";
 import { structureSegments } from "./segments";
+import { structurePassable } from "./structures";
 
 const steps = 180;
 const fullTurn = 2 * Math.PI;
@@ -12,7 +13,7 @@ const normalize = (angle: number) => ((angle % fullTurn) + fullTurn) % fullTurn;
  * they can already see, so a cast at a new position is a preview until the server recasts it.
  */
 export function castVision(origin: Point, rangeM: number, structures: MapStructure[]): Point[] {
-  const blockers = structures.filter((structure) => !structure.is_hidden && structure.blocks_vision);
+  const blockers = structures.filter((structure) => !structurePassable(structure) && structure.blocks_vision);
   const angles: number[] = [];
   for (let index = 0; index < steps; index++) angles.push(index * fullTurn / steps);
   blockers.forEach((structure) => structure.geometry.forEach((point) => {

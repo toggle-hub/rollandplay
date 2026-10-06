@@ -123,7 +123,7 @@ func castVision(origin Point, rangeM float64, structures []Structure) []Point {
 		return a
 	}
 	for _, st := range structures {
-		if st.IsHidden || !st.BlocksVision {
+		if st.Passable() || !st.BlocksVision {
 			continue
 		}
 		for _, p := range st.Geometry {
@@ -137,7 +137,7 @@ func castVision(origin Point, rangeM float64, structures []Structure) []Point {
 		nearest := rangeM
 		hit := Point{origin.X + math.Cos(a)*rangeM, origin.Y + math.Sin(a)*rangeM}
 		for _, st := range structures {
-			if st.IsHidden || !st.BlocksVision {
+			if st.Passable() || !st.BlocksVision {
 				continue
 			}
 			for _, seg := range structureSegments(st) {

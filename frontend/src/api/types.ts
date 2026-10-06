@@ -140,6 +140,8 @@ export type MapStructure = {
   cover_bonus: number;
   pass_rules: Record<string, boolean>;
   is_hidden?: boolean;
+  /** Room state only: a door opened at this table, which no longer blocks movement, sight or attacks. */
+  is_open?: boolean;
   /** Draw order inside the map (higher draws on top). Map endpoints always send it; room state does not. */
   z_index?: number;
   group_id?: string | null;
@@ -155,6 +157,20 @@ export type GameMap = {
   grid_size_m: number | string;
   background_asset_id?: string | null;
   structures?: MapStructure[];
+};
+/** A map this room has used, as listed for its game masters by `GET /api/rooms/{roomID}/maps`. */
+export type RoomMapSummary = {
+  /** The room map id; `map_id` is the saved map's id. */
+  id: string;
+  map_id: string;
+  name: string;
+  is_active: boolean;
+  /** Tokens on this map in this room; they wait there while another map is active. */
+  token_count: number;
+  /** Whether the viewer may edit the saved map, and so open it in the editor or save table changes to it. */
+  can_edit: boolean;
+  /** Structure changes made at this table that are not saved to the map yet. */
+  table_changes: { added: number; moved: number; removed: number };
 };
 export type TokenAttack = {
   id: string;

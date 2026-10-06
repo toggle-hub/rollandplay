@@ -1,6 +1,7 @@
 import type { MapStructure, ResolvedTokenAttack } from "../api/types";
 import type { Point } from "./geometryTransforms";
 import { segmentsIntersect, structureSegments } from "./segments";
+import { structurePassable } from "./structures";
 
 export type AttackTargetStatus = "valid" | "out_of_range" | "blocked";
 
@@ -14,7 +15,7 @@ const eps = 1e-9;
 /** Port of the server's attack line-of-fire rule: visible structures that block attacks and do not let them pass. */
 export function attackLineBlocked(from: Point, to: Point, structures: MapStructure[]): boolean {
   return structures.some((structure) => {
-    if (structure.is_hidden || !structure.blocks_attacks || structure.pass_rules?.attacks) return false;
+    if (structurePassable(structure) || !structure.blocks_attacks || structure.pass_rules?.attacks) return false;
     return structureSegments(structure).some((segment) => segmentsIntersect([from, to], segment));
   });
 }

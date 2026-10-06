@@ -320,6 +320,10 @@ func (c *client) handle(msg clientEnvelope) {
 		c.structureCreate(msg)
 	case "structure.remove":
 		c.structureRemove(msg)
+	case "structure.door":
+		c.structureDoor(msg)
+	case "structure.restore":
+		c.structureRestore(msg)
 	case "action.resolve":
 		c.actionResolve(msg)
 	case "death.save":
@@ -795,8 +799,8 @@ func (c *client) structureCreate(msg clientEnvelope) {
 	c.hub.publish(c.roomID, envelope{Type: "vision.update", RequestID: nil, Body: map[string]any{"room_id": c.roomID, "version": time.Now().UnixNano()}})
 }
 
-// structureRemove deletes a structure placed in this room, or hides a source-map structure
-// from this room for good. The source map keeps its structures either way.
+// structureRemove takes a structure off this room's map. The saved map keeps it, other rooms keep
+// it, and structure.restore puts it back; saving the table's changes to the map makes it final.
 func (c *client) structureRemove(msg clientEnvelope) {
 	if !c.isDM {
 		c.error(msg.RequestID, "forbidden", "DM required")
@@ -815,10 +819,7 @@ func (c *client) structureRemove(msg clientEnvelope) {
 		c.error(msg.RequestID, "not_found", "structure not found")
 		return
 	}
-	placed, err := c.hub.pool.Exec(ctx, `delete from map_structures where id=$1 and room_map_id=$2`, req.StructureID, roomMapID)
-	if err == nil && placed.RowsAffected() == 0 {
-		_, err = c.hub.pool.Exec(ctx, `insert into room_map_structure_states(room_map_id,structure_id,is_removed) values($1,$2,true) on conflict(room_map_id,structure_id) do update set is_removed=true,updated_at=now()`, roomMapID, req.StructureID)
-	}
+	_, err = c.hub.pool.Exec(ctx, `insert into room_map_structure_states(room_map_id,structure_id,is_removed) values($1,$2,true) on conflict(room_map_id,structure_id) do update set is_removed=true,updated_at=now()`, roomMapID, req.StructureID)
 	if err != nil {
 		c.error(msg.RequestID, "db", err.Error())
 		return
@@ -839,38 +840,10 @@ func (h *Hub) isDM(ctx context.Context, userID, roomID string) bool {
 	return ok
 }
 func (h *Hub) loadStructures(ctx context.Context, roomID string) ([]game.Structure, error) {
-	rows, err := h.pool.Query(ctx, `select ms.id::text,ms.kind,coalesce(rmss.geometry,ms.geometry),ms.blocks_vision,ms.blocks_movement,ms.blocks_attacks,ms.cover_bonus,ms.pass_rules,coalesce(rmss.is_hidden,false) from map_structures ms join room_maps rm on rm.map_id=ms.map_id left join room_map_structure_states rmss on rmss.room_map_id=rm.id and rmss.structure_id=ms.id where rm.room_id=$1 and rm.is_active and (ms.room_map_id is null or ms.room_map_id=rm.id) and not coalesce(rmss.is_removed,false) order by ms.z_index, ms.created_at, ms.id`, roomID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []game.Structure
-	for rows.Next() {
-		var id, kind string
-		var geom, pr []byte
-		var bv, bm, ba, hidden bool
-		var cover int
-		if err := rows.Scan(&id, &kind, &geom, &bv, &bm, &ba, &cover, &pr, &hidden); err != nil {
-			return nil, err
-		}
-		structure := game.ParseStructure(id, kind, geom, pr, bv, bm, ba, cover)
-		structure.IsHidden = hidden
-		out = append(out, structure)
-	}
-	return out, rows.Err()
+	return LoadActiveStructures(ctx, h.pool, roomID)
 }
 func (h *Hub) loadStructure(ctx context.Context, roomID, structureID string) (game.Structure, string, error) {
-	var structure game.Structure
-	var roomMapID string
-	var geometry, passRules []byte
-	var hidden bool
-	err := h.pool.QueryRow(ctx, `select rm.id::text,ms.id::text,ms.kind,coalesce(rmss.geometry,ms.geometry),ms.blocks_vision,ms.blocks_movement,ms.blocks_attacks,ms.cover_bonus,ms.pass_rules,coalesce(rmss.is_hidden,false) from map_structures ms join room_maps rm on rm.map_id=ms.map_id left join room_map_structure_states rmss on rmss.room_map_id=rm.id and rmss.structure_id=ms.id where rm.room_id=$1 and rm.is_active and (ms.room_map_id is null or ms.room_map_id=rm.id) and not coalesce(rmss.is_removed,false) and ms.id=$2`, roomID, structureID).Scan(&roomMapID, &structure.ID, &structure.Kind, &geometry, &structure.BlocksVision, &structure.BlocksMovement, &structure.BlocksAttacks, &structure.CoverBonus, &passRules, &hidden)
-	if err != nil {
-		return structure, "", err
-	}
-	structure = game.ParseStructure(structure.ID, structure.Kind, geometry, passRules, structure.BlocksVision, structure.BlocksMovement, structure.BlocksAttacks, structure.CoverBonus)
-	structure.IsHidden = hidden
-	return structure, roomMapID, nil
+	return scanStructure(h.pool.QueryRow(ctx, activeStructuresSQL+` and ms.id=$2`, roomID, structureID))
 }
 
 func isRigidTransform(current, next []game.Point) bool {

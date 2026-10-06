@@ -16,7 +16,13 @@ type Structure struct {
 	CoverBonus     int             `json:"cover_bonus"`
 	PassRules      map[string]bool `json:"pass_rules"`
 	IsHidden       bool            `json:"is_hidden"`
+	// IsOpen is set on doors opened at the table.
+	IsOpen bool `json:"is_open"`
 }
+
+// Passable reports a structure that stops nothing right now: hidden at the table, or an open door.
+func (s Structure) Passable() bool { return s.IsHidden || s.IsOpen && s.Kind == "door" }
+
 type Token struct {
 	ID               string           `json:"id"`
 	OwnerUserID      string           `json:"owner_user_id"`
@@ -86,7 +92,7 @@ func crossesBlocked(path []Point, structures []Structure, rule string) bool {
 	for i := 0; i < len(path)-1; i++ {
 		move := Segment{path[i], path[i+1]}
 		for _, st := range structures {
-			if st.IsHidden {
+			if st.Passable() {
 				continue
 			}
 			blocked := rule == "movement" && st.BlocksMovement || rule == "attacks" && st.BlocksAttacks
