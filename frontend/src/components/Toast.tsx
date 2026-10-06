@@ -50,12 +50,13 @@ export function ToastProvider({ children }: { children: ReactNode }) {
   return (
     <ToastContext.Provider value={show}>
       {children}
-      <div className="fixed bottom-4 right-4 z-50 flex w-[min(360px,calc(100vw-32px))] flex-col gap-2">
+      {/* Phones: a compact stack at the top, newest two only, so forms and the chat box near the bottom stay usable. */}
+      <div className="pointer-events-none fixed inset-x-3 top-3 z-50 flex flex-col gap-2 max-sm:[&>*:nth-last-child(n+3)]:hidden sm:inset-x-auto sm:top-auto sm:bottom-4 sm:right-4 sm:w-[min(360px,calc(100vw-32px))]">
         {toasts.map((toast) => (
           <div
             key={toast.id}
             role={toast.kind === "error" ? "alert" : "status"}
-            className="flex items-start gap-2 rounded-lg border border-[var(--line)] bg-[var(--surface-raised)] p-3 text-sm shadow-xl"
+            className="pointer-events-auto flex items-start gap-2 rounded-lg border border-[var(--line)] bg-[var(--surface-raised)] p-2.5 text-[13px] leading-snug shadow-xl sm:p-3 sm:text-sm"
           >
             {toast.kind === "error" ? (
               <WarningCircle aria-hidden="true" size={20} weight="fill" className="shrink-0 text-[var(--pink)]" />

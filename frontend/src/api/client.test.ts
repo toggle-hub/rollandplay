@@ -68,3 +68,20 @@ describe("access token refresh", () => {
     expect(expired).toHaveBeenCalledTimes(1);
   });
 });
+
+describe("error messages", () => {
+  it("turns an outage without a message into a plain sentence", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: false, status: 502, json: async () => { throw new SyntaxError("Unexpected token <"); } }));
+    await expect(apiFetch("/api/rooms")).rejects.toMatchObject({ status: 502, message: "The server is unavailable. Try again in a moment." });
+  });
+
+  it("explains a bare server error instead of showing its status code", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(response(500, { error: { message: "" } })));
+    await expect(apiFetch("/api/rooms")).rejects.toMatchObject({ status: 500, message: "Something went wrong on the server. Try again in a moment." });
+  });
+
+  it("keeps the server's own message when it sends one", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(response(409, { error: { code: "map_in_use", message: "This map is attached to a room." } })));
+    await expect(apiFetch("/api/maps/1", { method: "DELETE" })).rejects.toMatchObject({ status: 409, message: "This map is attached to a room." });
+  });
+});

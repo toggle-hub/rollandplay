@@ -1,26 +1,50 @@
-import { useState, type FormEvent } from "react";
+import { useEffect, useState, type FormEvent } from "react";
 import { ArrowRight, EnvelopeSimple, ShieldCheck } from "@phosphor-icons/react";
 import { postJSON } from "../api/client";
+
+// Seconds before another sign-in link can be requested.
+const RESEND_COOLDOWN_SECONDS = 30;
 
 export function LoginPage() {
   const [email, setEmail] = useState("");
   const [sent, setSent] = useState(false);
   const [pending, setPending] = useState(false);
   const [err, setErr] = useState("");
+  const [cooldown, setCooldown] = useState(0);
+  const [resent, setResent] = useState(false);
 
-  async function submit(e: FormEvent) {
-    e.preventDefault();
-    if (pending) return;
+  useEffect(() => {
+    if (cooldown <= 0) return;
+    const timer = window.setTimeout(() => setCooldown((seconds) => seconds - 1), 1000);
+    return () => window.clearTimeout(timer);
+  }, [cooldown]);
+
+  async function sendLink(): Promise<boolean> {
     setErr("");
     setPending(true);
     try {
       await postJSON<void>("/api/auth/magic-link", { email });
-      setSent(true);
+      setCooldown(RESEND_COOLDOWN_SECONDS);
+      return true;
     } catch (error) {
       setErr(error instanceof Error ? error.message : "We couldn’t send your link. Please try again.");
+      return false;
     } finally {
       setPending(false);
     }
+  }
+
+  async function submit(e: FormEvent) {
+    e.preventDefault();
+    if (pending) return;
+    setResent(false);
+    if (await sendLink()) setSent(true);
+  }
+
+  async function resend() {
+    if (pending || cooldown > 0) return;
+    setResent(false);
+    setResent(await sendLink());
   }
 
   return (
@@ -34,13 +58,20 @@ export function LoginPage() {
         </div>
       </section>
       <section className="auth-card">
-        {sent ? <div role="status" aria-live="polite">
-          <EnvelopeSimple size={36} weight="light" className="mb-8 text-[var(--green)]" aria-hidden="true" />
-          <p className="eyebrow">An invitation awaits</p>
-          <h2 className="mt-4 text-4xl tracking-tight">Check your email.</h2>
-          <p className="text-muted mt-5 leading-relaxed">We sent a sign-in link to <strong className="break-all font-medium text-[var(--paper)]">{email}</strong>. Open it in this browser to pick up where you left off.</p>
-          <p className="auth-note mt-6">Not seeing it? Check your spam folder, or make sure your email address is correct.</p>
-          <button className="btn-secondary mt-8" onClick={() => { setSent(false); setErr(""); }}>Use another email</button>
+        {sent ? <div>
+          <div role="status" aria-live="polite">
+            <EnvelopeSimple size={36} weight="light" className="mb-8 text-[var(--green)]" aria-hidden="true" />
+            <p className="eyebrow">An invitation awaits</p>
+            <h2 className="mt-4 text-4xl tracking-tight">Check your email.</h2>
+            <p className="text-muted mt-5 leading-relaxed">We sent a sign-in link to <strong className="break-all font-medium text-[var(--paper)]">{email}</strong>. Open it in this browser to pick up where you left off.</p>
+            <p className="auth-note mt-6">Not seeing it? Check your spam folder, or make sure your email address is correct.</p>
+            {resent && <p className="mt-4 text-sm text-[var(--green)]">We sent a new link. Use the newest email.</p>}
+          </div>
+          {err && <p role="alert" className="mt-4 text-sm text-[var(--pink)]">{err}</p>}
+          <div className="mt-8 flex flex-wrap gap-3">
+            <button type="button" className="btn" onClick={resend} disabled={pending || cooldown > 0} aria-busy={pending}>{pending ? "Sending…" : cooldown > 0 ? `Resend link in ${cooldown}s` : "Resend link"}</button>
+            <button type="button" className="btn-secondary" onClick={() => { setSent(false); setErr(""); setResent(false); }}>Use another email</button>
+          </div>
         </div> : <>
           <p className="eyebrow">Welcome to Rollandplay</p>
           <h2 className="mt-4 text-4xl tracking-tight">Take your seat.</h2>

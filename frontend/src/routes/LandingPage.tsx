@@ -1,23 +1,26 @@
-import { useRef, useState } from "react";
+import { Fragment, useRef } from "react";
 import { Link } from "react-router-dom";
-import { ArrowDown, ArrowUpRight, ArrowRight, Plus, Minus, Compass, Sparkle } from "@phosphor-icons/react";
+import { ArrowDown, ArrowUpRight, ArrowRight, BookOpen, DiceFive, Eye, Sparkle, UsersThree } from "@phosphor-icons/react";
 import gsap from "gsap";
 import { useGSAP } from "@gsap/react";
 import { ScrollTrigger } from "gsap/ScrollTrigger";
 import { Brand } from "../components/Brand";
+import tableMap from "../assets/landing-map.webp";
+import tableChat from "../assets/landing-chat.webp";
 
 gsap.registerPlugin(useGSAP, ScrollTrigger);
 
 const landscape = "https://picsum.photos/seed/adventure/1920/1080";
-const stories = [
-  { title: "Find your people.", text: "Old friends. New characters. A shared reason to make time for one more adventure.", image: "https://picsum.photos/seed/adventure/1920/1080", caption: "A little further, together" },
-  { title: "Follow the unknown.", text: "A path without a name. A door left open. The best stories start with a little curiosity.", image: "https://picsum.photos/seed/tabletop/1920/1080", caption: "Leave the familiar behind" },
-  { title: "Make it your story.", text: "No two parties take the same path. Bring your imagination and see where the evening goes.", image: "https://picsum.photos/seed/horizon/1920/1080", caption: "Every choice, a new chapter" },
+const highlights = ["SHARED MAPS", "FOG OF WAR", "DICE ROLLED FOR YOU", "D&D 5E RULES"];
+const features = [
+  { icon: Eye, title: "Shared map with fog of war", text: "Everyone plays on the same map. Walls and closed doors block sight, so each player sees only what their character can see." },
+  { icon: DiceFive, title: "Attacks and damage rolled for you", text: "Pick an attack and a target. The hit roll, the damage and the new hit points land in the table chat for everyone." },
+  { icon: BookOpen, title: "Built-in D&D 5e rules", text: "Classes, weapons, spells and monsters from the 5e SRD are ready to use. Running another game? Write your own rule book." },
+  { icon: UsersThree, title: "Play in the browser with friends", text: "Nothing to install. Sign in with your email, then invite your friends by username or share the room code." },
 ];
 
 export function LandingPage() {
   const root = useRef<HTMLElement>(null);
-  const [activeStory, setActiveStory] = useState(0);
 
   useGSAP(() => {
     const media = gsap.matchMedia();
@@ -41,7 +44,7 @@ export function LandingPage() {
       <section className="hero section-container">
         <div className="hero-orbit" aria-hidden="true" />
         <div className="hero-photo group overflow-hidden">
-          <img src={landscape} alt="Waves breaking against a rugged coastline" fetchPriority="high" className="transition-transform duration-700 ease-out group-hover:scale-105" />
+          <img src={landscape} alt="" fetchPriority="high" className="transition-transform duration-700 ease-out group-hover:scale-105" />
           <div className="hero-photo-wash" />
           <svg className="hero-compass" viewBox="0 0 320 320" fill="none" aria-hidden="true">
             <circle cx="160" cy="160" r="149" stroke="currentColor" strokeWidth="0.7" />
@@ -52,43 +55,46 @@ export function LandingPage() {
           <span className="hero-image-caption">There’s a whole world out there.</span>
         </div>
         <div className="hero-content">
-          <p className="hero-enter hero-kicker"><span /> Your people. Your story. Your table.</p>
+          <p className="hero-enter hero-kicker"><span /> A virtual tabletop for D&amp;D 5e and your own games</p>
           <h1 className="hero-enter max-w-6xl w-full">Good company.<br /><span>Great adventures.</span></h1>
-          <p className="hero-enter hero-description">A home for the stories you tell together.<br className="hidden sm:block" /> Gather your party. Leave the ordinary behind.</p>
+          <p className="hero-enter hero-description">Gather your party around one shared map, right in the browser.<br className="hidden sm:block" /> Move your tokens, pick an attack, and let the dice and the rules keep score.</p>
           <div className="hero-enter hero-actions">
-            <Link className="btn" to="/login">Find your next adventure <ArrowUpRight size={19} aria-hidden="true" /></Link>
-            <a className="hero-text-link" href="#experience">Take a look around <ArrowDown size={17} aria-hidden="true" /></a>
+            <Link className="btn" to="/login">Sign in to play <ArrowUpRight size={19} aria-hidden="true" /></Link>
+            <a className="hero-text-link" href="#experience">See how it plays <ArrowDown size={17} aria-hidden="true" /></a>
           </div>
         </div>
-        <div className="hero-bottom"><span>Made for the way you play.</span><a href="#experience" aria-label="Explore the Rollandplay experience"><ArrowDown size={20} aria-hidden="true" /></a><span>Tabletop spirit. Anywhere.</span></div>
+        <div className="hero-bottom"><span>Made for the way you play.</span><a href="#experience" aria-label="See how Rollandplay works"><ArrowDown size={20} aria-hidden="true" /></a><span>Tabletop spirit. Anywhere.</span></div>
       </section>
 
-      <div className="marquee" aria-label="For the storytellers, world builders, and good company">
+      <div className="marquee" aria-label="Shared maps, fog of war, dice rolled for you, D&D 5e rules">
         <div className="marquee-track" aria-hidden="true">
-          {[0, 1].map((copy) => <div className="marquee-group" key={copy}><span>STORYTELLERS</span><Sparkle weight="fill" /><span>WORLD BUILDERS</span><Sparkle weight="fill" /><span>GOOD COMPANY</span><Sparkle weight="fill" /></div>)}
+          {[0, 1].map((copy) => <div className="marquee-group" key={copy}>{highlights.map((label) => <Fragment key={label}><span>{label}</span><Sparkle weight="fill" /></Fragment>)}</div>)}
         </div>
       </div>
 
-      <section id="experience" className="section-container chapter">
+      <section id="experience" className="section-container chapter" aria-labelledby="experience-heading">
         <div className="section-intro">
-          <h2>A little imagination.<br />An entire <span className="inline-world"><img src="https://picsum.photos/seed/adventure/1920/1080" alt="" loading="lazy" /></span> world.</h2>
-          <p>It’s never just a game. It’s the unexpected turn, the impossible plan, and the people who make it unforgettable.</p>
+          <h2 id="experience-heading">Your whole table,<br /><span className="accent-italic">in one browser tab.</span></h2>
+          <p>Draw the dungeon, drop in the party and the monsters, and play. These are real screens from a game in progress.</p>
         </div>
-        <div className="story-bento grid grid-flow-dense md:grid-cols-3 md:grid-rows-2">
-          <article className="bento-art md:row-span-2 group overflow-hidden">
-            <img src="https://picsum.photos/seed/horizon/1920/1080" alt="Leather bags and tools laid out for an expedition" loading="lazy" className="transition-transform duration-700 ease-out group-hover:scale-105" />
-            <div className="bento-art-overlay" />
-            <Compass className="bento-compass" size={44} weight="thin" aria-hidden="true" />
-            <div><p className="bento-small">An invitation to get lost</p><h3>The real world<br />can wait.</h3></div>
-          </article>
-          <article className="bento-copy md:col-span-2"><span className="bento-rule" /><h3>Less ordinary.<br />More “remember when?”</h3><p>The best part of any adventure isn’t the destination. It’s the story you’re still telling long after the night is over.</p></article>
-          <article className="bento-quote md:col-span-2"><Sparkle size={32} weight="thin" aria-hidden="true" /><div><h3>Bring yourself.<br />Become someone else.</h3><p>Every great story has room for another character.</p></div></article>
+        <div className="feature-showcase">
+          <figure className="feature-shot">
+            <div className="feature-frame"><img src={tableMap} width={1512} height={1008} loading="lazy" alt="A dungeon map seen by a player: the room where his character stands is lit, a cone of sight reaches through an open door to a goblin, and the rest of the map stays dark." /></div>
+            <figcaption>What a player sees: walls block sight, and the rest stays dark.</figcaption>
+          </figure>
+          <figure className="feature-shot feature-shot-chat">
+            <div className="feature-frame"><img src={tableChat} width={556} height={776} loading="lazy" alt="The table chat: Brannoc attacks a goblin with a light crossbow, rolls 19 to hit, and deals 1 piercing damage." /></div>
+            <figcaption>Every attack and roll lands in the chat.</figcaption>
+          </figure>
         </div>
+        <ul className="feature-list">
+          {features.map(({ icon: Icon, title, text }) => <li key={title}><Icon size={28} weight="light" aria-hidden="true" /><h3>{title}</h3><p>{text}</p></li>)}
+        </ul>
       </section>
 
       <section className="journey-section chapter">
         <div className="section-container journey-layout">
-          <div className="journey-heading"><p className="eyebrow">A shared escape</p><h2>Some nights<br />stay with you.</h2><p>Turn a little free time into a world of possibility. All it takes is a spark, a story, and your favorite people.</p><Link to="/login" className="text-action">Make a little magic <ArrowUpRight size={21} aria-hidden="true" /></Link></div>
+          <div className="journey-heading"><p className="eyebrow">A shared escape</p><h2>Some nights<br />stay with you.</h2><p>Turn a little free time into a world of possibility. All it takes is a spark, a story, and your favorite people.</p><Link to="/login" className="text-action">Sign in and start a game <ArrowUpRight size={21} aria-hidden="true" /></Link></div>
           <div className="journey-gallery">
             <figure><div className="journey-image overflow-hidden"><img className="scroll-image" src={landscape} alt="A rocky coast stretching into the distance" loading="lazy" /></div><figcaption><span>Somewhere beyond the everyday.</span><span aria-hidden="true">↗</span></figcaption></figure>
             <figure><div className="journey-image journey-image-second overflow-hidden"><img className="scroll-image" src="https://picsum.photos/seed/tabletop/1920/1080" alt="Waves flowing through a passage of weathered pillars" loading="lazy" /></div><figcaption><span>A story only your party could tell.</span><span aria-hidden="true">↗</span></figcaption></figure>
@@ -96,20 +102,8 @@ export function LandingPage() {
         </div>
       </section>
 
-      <section className="section-container chapter possibility-section">
-        <div className="section-intro"><h2>There’s no right way.<br />Just <span className="accent-italic">your way.</span></h2><p>Take the scenic route. Try the unlikely plan. The next chapter is yours to write.</p></div>
-        <div className="story-accordion">
-          {stories.map((story, index) => <article key={story.title} onMouseEnter={() => setActiveStory(index)} className={`story-slice group overflow-hidden ${activeStory === index ? "is-active" : ""}`}>
-            <img src={story.image} alt="" loading="lazy" className="transition-transform duration-700 ease-out group-hover:scale-105" />
-            <div className="slice-wash" />
-            <button type="button" aria-expanded={activeStory === index} aria-controls={`story-panel-${index}`} onClick={() => setActiveStory(index)} className="slice-trigger"><span>{story.title}</span>{activeStory === index ? <Minus size={22} aria-hidden="true" /> : <Plus size={22} aria-hidden="true" />}</button>
-            <div id={`story-panel-${index}`} className="slice-content" hidden={activeStory !== index}><p>{story.text}</p><span>{story.caption}</span></div>
-          </article>)}
-        </div>
-      </section>
-
-      <section className="final-cta section-container"><p className="eyebrow">The best stories start together</p><h2>Save a seat.<br /><span>Start a story.</span></h2><Link className="btn" to="/login">Your adventure begins here <ArrowRight size={20} aria-hidden="true" /></Link><p className="cta-note">Sign in with your email. Bring your imagination.</p><div className="cta-orbit" aria-hidden="true" /></section>
-      <footer className="site-footer section-container"><Link to="/" aria-label="Rollandplay home"><Brand /></Link><p>A little less ordinary. A little more adventure.</p><a href="#experience">Back to the story <ArrowUpRight size={16} aria-hidden="true" /></a></footer>
+      <section className="final-cta section-container"><p className="eyebrow">The best stories start together</p><h2>Save a seat.<br /><span>Start a story.</span></h2><Link className="btn" to="/login">Sign in to play <ArrowRight size={20} aria-hidden="true" /></Link><p className="cta-note">Sign in with your email. No password needed.</p><div className="cta-orbit" aria-hidden="true" /></section>
+      <footer className="site-footer section-container"><Link to="/" aria-label="Rollandplay home"><Brand /></Link><p>A little less ordinary. A little more adventure.</p><a href="#experience">See how it plays <ArrowUpRight size={16} aria-hidden="true" /></a></footer>
     </main>
   );
 }
