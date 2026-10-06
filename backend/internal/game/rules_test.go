@@ -27,3 +27,21 @@ func TestRulesBlockingAndPassRules(t *testing.T) {
 		t.Fatal("hidden structure should not block attacks")
 	}
 }
+
+func TestOpenDoorStopsBlocking(t *testing.T) {
+	door := Structure{Kind: "door", Geometry: []Point{{1, -1}, {1, 1}}, BlocksMovement: true, BlocksAttacks: true, PassRules: map[string]bool{}}
+	tok := Token{}
+	path := []Point{{0, 0}, {2, 0}}
+	if CanMove(path, []Structure{door}, tok) || CanTarget(path[0], path[1], []Structure{door}, tok) {
+		t.Fatal("a closed door should block movement and attacks")
+	}
+	door.IsOpen = true
+	if !CanMove(path, []Structure{door}, tok) || !CanTarget(path[0], path[1], []Structure{door}, tok) {
+		t.Fatal("an open door should let movement and attacks through")
+	}
+	wall := door
+	wall.Kind = "wall"
+	if CanMove(path, []Structure{wall}, tok) {
+		t.Fatal("only doors open; an open flag on a wall must not let tokens through")
+	}
+}

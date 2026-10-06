@@ -116,6 +116,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/rooms/{roomID}/maps", s.handleRoomMapAttach)
 	mux.HandleFunc("POST /api/rooms/{roomID}/maps/new", s.handleRoomMapNew)
 	mux.HandleFunc("PATCH /api/rooms/{roomID}/maps/{roomMapID}", s.handleRoomMapPatch)
+	mux.HandleFunc("GET /api/rooms/{roomID}/maps", s.handleRoomMapsList)
+	mux.HandleFunc("POST /api/rooms/{roomID}/maps/{roomMapID}/save", s.handleRoomMapSave)
 	mux.HandleFunc("GET /api/rooms/{roomID}/state", s.handleRoomState)
 	mux.HandleFunc("GET /api/rooms/{roomID}/chat", s.handleRoomChat)
 	mux.HandleFunc("POST /api/rooms/{roomID}/tokens", s.handleTokenCreate)
@@ -1939,25 +1941,7 @@ func (s *Server) visibleChecks(ctx context.Context, roomID, userID string, isDM 
 }
 
 func (s *Server) loadStructures(ctx context.Context, roomID string) ([]game.Structure, error) {
-	rows, err := s.Pool.Query(ctx, `select ms.id::text,ms.kind,coalesce(rmss.geometry,ms.geometry),ms.blocks_vision,ms.blocks_movement,ms.blocks_attacks,ms.cover_bonus,ms.pass_rules,coalesce(rmss.is_hidden,false) from map_structures ms join room_maps rm on rm.map_id=ms.map_id left join room_map_structure_states rmss on rmss.room_map_id=rm.id and rmss.structure_id=ms.id where rm.room_id=$1 and rm.is_active and (ms.room_map_id is null or ms.room_map_id=rm.id) and not coalesce(rmss.is_removed,false) order by ms.z_index, ms.created_at, ms.id`, roomID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []game.Structure
-	for rows.Next() {
-		var id, kind string
-		var geom, pr []byte
-		var bv, bm, ba, hidden bool
-		var cover int
-		if err := rows.Scan(&id, &kind, &geom, &bv, &bm, &ba, &cover, &pr, &hidden); err != nil {
-			return nil, err
-		}
-		structure := game.ParseStructure(id, kind, geom, pr, bv, bm, ba, cover)
-		structure.IsHidden = hidden
-		out = append(out, structure)
-	}
-	return out, rows.Err()
+	return ws.LoadActiveStructures(ctx, s.Pool, roomID)
 }
 func (s *Server) loadToken(ctx context.Context, roomID, tokenID string) (game.Token, error) {
 	return ws.ScanToken(s.Pool.QueryRow(ctx, ws.TokenSelectSQL+` where rm.room_id=$1 and rt.id=$2`, roomID, tokenID))

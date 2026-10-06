@@ -10,7 +10,8 @@ import type { QuickCheckGroup } from "../lib/checks";
 import { geometryCenter, rotateGeometry, type Point } from "../lib/geometryTransforms";
 import { clampCamera, fitCamera, mapToView, pinchCamera, pixelsPerMeter, viewToMap, wheelZoomFactor, zoomAt, type Camera, type Size } from "../lib/mapCamera";
 import type { RemoteRuler } from "../lib/rulers";
-import { structureLabel, templateGeometry } from "../lib/structures";
+import { stampGeometry, structureLabel, templateGeometry } from "../lib/structures";
+import { drawDoor, drawMapBackground, structureColors } from "../lib/roomMapDrawing";
 import { extendPath, movementBarriers, walkToken } from "../lib/movement";
 import { clampTokenCenter, snapTokenCenter } from "../lib/tokenGrid";
 import { drawToken, drawTokenLabels } from "../lib/tokenDrawing";
@@ -45,7 +46,8 @@ type Props = {
   /** The action wheel's Checks, built from the room rule book; D&D checks when absent. */
   checkGroups?: QuickCheckGroup[];
   floatingResults?: readonly FloatingResult[];
-  placingStructure?: { kind: string } | null;
+  /** The structure the next click places, turned by `rotationDeg` and sized by `scalePercent` (100 when unset). */
+  placingStructure?: { kind: string; rotationDeg?: number; scalePercent?: number } | null;
   onPlaceStructure?: (geometry: Point[]) => void;
   onCancelPlacement?: () => void;
   /** A new token waiting for a click on the map; `sizeM` sizes its preview. */
@@ -53,6 +55,8 @@ type Props = {
   /** Where the new token should stand: inside the map and moved off any token it would cover. */
   onPlaceToken?: (at: Point) => void;
   onCancelTokenPlacement?: () => void;
+  /** Double-clicking a door opens or closes it; only game masters get this. */
+  onToggleDoor?: (door: MapStructure) => void;
   /** Where tokens dragged by someone else at the table are right now. */
   remoteDragPositions?: ReadonlyMap<string, Point>;
   /** Live positions of the tokens being dragged, before they are dropped. */
@@ -130,6 +134,7 @@ export function MapCanvas({
   placingToken,
   onPlaceToken,
   onCancelTokenPlacement,
+  onToggleDoor,
   remoteDragPositions,
   onDragTokens,
   onDragTokensEnd,
@@ -183,6 +188,7 @@ export function MapCanvas({
   // The view the viewer zoomed or panned to; null keeps the whole map fitted to the view.
   const [userCamera, setUserCamera] = useState<Camera | null>(null);
   const placingKind = placingStructure?.kind;
+  const stampAt = (point: Point) => stampGeometry(placingKind!, point, gridSize, placingStructure?.rotationDeg ?? 0, placingStructure?.scalePercent ?? 100);
   const findToken = (tokenId?: string) => tokenId === undefined ? undefined : state.visibleTokens.find((token) => token.id === tokenId);
   const targetingSource = findToken(targeting?.tokenId);
   const targetingSpec = targeting ? choiceTargeting(targeting.choice) : null;
@@ -308,6 +314,8 @@ export function MapCanvas({
     const h = mapHeight * scale;
     ctx.fillStyle = "#221c2b";
     ctx.fillRect(0, 0, w, h);
+    // The map's background image sits under the grid; players' fog is drawn over both.
+    drawMapBackground(ctx, active?.background_asset_id ? images.current.get(active.background_asset_id) : undefined, w, h);
     ctx.strokeStyle = "#40364c";
     ctx.lineWidth = 1;
     const grid = n(state.metersPerGrid, 1) * scale;
@@ -377,11 +385,11 @@ export function MapCanvas({
       drawTransformFrame(ctx, frame, scale);
     }
     if (placingKind && placementPoint) {
-      ctx.strokeStyle = "#be8cff";
+      ctx.strokeStyle = structureColors[placingKind] ?? "#be8cff";
       ctx.lineWidth = 4;
       ctx.setLineDash([6, 6]);
       ctx.beginPath();
-      templateGeometry(placingKind, placementPoint, gridSize).forEach((point, index) => {
+      stampAt(placementPoint).forEach((point, index) => {
         if (index === 0) ctx.moveTo(point.x * scale, point.y * scale);
         else ctx.lineTo(point.x * scale, point.y * scale);
       });
@@ -521,17 +529,18 @@ export function MapCanvas({
       ctx.textAlign = "start";
       ctx.font = font;
     }
-  }, [state, selectedTokenIds, selectedStructureId, canMoveStructures, drag, remoteDragPositions, remoteRulers, marquee, structureDrag, ruler, rangePreview, targeting, placingKind, placementPoint, placingToken?.label, placingToken?.sizeM, tokenGhost, gridSize, imageVersion, floatingResults, view, camera.x, camera.y, scale]);
+  }, [state, selectedTokenIds, selectedStructureId, canMoveStructures, drag, remoteDragPositions, remoteRulers, marquee, structureDrag, ruler, rangePreview, targeting, placingKind, placementPoint, placingStructure?.rotationDeg, placingStructure?.scalePercent, placingToken?.label, placingToken?.sizeM, tokenGhost, gridSize, imageVersion, floatingResults, view, camera.x, camera.y, scale]);
   useEffect(() => {
-    state.visibleTokens.forEach((token) => {
-      const id = token.image_asset_id;
+    const ids: (string | null | undefined)[] = state.visibleTokens.map((token) => token.image_asset_id);
+    ids.push(state.activeMap?.background_asset_id);
+    ids.forEach((id) => {
       if (!id || images.current.has(id)) return;
       const image = new Image();
       image.onload = () => setImageVersion((version) => version + 1);
       image.src = assetURL(id);
       images.current.set(id, image);
     });
-  }, [state.visibleTokens]);
+  }, [state.visibleTokens, state.activeMap?.background_asset_id]);
   useEffect(() => {
     if (!placingKind) {
       setPlacementPoint(null);
@@ -832,7 +841,7 @@ export function MapCanvas({
             return;
           }
           if (placingKind) {
-            onPlaceStructure?.(templateGeometry(placingKind, point, gridSize));
+            onPlaceStructure?.(stampAt(point));
             return;
           }
           if (placingToken) {
@@ -1111,6 +1120,12 @@ export function MapCanvas({
           touches.current.delete(event.pointerId);
           cancelPointerAction();
         }}
+        onDoubleClick={(event) => {
+          if (!onToggleDoor || placingKind || targeting || pending) return;
+          const point = eventPoint(event);
+          const door = [...state.structures].reverse().find((structure) => structure.kind === "door" && hitsStructure(structure, point));
+          if (door) onToggleDoor(door);
+        }}
         onBlur={() => {
           spaceHeld.current = false;
           cancelPointerAction();
@@ -1215,6 +1230,10 @@ function drawStructures(
   structures.forEach((structure) => {
     const selected = structure.id === selectedStructureId;
     const geometry = drag?.structure.id === structure.id ? drag.currentGeometry : structure.geometry;
+    if (structure.kind === "door") {
+      drawDoor(ctx, structure, geometry, scale, selected);
+      return;
+    }
     ctx.strokeStyle = structure.is_hidden ? "#80738e" : selected ? "#f6effa" : structure.blocks_movement ? "#be8cff" : "#ebc7ff";
     ctx.lineWidth = selected ? 4 : structure.blocks_vision ? 4 : 2;
     ctx.setLineDash(structure.is_hidden ? [6, 5] : []);

@@ -82,3 +82,27 @@ func TestTokenVisibleTo(t *testing.T) {
 		}
 	}
 }
+
+func TestOpenDoorLetsVisionThroughAndStaysVisible(t *testing.T) {
+	door := Structure{ID: "door", Kind: "door", Geometry: []Point{{5, -2}, {5, 2}}, BlocksVision: true}
+	token := Token{ID: "token", OwnerUserID: "player", X: 0, Y: 0, VisionRangeM: 10}
+	seesPast := func(door Structure) bool {
+		vis := ComputeVisibility(VisibilityInput{UserID: "player", MapWidthM: 20, MapHeightM: 20, Tokens: []Token{token}, Structures: []Structure{door}})
+		if len(vis.VisibleStructureIDs) != 1 {
+			t.Fatalf("the door itself should stay visible: %+v", vis.VisibleStructureIDs)
+		}
+		for _, point := range vis.VisionAreas[0].Polygon {
+			if point.X > 6 && point.Y > -1 && point.Y < 1 {
+				return true
+			}
+		}
+		return false
+	}
+	if seesPast(door) {
+		t.Fatal("a closed door should block sight")
+	}
+	door.IsOpen = true
+	if !seesPast(door) {
+		t.Fatal("an open door should let sight through")
+	}
+}

@@ -1079,4 +1079,26 @@ describe("MapCanvas", () => {
     expect(fillText).toHaveBeenCalledWith("3 m · 3 squares · speed 2 m", expect.any(Number), expect.any(Number));
     fireEvent.pointerUp(canvas, { clientX: 288, clientY: 72 });
   });
+
+  it("places the stamp turned and sized like the ghost shows it", () => {
+    const place = vi.fn();
+    const { container } = render(<MapCanvas state={state} placingStructure={{ kind: "wall", rotationDeg: 90, scalePercent: 50 }} onPlaceStructure={place} />);
+    clickAt(container.querySelector("canvas")!, 5, 5);
+    expect(place).toHaveBeenCalledWith([{ x: 5, y: 4 }, { x: 5, y: 6 }]);
+  });
+
+  it("opens and closes a door on double-click only for game masters, and never for other structures", () => {
+    const door = { ...wall, id: "door", kind: "door", geometry: [{ x: 4, y: 1 }, { x: 4, y: 3 }] };
+    const toggle = vi.fn();
+    const { container, rerender } = render(<MapCanvas state={{ ...state, structures: [wall, door] }} canMoveStructures onToggleDoor={toggle} />);
+    const canvas = container.querySelector("canvas")!;
+    fireEvent.doubleClick(canvas, { clientX: 2 * 72, clientY: 2 * 72 });
+    expect(toggle).not.toHaveBeenCalled();
+    fireEvent.doubleClick(canvas, { clientX: 4 * 72, clientY: 2 * 72 });
+    expect(toggle).toHaveBeenCalledWith(door);
+    toggle.mockClear();
+    rerender(<MapCanvas state={{ ...state, structures: [wall, door] }} />);
+    fireEvent.doubleClick(canvas, { clientX: 4 * 72, clientY: 2 * 72 });
+    expect(toggle).not.toHaveBeenCalled();
+  });
 });

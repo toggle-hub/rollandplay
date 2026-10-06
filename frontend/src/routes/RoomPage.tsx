@@ -1,6 +1,6 @@
 import { FormEvent, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
-import { Eye, EyeSlash, MapTrifold, Trash, UsersThree } from "@phosphor-icons/react";
+import { Door, DoorOpen, Eye, EyeSlash, MapTrifold, Trash, UsersThree } from "@phosphor-icons/react";
 import { apiFetch, connectRoomSocket, patchJSON, postJSON, requestId } from "../api/client";
 import type { ChatMessage, GameMap, Monster, PresenceChange, RoomMember, Sheet, TokenDragFrame, TokenPatch, VisibleRoomState } from "../api/types";
 import { useSession } from "../auth/SessionContext";
@@ -19,7 +19,9 @@ import { RoomHeader, type RoomConnection } from "../components/RoomHeader";
 import { RoomTabs } from "../components/RoomTabs";
 import { Dialog } from "../components/Dialog";
 import { useToast } from "../components/Toast";
-import { defaultBlocksForKind, structureTypes, type StructureBlocks } from "../lib/structures";
+import { BlankMapCard, RoomMapCard, StructureToolsCard, usePlacementStamp } from "../components/RoomMapTools";
+import { useRoomStructureHistory } from "../lib/roomStructureHistory";
+import { defaultBlocksForKind, structureLabel, type StructureBlocks } from "../lib/structures";
 import { createFrameThrottle } from "../lib/frameThrottle";
 import { floatText, isActionRoll } from "../lib/actions";
 import { isClearedRuler, isSharedRuler, remoteRulers, type SharedRuler } from "../lib/rulers";
@@ -66,7 +68,6 @@ export function RoomPage() {
   const [structureBlocks, setStructureBlocks] = useState<StructureBlocks>(() => defaultBlocksForKind("wall"));
   const [placingStructure, setPlacingStructure] = useState(false);
   const [confirmRemove, setConfirmRemove] = useState(false);
-  const [blankMap, setBlankMap] = useState({ name: "", width: "30", height: "30" });
   // Tokens someone else is dragging right now, drawn at their live position until the drag ends or the move lands.
   const [remoteDrags, setRemoteDrags] = useState<ReadonlyMap<string, Point>>(() => new Map());
   // Members with the room open right now, from the room socket's presence.changed events.
@@ -105,6 +106,9 @@ export function RoomPage() {
   const canManageSelectedToken = selectedTokens.length === 1 && (isDM || selectedTokens[0].owner_user_id === user?.id);
   const settingsToken = canManageSelectedToken ? selectedTokens[0] : undefined;
   const actionEditorToken = state?.visibleTokens.find((token) => token.id === actionEditorTokenId && token.actions_editable);
+  // The game master's in-room structure changes, undoable with Undo or Ctrl/Cmd+Z.
+  const structureHistory = useRoomStructureHistory(sendMap, currentMapId, isDM);
+  const [stamp, setStamp] = usePlacementStamp(placingStructure);
 
   /** Reloads parts of the room over HTTP; requests close together share one round of fetches. */
   function refresh(...parts: RoomPart[]) {
@@ -192,6 +196,7 @@ export function RoomPage() {
 
     let reconnecting = false;
     const stopSocket = keepSocketOpen(() => connectRoomSocket(roomId, (event) => {
+      structureHistory.observe(event);
       if (event.type === "room.deleted" || (event.type === "member.left" && isUserIdBody(event.body) && event.body.user_id === user?.id)) {
         stopSocket();
         setConnection("connecting");
@@ -279,14 +284,14 @@ export function RoomPage() {
     };
   }, [roomId]);
 
-  function send(type: string, body: unknown) {
+  function send(type: string, body: unknown, id: string = requestId()) {
     if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) throw new Error("The table is reconnecting. Try again in a moment.");
-    wsRef.current.send(JSON.stringify({ type, requestId: requestId(), body }));
+    wsRef.current.send(JSON.stringify({ type, requestId: id, body }));
   }
 
-  function sendMap(type: string, body: unknown) {
+  function sendMap(type: string, body: unknown, id?: string) {
     try {
-      send(type, body);
+      send(type, body, id);
       return true;
     } catch (err) {
       toast({ kind: "error", message: err instanceof Error ? err.message : "Could not send the map action." });
@@ -323,8 +328,13 @@ export function RoomPage() {
     }
     setMapSelection(null);
   }
+  // Only game masters open and close doors; an open door stops blocking movement, sight and attacks.
+  function toggleDoor(door: { id: string; is_open?: boolean }) {
+    if (isDM) sendMap("structure.door", { structureId: door.id, isOpen: !door.is_open });
+  }
   function moveRoomStructure(structureId: string, geometry: Point[]) {
-    if (!sendMap("structure.move", { structureId, geometry })) return;
+    const moved = state?.structures.find((structure) => structure.id === structureId);
+    if (!moved || !structureHistory.move(moved, geometry)) return;
     setState((current) => current ? {
       ...current,
       structures: current.structures.map((structure) => structure.id === structureId ? { ...structure, geometry } : structure),
@@ -407,21 +417,6 @@ export function RoomPage() {
     void update(() => postJSON(`/api/rooms/${roomId}/tokens`, { ...body, x_m: at.x, y_m: at.y }));
   }
 
-  function attachMap(e: FormEvent) {
-    e.preventDefault();
-    if (mapChoice) void update(() => postJSON(`/api/rooms/${roomId}/maps`, { map_id: mapChoice, is_active: true }), ["state", "maps"]);
-  }
-
-  function startBlankMap(e: FormEvent) {
-    e.preventDefault();
-    const body = { name: blankMap.name.trim() || undefined, width_m: Number(blankMap.width), height_m: Number(blankMap.height) };
-    void update(async () => {
-      const created = await postJSON<GameMap>(`/api/rooms/${roomId}/maps/new`, body);
-      setMapChoice(created.id);
-      setBlankMap((current) => ({ ...current, name: "" }));
-    }, ["state", "maps"]);
-  }
-
   if (!state) return <div className="card space-y-4">{loadError ? <p role="alert" className="text-[var(--pink)]">{loadError}</p> : <p role="status">Setting your table…</p>}<Link className="text-sm text-[var(--accent)]" to="/rooms">Back to rooms</Link></div>;
 
   const openCheckCount = (state.checks ?? []).filter((check) => !check.closed_at).length;
@@ -486,65 +481,23 @@ export function RoomPage() {
         <button className="btn-secondary min-h-9 shrink-0 px-3 py-1.5 text-xs md:hidden!" type="button" onClick={closeTools}>Close tools</button>
         {isDM ? <RoomTabs label="Game master tools" idPrefix="room-tools" active={toolsTab} onChange={setToolsTab} className="min-h-0 flex-1" panelClassName="min-h-0 flex-1 space-y-3 overflow-y-auto overscroll-contain" tabs={[
           { id: "map", label: "Map", content: <>
-        {isDM && <form className="card space-y-4 p-5!" onSubmit={attachMap}>
-          <h2 className="flex items-center gap-2 text-xl"><MapTrifold size={22} className="text-[var(--accent)]" aria-hidden="true" />Room map</h2>
-          <p className="text-muted text-sm">Choose one of your maps and make it active at this table.</p>
-          <label className="field-label block" htmlFor="room-map">Active map</label>
-          <div className="flex flex-col gap-3">
-            <select id="room-map" className="w-full min-w-0" value={mapChoice} onChange={(e) => setMapChoice(e.target.value)}>
-              <option value="">Choose a map</option>
-              {maps.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}
-            </select>
-            <button className="btn-secondary shrink-0" disabled={!mapChoice || mapChoice === currentMapId || busy}>{busy ? "Saving…" : "Set active map"}</button>
-          </div>
-          {maps.length === 0 && <p className="text-muted text-sm">No saved maps yet. Start a blank map below, or <Link className="text-[var(--accent)] underline underline-offset-4" to="/maps">create one in Maps</Link>.</p>}
-        </form>}
-        {isDM && <form className="card space-y-3 p-5!" onSubmit={startBlankMap}>
-          <h2 className="text-xl">Start a blank map</h2>
-          <p className="text-muted text-sm">Creates an empty map in your library and makes it active here right away.</p>
-          <label className="field-label block" htmlFor="room-blank-map-name">Map name <span className="text-muted font-normal">(optional)</span></label>
-          <input id="room-blank-map-name" className="w-full" value={blankMap.name} onChange={(e) => setBlankMap({ ...blankMap, name: e.target.value })} placeholder={`${state.room.name} map`} />
-          <div className="grid grid-cols-2 gap-3">
-            <div>
-              <label className="field-label block" htmlFor="room-blank-map-width">Width (m)</label>
-              <input id="room-blank-map-width" className="w-full" type="number" min="1" max="1000" step="1" required value={blankMap.width} onChange={(e) => setBlankMap({ ...blankMap, width: e.target.value })} />
-            </div>
-            <div>
-              <label className="field-label block" htmlFor="room-blank-map-height">Height (m)</label>
-              <input id="room-blank-map-height" className="w-full" type="number" min="1" max="1000" step="1" required value={blankMap.height} onChange={(e) => setBlankMap({ ...blankMap, height: e.target.value })} />
-            </div>
-          </div>
-          <button className="btn-secondary w-full" disabled={busy}>{busy ? "Saving…" : "Start blank map"}</button>
-        </form>}
+        {roomId && <RoomMapCard roomId={roomId} state={state} maps={maps} mapChoice={mapChoice} onMapChoice={setMapChoice} busy={busy} run={(action) => void update(action, ["state", "maps"])} />}
+        {roomId && <BlankMapCard roomId={roomId} roomName={state.room.name} busy={busy} run={(action) => void update(action, ["state", "maps"])} onCreated={setMapChoice} />}
           </> },
           { id: "tokens", label: "Tokens", content: tokenCards },
           { id: "structures", label: "Structures", content: <>
-        {isDM && <div className="card space-y-3 p-5!">
-          <h2 className="text-xl">Place structure</h2>
-          {!state.activeMap && <p className="text-muted text-sm">No map yet. Placing a structure starts a blank 30 × 30 m map for this room.</p>}
-          <label className="field-label block" htmlFor="room-structure-kind">Structure type</label>
-          <select id="room-structure-kind" className="w-full min-w-0" value={structureKind} onChange={(e) => {
-            setStructureKind(e.target.value);
-            setStructureBlocks(defaultBlocksForKind(e.target.value));
-          }}>
-            {structureTypes.map((type) => <option key={type.value} value={type.value}>{type.label}</option>)}
-          </select>
-          <fieldset className="space-y-2">
-            <legend className="field-label">This structure blocks</legend>
-            <label className="flex items-center gap-2 text-sm"><input type="checkbox" checked={structureBlocks.blocks_vision} onChange={(e) => setStructureBlocks({ ...structureBlocks, blocks_vision: e.target.checked })} />Line of sight</label>
-            <label className="flex items-center gap-2 text-sm"><input type="checkbox" checked={structureBlocks.blocks_movement} onChange={(e) => setStructureBlocks({ ...structureBlocks, blocks_movement: e.target.checked })} />Movement</label>
-            <label className="flex items-center gap-2 text-sm"><input type="checkbox" checked={structureBlocks.blocks_attacks} onChange={(e) => setStructureBlocks({ ...structureBlocks, blocks_attacks: e.target.checked })} />Attacks</label>
-          </fieldset>
-          <button className={placingStructure ? "btn-secondary w-full" : "btn w-full"} type="button" aria-pressed={placingStructure} onClick={() => {
-            if (placingStructure) {
-              setPlacingStructure(false);
-              return;
-            }
-            setPlacingStructure(true);
-            setPlacingToken(null);
-            setToolsOpen(false);
-          }}>{placingStructure ? "Stop placing" : "Place on map"}</button>
-        </div>}
+        <StructureToolsCard hasMap={!!state.activeMap} kind={structureKind} onKind={(kind) => {
+          setStructureKind(kind);
+          setStructureBlocks(defaultBlocksForKind(kind));
+        }} blocks={structureBlocks} onBlocks={setStructureBlocks} placing={placingStructure} onTogglePlacing={() => {
+          if (placingStructure) {
+            setPlacingStructure(false);
+            return;
+          }
+          setPlacingStructure(true);
+          setPlacingToken(null);
+          setToolsOpen(false);
+        }} stamp={stamp} onStamp={setStamp} undoLabel={structureHistory.next?.label} canUndo={!!structureHistory.next?.ready} onUndo={structureHistory.undo} />
           </> },
           { id: "checks", label: "Checks", count: openCheckCount, content: <CheckPromptForm members={members} onPrompt={(request) => sendMap("check.prompt", request)} /> },
         ]} /> : <div className="min-h-0 flex-1 space-y-3 overflow-y-auto overscroll-contain">{tokenCards}</div>}
@@ -562,7 +515,7 @@ export function RoomPage() {
             : selectedTokens.length > 1
               ? <p className="min-w-0 truncate text-sm text-[var(--paper)]">{`${selectedTokens.length} tokens selected`}</p>
               : selectedStructure
-                ? <p className="min-w-0 truncate text-sm text-[var(--paper)]"><span className="text-muted mr-2 text-xs uppercase tracking-[0.12em]">structure</span>{selectedStructure.kind}<span className="text-muted ml-2 text-xs">{selectedStructure.is_hidden ? "Hidden" : "Visible"}</span></p>
+                ? <p className="min-w-0 truncate text-sm text-[var(--paper)]"><span className="text-muted mr-2 text-xs uppercase tracking-[0.12em]">structure</span>{selectedStructure.kind}<span className="text-muted ml-2 text-xs">{selectedStructure.kind === "door" && (selectedStructure.is_open ? "Open · " : "Closed · ")}{selectedStructure.is_hidden ? "Hidden" : "Visible"}</span></p>
                 : <p className="text-muted min-w-0 truncate text-sm">{isDM ? "Select a token or structure on the map to manage it." : "Select your token on the map to manage it."}</p>}
           <div className="flex flex-wrap justify-end gap-2" role="group" aria-label="Selected object actions">
             {isDM && <button className={`btn-secondary min-h-9 shrink-0 px-3 py-1.5 text-xs${hasSelection ? "" : " invisible"}`} type="button" disabled={!hasSelection} aria-hidden={!hasSelection} onClick={toggleSelectedVisibility}>
@@ -573,12 +526,18 @@ export function RoomPage() {
               <Trash size={16} aria-hidden="true" />
               {confirmRemove ? "Confirm remove" : removableTokens.length > 1 ? `Remove ${removableTokens.length} tokens` : "Remove token"}
             </button>}
+            {isDM && selectedStructure?.kind === "door" && <button className="btn-secondary min-h-9 shrink-0 px-3 py-1.5 text-xs" type="button" onClick={() => toggleDoor(selectedStructure)}>
+              {selectedStructure.is_open ? <Door size={16} aria-hidden="true" /> : <DoorOpen size={16} aria-hidden="true" />}
+              {selectedStructure.is_open ? "Close door" : "Open door"}
+            </button>}
             {selectedStructure && <button className="btn-secondary min-h-9 shrink-0 px-3 py-1.5 text-xs" type="button" onClick={() => {
               if (!confirmRemove) {
                 setConfirmRemove(true);
                 return;
               }
-              if (sendMap("structure.remove", { structureId: selectedStructure.id })) setMapSelection(null);
+              if (!structureHistory.remove(selectedStructure)) return;
+              setMapSelection(null);
+              toast({ kind: "info", message: `${structureLabel(selectedStructure.kind)} removed from this table. Undo (Ctrl+Z) puts it back.` });
             }}>
               <Trash size={16} aria-hidden="true" />
               {confirmRemove ? "Confirm remove" : "Remove structure"}
@@ -614,8 +573,9 @@ export function RoomPage() {
             onEditActions={(tokenId) => {
               setActionEditorTokenId(tokenId);
             }}
-            placingStructure={placingStructure ? { kind: structureKind } : null}
-            onPlaceStructure={(geometry) => sendMap("structure.create", { kind: structureKind, geometry, ...structureBlocks })}
+            placingStructure={placingStructure ? { kind: structureKind, ...stamp } : null}
+            onPlaceStructure={(geometry) => structureHistory.place({ kind: structureKind, geometry, ...structureBlocks })}
+            onToggleDoor={isDM ? toggleDoor : undefined}
             onCancelPlacement={() => setPlacingStructure(false)}
             placingToken={placingToken}
             onPlaceToken={placeToken}
