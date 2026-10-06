@@ -14,6 +14,7 @@ declare global {
     fill: Mock;
     arc: Mock;
     setLineDash: Mock;
+    drawImage: Mock;
     fillStyle: string;
     strokeStyle: string;
     lineWidth: number;

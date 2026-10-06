@@ -102,6 +102,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/maps/{mapID}", s.handleMapGet)
 	mux.HandleFunc("PATCH /api/maps/{mapID}", s.handleMapPatch)
 	mux.HandleFunc("DELETE /api/maps/{mapID}", s.handleMapDelete)
+	mux.HandleFunc("GET /api/maps/{mapID}/rooms", s.handleMapRooms)
 	mux.HandleFunc("POST /api/maps/{mapID}/editors", s.handleMapEditor)
 	mux.HandleFunc("POST /api/maps/{mapID}/structures", s.handleStructureCreate)
 	mux.HandleFunc("PATCH /api/maps/{mapID}/structures/{structureID}", s.handleStructurePatch)
@@ -1025,7 +1026,7 @@ func (s *Server) handleMapsList(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	rows, err := s.queryJSON(r.Context(), `select jsonb_build_object('id',id::text,'owner_id',owner_id::text,'name',name,'is_public',is_public,'width_m',width_m,'height_m',height_m,'grid_size_m',grid_size_m,'background_asset_id',background_asset_id::text) from maps where owner_id=$1 or is_public or exists(select 1 from map_editors where map_id=maps.id and user_id=$1) order by created_at desc`, u.ID)
+	rows, err := s.queryJSON(r.Context(), `select jsonb_build_object('id',id::text,'owner_id',owner_id::text,'name',name,'is_public',is_public,'width_m',width_m,'height_m',height_m,'grid_size_m',grid_size_m,'background_asset_id',background_asset_id::text,'preview_structures',coalesce((select jsonb_agg(jsonb_build_object('kind',ms.kind,'geometry',ms.geometry) order by ms.z_index, ms.created_at, ms.id) from map_structures ms where ms.map_id=maps.id and ms.room_map_id is null),'[]'::jsonb)) from maps where owner_id=$1 or is_public or exists(select 1 from map_editors where map_id=maps.id and user_id=$1) order by created_at desc`, u.ID)
 	respondRows(w, rows, err)
 }
 func (s *Server) handleMapCreate(w http.ResponseWriter, r *http.Request) {
@@ -1063,7 +1064,7 @@ func (s *Server) handleMapPatch(w http.ResponseWriter, r *http.Request) {
 	}
 	var req map[string]any
 	_ = ReadJSON(r, &req)
-	row, err := s.oneJSON(r.Context(), `update maps set name=coalesce($2,name),is_public=coalesce($3,is_public),width_m=coalesce($4,width_m),height_m=coalesce($5,height_m),grid_size_m=coalesce($6,grid_size_m),background_asset_id=coalesce($7,background_asset_id),updated_at=now() where id=$1 returning jsonb_build_object('id',id::text,'owner_id',owner_id::text,'name',name,'is_public',is_public,'width_m',width_m,'height_m',height_m,'grid_size_m',grid_size_m,'background_asset_id',background_asset_id::text)`, id, nullableString(req, "name"), nullableBool(req, "is_public"), nullableFloat(req, "width_m"), nullableFloat(req, "height_m"), nullableFloat(req, "grid_size_m"), nullableString(req, "background_asset_id"))
+	row, err := s.oneJSON(r.Context(), `update maps set name=coalesce($2,name),is_public=coalesce($3,is_public),width_m=coalesce($4,width_m),height_m=coalesce($5,height_m),grid_size_m=coalesce($6,grid_size_m),background_asset_id=case when $8 then null else coalesce($7,background_asset_id) end,updated_at=now() where id=$1 returning jsonb_build_object('id',id::text,'owner_id',owner_id::text,'name',name,'is_public',is_public,'width_m',width_m,'height_m',height_m,'grid_size_m',grid_size_m,'background_asset_id',background_asset_id::text)`, id, nullableString(req, "name"), nullableBool(req, "is_public"), nullableFloat(req, "width_m"), nullableFloat(req, "height_m"), nullableFloat(req, "grid_size_m"), nullableString(req, "background_asset_id"), clearsBackground(req))
 	respondRaw(w, row, err)
 	s.bumpMapRooms(context.Background(), id)
 }
@@ -1151,7 +1152,15 @@ func (s *Server) handleStructureCreate(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	row, err := s.oneJSON(r.Context(), `insert into map_structures(id,map_id,kind,geometry,blocks_vision,blocks_movement,blocks_attacks,cover_bonus,pass_rules,z_index,group_id) values($1,$2,$3,$4,$5,$6,$7,$8,$9,coalesce($10,(select coalesce(max(z_index),0)+1 from map_structures where map_id=$2)),$11::uuid) returning jsonb_build_object('id',id::text,'map_id',map_id::text,'kind',kind,'geometry',geometry,'blocks_vision',blocks_vision,'blocks_movement',blocks_movement,'blocks_attacks',blocks_attacks,'cover_bonus',cover_bonus,'pass_rules',pass_rules,'z_index',z_index,'group_id',group_id::text)`, uuid.New().String(), mapID, str(req, "kind", "wall"), jsonRaw(req["geometry"]), boolv(req, "blocks_vision", false), boolv(req, "blocks_movement", false), boolv(req, "blocks_attacks", false), intv(req, "cover_bonus", 0), jsonRaw(req["pass_rules"]), nullableInt(req, "z_index"), groupID)
+	structureID, ok := structureCreateID(w, req)
+	if !ok {
+		return
+	}
+	row, err := s.oneJSON(r.Context(), `insert into map_structures(id,map_id,kind,geometry,blocks_vision,blocks_movement,blocks_attacks,cover_bonus,pass_rules,z_index,group_id) values($1,$2,$3,$4,$5,$6,$7,$8,$9,coalesce($10,(select coalesce(max(z_index),0)+1 from map_structures where map_id=$2)),$11::uuid) returning jsonb_build_object('id',id::text,'map_id',map_id::text,'kind',kind,'geometry',geometry,'blocks_vision',blocks_vision,'blocks_movement',blocks_movement,'blocks_attacks',blocks_attacks,'cover_bonus',cover_bonus,'pass_rules',pass_rules,'z_index',z_index,'group_id',group_id::text)`, structureID, mapID, str(req, "kind", "wall"), jsonRaw(req["geometry"]), boolv(req, "blocks_vision", false), boolv(req, "blocks_movement", false), boolv(req, "blocks_attacks", false), intv(req, "cover_bonus", 0), jsonRaw(req["pass_rules"]), nullableInt(req, "z_index"), groupID)
+	if isUniqueViolation(err) {
+		WriteError(w, 409, "structure_exists", "a structure with this id already exists")
+		return
+	}
 	respondRawStatus(w, row, err, 201)
 	s.bumpMapRooms(context.Background(), mapID)
 }

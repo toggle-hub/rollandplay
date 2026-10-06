@@ -2,10 +2,11 @@ import { useEffect, useRef, type KeyboardEvent } from "react";
 
 export type EditorAction = { id: string; label: string; shortcut?: string; disabled?: boolean; danger?: boolean };
 
-/** Right-click menu for the map editor selection, positioned in shell pixels and kept inside the shell. */
-export function EditorContextMenu({ x, y, actions, onAction, onClose }: {
+/** Right-click menu of the map editor, positioned in shell pixels and kept inside the shell. */
+export function EditorContextMenu({ x, y, label, actions, onAction, onClose }: {
   x: number;
   y: number;
+  label: string;
   actions: EditorAction[];
   onAction: (id: string) => void;
   onClose: () => void;
@@ -37,7 +38,7 @@ export function EditorContextMenu({ x, y, actions, onAction, onClose }: {
   return <div
     ref={menuRef}
     role="menu"
-    aria-label="Structure actions"
+    aria-label={label}
     className="absolute z-50 grid w-[200px] gap-0.5 rounded-xl border border-[var(--accent)]/25 bg-[var(--input)] p-1 shadow-2xl"
     style={{ left: `clamp(8px, ${x}px, calc(100% - 208px))`, top: `clamp(8px, ${y}px, calc(100% - 280px))` }}
     onPointerDown={(event) => event.stopPropagation()}
