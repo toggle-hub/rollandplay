@@ -59,7 +59,7 @@ func newTestApp(t *testing.T) *testApp {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, name := range []string{"004_default_dnd_rule_book.sql", "005_character_creation_rules.sql", "009_rule_book_monsters.sql", "012_key_order.sql", "014_rule_book_compendium.sql"} {
+	for _, name := range []string{"004_default_dnd_rule_book.sql", "005_character_creation_rules.sql", "009_rule_book_monsters.sql", "012_key_order.sql", "014_rule_book_compendium.sql", "020_character_creation_defaults.sql"} {
 		seed, err := migrations.Files.ReadFile(name)
 		if err != nil {
 			t.Fatal(err)
