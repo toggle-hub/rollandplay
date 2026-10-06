@@ -426,7 +426,7 @@ export function MapEditorCanvas({
   const helpText = transform
     ? `Esc cancels · hold ${altKeyName} to place freely · Shift ${transform.action === "rotate" ? "snaps to 15°" : "locks to one axis"}`
     : selecting
-      ? "Drag to move (snaps to the grid) · corners resize · round handle rotates · right-click for more"
+      ? "Drag to move (snaps to the grid) · corners resize · round handle rotates · right-drag or Space-drag pans · right-click for more"
       : drawing
         ? drawPoints.length === 0
           ? `Click to start a ${brushName} · corners snap to the grid · hold ${altKeyName} for free placement`
@@ -455,6 +455,7 @@ export function MapEditorCanvas({
               <button className="btn-secondary h-9 min-h-0 w-full whitespace-nowrap px-1 py-1.5 text-[10px] tabular-nums" type="button" aria-label="Reset view" title="Reset view" onClick={() => { setZoom(0.85); setCamera(initialCamera); }}>{Math.round(zoom * 100)}%</button>
               <button className="btn-secondary h-9 min-h-0 w-full whitespace-nowrap px-2 py-1.5 text-xs" type="button" aria-label="Zoom in" onClick={() => setZoom((current) => Math.min(3, round(current + 0.15)))}>+</button>
             </div>
+            <p className="text-muted mb-0 px-1 text-[10px] leading-snug">Drag to pan with the right or middle button, or hold Space. Scroll to zoom.</p>
           </div>
           {controls}
         </div>
