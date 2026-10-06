@@ -1,5 +1,6 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { apiFetch, connectNotificationSocket } from "../api/client";
+import { keepSocketOpen } from "../lib/reconnectingSocket";
 import type { AppNotification, NotificationsState } from "../api/types";
 import { useSession } from "../auth/SessionContext";
 import { playerLabel } from "../components/PlayerName";
@@ -20,10 +21,6 @@ const empty: NotificationsState = { friend_requests: [], room_invitations: [] };
 // Outside a provider (isolated component tests) notifications are simply empty and silent.
 const inert: NotificationsValue = { ...empty, refresh: async () => {}, subscribe: () => () => {}, announce: () => {} };
 const NotificationsContext = createContext<NotificationsValue>(inert);
-
-// Reconnect delays grow from 1 s to 30 s while the notification socket keeps failing.
-const reconnectBaseMs = 1000;
-const reconnectMaxMs = 30_000;
 
 /** The alert shown when a notification arrives; null for changes that only refresh lists. */
 export function notificationMessage(note: AppNotification): string | null {
@@ -74,42 +71,20 @@ export function NotificationsProvider({ children }: { children: ReactNode }) {
     if (!userId) return;
     // Background reloads stay quiet; an expired session is reported by apiFetch itself.
     const reload = () => { refresh().catch(() => {}); };
-    let stopped = false;
-    let socket: WebSocket | null = null;
-    let retry: number | undefined;
-    let failures = 0;
-    const connect = () => {
-      socket = connectNotificationSocket((event) => {
-        if (event.type !== "notification" || !isNotification(event.body)) return;
-        const note = event.body;
-        const message = notificationMessage(note);
-        if (message) toast({ kind: "info", message });
-        announce(note);
-        reload();
-      });
-      socket.onopen = () => {
-        failures = 0;
-        reload();
-      };
-      socket.onclose = () => {
-        if (stopped) return;
-        retry = window.setTimeout(connect, Math.min(reconnectMaxMs, reconnectBaseMs * 2 ** failures++));
-      };
-    };
+    const stopSocket = keepSocketOpen(() => connectNotificationSocket((event) => {
+      if (event.type !== "notification" || !isNotification(event.body)) return;
+      const note = event.body;
+      const message = notificationMessage(note);
+      if (message) toast({ kind: "info", message });
+      announce(note);
+      reload();
+    }), { onOpen: reload });
     const onVisible = () => { if (document.visibilityState === "visible") reload(); };
     reload();
-    connect();
     document.addEventListener("visibilitychange", onVisible);
     return () => {
-      stopped = true;
-      window.clearTimeout(retry);
+      stopSocket();
       document.removeEventListener("visibilitychange", onVisible);
-      if (socket) {
-        socket.onopen = null;
-        socket.onclose = null;
-        socket.onmessage = null;
-        socket.close();
-      }
     };
   }, [userId, refresh, announce, toast]);
 

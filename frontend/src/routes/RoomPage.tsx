@@ -1,8 +1,8 @@
-import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
-import { Link, useParams } from "react-router-dom";
-import { ArrowLeft, Circle, Eye, EyeSlash, MapTrifold, Trash, UsersThree } from "@phosphor-icons/react";
+import { FormEvent, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
+import { Link, useNavigate, useParams } from "react-router-dom";
+import { Eye, EyeSlash, MapTrifold, Trash, UsersThree } from "@phosphor-icons/react";
 import { apiFetch, connectRoomSocket, patchJSON, postJSON, requestId } from "../api/client";
-import type { ChatMessage, GameMap, Monster, PresenceChange, RoomMember, ServerEnvelope, Sheet, TokenDragFrame, TokenPatch, VisibleRoomState } from "../api/types";
+import type { ChatMessage, GameMap, Monster, PresenceChange, RoomMember, Sheet, TokenDragFrame, TokenPatch, VisibleRoomState } from "../api/types";
 import { useSession } from "../auth/SessionContext";
 import { MapCanvas, type FloatingResult, type MapSelection } from "../components/MapCanvas";
 import { ChatPanel } from "../components/ChatPanel";
@@ -15,16 +15,30 @@ import { TokenSettingsPanel } from "../components/TokenSettingsPanel";
 import { CharacterStatusCard } from "../components/CharacterStatusCard";
 import { RoomInvitePanel } from "../components/RoomInvitePanel";
 import { TurnOrderStrip } from "../components/TurnOrderStrip";
+import { RoomHeader, type RoomConnection } from "../components/RoomHeader";
+import { RoomTabs } from "../components/RoomTabs";
+import { Dialog } from "../components/Dialog";
 import { useToast } from "../components/Toast";
 import { defaultBlocksForKind, structureTypes, type StructureBlocks } from "../lib/structures";
 import { createFrameThrottle } from "../lib/frameThrottle";
 import { floatText, isActionRoll } from "../lib/actions";
 import { isClearedRuler, isSharedRuler, remoteRulers, type SharedRuler } from "../lib/rulers";
+import { isPendingFor } from "../lib/checks";
+import { createRefreshQueue, type RefreshQueue } from "../lib/refreshQueue";
+import { keepSocketOpen } from "../lib/reconnectingSocket";
+import { allRoomParts, partsToReload, type RoomPart } from "../lib/roomEvents";
+import { useViewportFill } from "../lib/useViewportFill";
 
 type Point = { x: number; y: number };
 
+// Events arriving this close together reload the room once.
+const refreshDelayMs = 40;
+// Space kept under the table at the bottom of the window, matching the page's bottom padding.
+const roomBottomGapPx = 16;
+
 export function RoomPage() {
   const { roomId } = useParams();
+  const navigate = useNavigate();
   const { session } = useSession();
   const user = session.status === "authenticated" ? session.user : null;
   const [state, setState] = useState<VisibleRoomState | null>(null);
@@ -32,7 +46,7 @@ export function RoomPage() {
   const [sheets, setSheets] = useState<Sheet[]>([]);
   const [maps, setMaps] = useState<GameMap[]>([]);
   const [loadError, setLoadError] = useState("");
-  const [connected, setConnected] = useState(false);
+  const [connection, setConnection] = useState<RoomConnection>("connecting");
   const [busy, setBusy] = useState(false);
   const [sheet, setSheet] = useState("");
   const [mapChoice, setMapChoice] = useState("");
@@ -41,6 +55,8 @@ export function RoomPage() {
   const [monsterChoice, setMonsterChoice] = useState("");
   const [mapSelection, setMapSelection] = useState<MapSelection | null>(null);
   const [toolsOpen, setToolsOpen] = useState(false);
+  const [toolsTab, setToolsTab] = useState("map");
+  const [sideTab, setSideTab] = useState("chat");
   const [actionEditorTokenId, setActionEditorTokenId] = useState<string | null>(null);
   // Action results floated above the tokens they hit, each removed shortly after it arrives.
   const [floats, setFloats] = useState<FloatingResult[]>([]);
@@ -59,10 +75,15 @@ export function RoomPage() {
   const [placingToken, setPlacingToken] = useState<{ body: Record<string, unknown>; label: string; sizeM: number } | null>(null);
   const previousMapId = useRef("");
   const toolsToggleRef = useRef<HTMLButtonElement>(null);
+  const sideRef = useRef<HTMLElement>(null);
   const wsRef = useRef<WebSocket | null>(null);
+  const refreshQueue = useRef<RefreshQueue<RoomPart> | null>(null);
+  // Checks this page already knows; null until the first state arrives, so checks open on arrival don't alert.
+  const knownChecks = useRef<Set<string> | null>(null);
   // Once the room has loaded, later failures become toasts instead of replacing the page.
   const loaded = useRef(false);
   const toast = useToast();
+  const [gridRef, fill] = useViewportFill<HTMLDivElement>(roomBottomGapPx, 360);
   const myMember = members.find((member) => member.user_id === user?.id);
   const isDM = !!myMember?.is_dm;
   // Characters usable at this table: the room's rule book, and for players only their own sheets.
@@ -82,35 +103,10 @@ export function RoomPage() {
   const settingsToken = canManageSelectedToken ? selectedTokens[0] : undefined;
   const actionEditorToken = state?.visibleTokens.find((token) => token.id === actionEditorTokenId && token.actions_editable);
 
-  async function load() {
-    if (!roomId) return;
-    try {
-      const [nextState, nextMembers, nextSheets, nextMaps] = await Promise.all([
-        apiFetch<VisibleRoomState>(`/api/rooms/${roomId}/state`),
-        apiFetch<RoomMember[]>(`/api/rooms/${roomId}/members`),
-        apiFetch<Sheet[]>("/api/sheets"),
-        apiFetch<GameMap[]>("/api/maps"),
-      ]);
-      setState(nextState);
-      setMembers(nextMembers ?? []);
-      setSheets(nextSheets ?? []);
-      setMaps(nextMaps ?? []);
-      setSheet((current) => current || nextMembers?.find((member) => member.user_id === user?.id)?.sheet_id || "");
-      setMapChoice((current) => current || activeMapId(nextState) || nextMaps?.[0]?.id || "");
-      loaded.current = true;
-    } catch (err) {
-      const message = err instanceof Error ? err.message : "Could not load this room.";
-      if (loaded.current) toast({ kind: "error", message });
-      else setLoadError(message);
-    }
+  /** Reloads parts of the room over HTTP; requests close together share one round of fetches. */
+  function refresh(...parts: RoomPart[]) {
+    return refreshQueue.current?.request(...parts) ?? Promise.resolve();
   }
-
-  useEffect(() => {
-    setState(null);
-    setLoadError("");
-    loaded.current = false;
-    void load();
-  }, [roomId]);
 
   useEffect(() => {
     setMapSelection(null);
@@ -128,9 +124,78 @@ export function RoomPage() {
     apiFetch<Monster[]>(`/api/rooms/${roomId}/monsters`).then((items) => setMonsters(items ?? [])).catch(() => setMonsters([]));
   }, [isDM, roomId]);
 
+  // Selecting a token you manage shows its settings, which game masters find under Tokens.
+  useEffect(() => {
+    if (settingsToken) setToolsTab("tokens");
+  }, [settingsToken?.id]);
+
+  // A check the game master just asked this player to roll alerts with a Roll button right in the toast.
+  useEffect(() => {
+    if (!state) return;
+    const checks = state.checks ?? [];
+    const known = knownChecks.current;
+    knownChecks.current = new Set([...(known ?? []), ...checks.map((check) => check.id)]);
+    if (!known) return;
+    for (const check of checks) {
+      if (known.has(check.id) || !isPendingFor(check, user?.id)) continue;
+      toast({
+        kind: "info",
+        message: `${check.title ? `${check.title}: the` : "The"} game master asks you for a roll: ${check.label}, DC ${check.dc}.`,
+        action: { label: "Roll", onClick: () => sendMap("check.roll", { checkId: check.id }) },
+      });
+    }
+  }, [state?.checks]);
+
   useEffect(() => {
     if (!roomId) return;
-    const ws = connectRoomSocket(roomId, (event: ServerEnvelope) => {
+    setState(null);
+    setLoadError("");
+    setConnection("connecting");
+    loaded.current = false;
+    knownChecks.current = null;
+    let active = true;
+    const queue = createRefreshQueue<RoomPart>(async (parts) => {
+      try {
+        const [nextState, nextMembers, nextSheets, nextMaps] = await Promise.all([
+          parts.has("state") ? apiFetch<VisibleRoomState>(`/api/rooms/${roomId}/state`) : null,
+          parts.has("members") ? apiFetch<RoomMember[]>(`/api/rooms/${roomId}/members`) : null,
+          parts.has("members") ? apiFetch<Sheet[]>("/api/sheets") : null,
+          parts.has("maps") ? apiFetch<GameMap[]>("/api/maps") : null,
+        ]);
+        if (!active) return;
+        if (nextState) {
+          setState(nextState);
+          setMapChoice((current) => current || activeMapId(nextState));
+        }
+        if (parts.has("members")) {
+          setMembers(nextMembers ?? []);
+          setSheets(nextSheets ?? []);
+          setSheet((current) => current || nextMembers?.find((member) => member.user_id === user?.id)?.sheet_id || "");
+        }
+        if (parts.has("maps")) {
+          setMaps(nextMaps ?? []);
+          setMapChoice((current) => current || nextMaps?.[0]?.id || "");
+        }
+        loaded.current = true;
+      } catch (err) {
+        if (!active) return;
+        const message = err instanceof Error ? err.message : "Could not load this room.";
+        if (loaded.current) toast({ kind: "error", message });
+        else setLoadError(message);
+      }
+    }, refreshDelayMs);
+    refreshQueue.current = queue;
+    void queue.request(...allRoomParts);
+
+    let reconnecting = false;
+    const stopSocket = keepSocketOpen(() => connectRoomSocket(roomId, (event) => {
+      if (event.type === "room.deleted" || (event.type === "member.left" && isUserIdBody(event.body) && event.body.user_id === user?.id)) {
+        stopSocket();
+        setConnection("connecting");
+        toast({ kind: "info", message: event.type === "room.deleted" ? "This room was deleted." : "You are no longer at this table." });
+        navigate("/rooms");
+        return;
+      }
       if ((event.type === "chat.message" || event.type === "roll.result") && isChatMessage(event.body)) {
         const message = event.body;
         setState((current) => current ? { ...current, chatHistory: [...(current.chatHistory ?? []), message] } : current);
@@ -141,19 +206,18 @@ export function RoomPage() {
           const ids = results.map((result) => result.id);
           setFloats((current) => [...current, ...results]);
           window.setTimeout(() => setFloats((current) => current.filter((result) => !ids.includes(result.id))), 3000);
-          void load();
+          void queue.request("state");
         }
       }
-      if (event.type === "token.updated" || event.type === "token.removed" || event.type === "structure.moved" || event.type === "structure.updated" || event.type === "structure.created" || event.type === "structure.removed" || event.type === "map.activated" || event.type === "vision.update" || event.type === "check.changed" || event.type === "member.joined" || event.type === "state.snapshot") void load();
-      if (event.type === "combat.changed") void load();
-      if (event.type === "map.activated" || event.type === "state.snapshot") {
-        setRemoteDrags(new Map());
-        setSharedRulers(new Map());
-      }
+      const parts = partsToReload(event.type);
       // The preview stays on the landing position until the reloaded state has the token there.
       if (event.type === "token.moved" && isTokenIdsBody(event.body)) {
         const ids = event.body.token_ids;
-        void load().then(() => setRemoteDrags((current) => withoutKeys(current, ids)));
+        void queue.request(...parts).then(() => setRemoteDrags((current) => withoutKeys(current, ids)));
+      } else if (parts.length > 0) void queue.request(...parts);
+      if (event.type === "map.activated" || event.type === "state.snapshot") {
+        setRemoteDrags(new Map());
+        setSharedRulers(new Map());
       }
       if (event.type === "token.dragging" && isDragFrame(event.body)) {
         const frame = event.body;
@@ -184,36 +248,36 @@ export function RoomPage() {
           return next;
         });
       }
-      if (event.type === "error" && isErrorBody(event.body)) {
-        toast({ kind: "error", message: event.body.message });
-        void load();
-      }
+      if (event.type === "error" && isErrorBody(event.body)) toast({ kind: "error", message: event.body.message });
+    }), {
+      onOpen: (socket) => {
+        wsRef.current = socket;
+        setConnection("live");
+        // The first connection's state.snapshot reloads the state; after a drop, anything may have changed.
+        if (reconnecting) void queue.request(...allRoomParts);
+      },
+      onClose: () => {
+        wsRef.current = null;
+        reconnecting = true;
+        setConnection("reconnecting");
+        setRemoteDrags(new Map());
+        setOnlineUserIds(new Set());
+        setSharedRulers(new Map());
+      },
     });
-    wsRef.current = ws;
-    ws.onopen = () => {
-      setConnected(true);
-      void load();
-    };
-    ws.onclose = () => {
-      setConnected(false);
-      setRemoteDrags(new Map());
-      setOnlineUserIds(new Set());
-      setSharedRulers(new Map());
-    };
-    ws.onerror = () => toast({ kind: "error", message: "The live connection was interrupted. Reload this room to reconnect." });
     return () => {
+      active = false;
       dragFrames.cancel();
       measure.cancel();
-      ws.onopen = null;
-      ws.onclose = null;
-      ws.onerror = null;
-      ws.close();
+      stopSocket();
       wsRef.current = null;
+      queue.stop();
+      refreshQueue.current = null;
     };
   }, [roomId]);
 
   function send(type: string, body: unknown) {
-    if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) throw new Error("The room is not connected. Reload the page to reconnect.");
+    if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) throw new Error("The table is reconnecting. Try again in a moment.");
     wsRef.current.send(JSON.stringify({ type, requestId: requestId(), body }));
   }
 
@@ -281,11 +345,12 @@ export function RoomPage() {
   const measure = useMemo(() => createFrameThrottle(({ from, to }: { from: Point; to: Point }) => trySend("ruler.measure", { from, to }), 50), [roomId]);
   const dragFrames = useMemo(() => createFrameThrottle((moves: { tokenId: string; to: Point }[]) => trySend("token.drag", { moves }), 50), [roomId]);
 
-  async function update(action: () => Promise<unknown>) {
+  /** Runs an HTTP change, then reloads the parts of the room it touched (the room state unless told otherwise). */
+  async function update(action: () => Promise<unknown>, parts: RoomPart[] = ["state"]) {
     setBusy(true);
     try {
       await action();
-      await load();
+      await refresh(...parts);
     } catch (err) {
       toast({ kind: "error", message: err instanceof Error ? err.message : "Could not update this room." });
     } finally {
@@ -341,7 +406,7 @@ export function RoomPage() {
 
   function attachMap(e: FormEvent) {
     e.preventDefault();
-    if (mapChoice) void update(() => postJSON(`/api/rooms/${roomId}/maps`, { map_id: mapChoice, is_active: true }));
+    if (mapChoice) void update(() => postJSON(`/api/rooms/${roomId}/maps`, { map_id: mapChoice, is_active: true }), ["state", "maps"]);
   }
 
   function startBlankMap(e: FormEvent) {
@@ -351,38 +416,73 @@ export function RoomPage() {
       const created = await postJSON<GameMap>(`/api/rooms/${roomId}/maps/new`, body);
       setMapChoice(created.id);
       setBlankMap((current) => ({ ...current, name: "" }));
-    });
+    }, ["state", "maps"]);
   }
 
   if (!state) return <div className="card space-y-4">{loadError ? <p role="alert" className="text-[var(--pink)]">{loadError}</p> : <p role="status">Setting your table…</p>}<Link className="text-sm text-[var(--accent)]" to="/rooms">Back to rooms</Link></div>;
 
-  return <div className="workspace-page">
-    <header>
-      <Link className="mb-5 inline-flex items-center gap-2 text-sm text-[var(--muted)] hover:text-[var(--paper)]" to="/rooms"><ArrowLeft size={16} aria-hidden="true" />All rooms</Link>
-      <div className="flex flex-wrap items-center justify-between gap-4"><h1 className="page-heading min-w-0 break-words">{state.room.name}</h1><p role="status" className="flex items-center gap-2 text-sm text-[var(--muted)]"><Circle size={8} weight="fill" className={connected ? "text-[var(--green)]" : "text-[var(--pink)]"} aria-hidden="true" />{connected ? "Live at the table" : "Not connected"}</p></div>
-      <p className="text-muted mt-3 break-all text-sm">Rule book <span className="ml-2 text-[var(--lavender)]">{state.room.rule_book.name}</span><span className="mx-3" aria-hidden="true">·</span>Invite your party with <span className="ml-2 select-all font-mono text-[var(--paper)]">{state.room.invite_code}</span></p>
-    </header>
-    <div className="grid grid-cols-[minmax(0,1fr)] items-start gap-4 md:grid-cols-[240px_minmax(0,1fr)] md:gap-6 2xl:grid-cols-[240px_minmax(0,1fr)_280px]">
-      <div className="sticky top-4 z-30 col-start-1 row-start-1 min-w-0 md:row-span-2" onKeyDown={(event) => {
-        if (event.key === "Escape" && toolsOpen) {
-          setToolsOpen(false);
-          toolsToggleRef.current?.focus();
-        }
+  const openCheckCount = (state.checks ?? []).filter((check) => !check.closed_at).length;
+  const myPendingChecks = (state.checks ?? []).filter((check) => isPendingFor(check, user?.id));
+  const closeTools = () => {
+    setToolsOpen(false);
+    toolsToggleRef.current?.focus();
+  };
+  const tokenCards = <>
+  {state.activeMap && <CharacterStatusCard tokens={state.visibleTokens} selectedTokenIds={selectedTokens.map((token) => token.id)} isDM={isDM} onSend={sendMap} />}
+  {settingsToken && <TokenSettingsPanel key={settingsToken.id} token={settingsToken} isDM={isDM} canManage={canManageSelectedToken} members={members} busy={busy}
+    onSave={(patch) => void update(() => patchToken(settingsToken.id, patch))}
+    onUploadImage={(file) => uploadTokenImage(settingsToken.id, file)}
+    onClearImage={() => void update(() => patchToken(settingsToken.id, { image_asset_id: null }))}
+    onSend={sendMap} />}
+  {!isDM && state.ownTokens.length > 0 ? <div className="card space-y-3 p-5!">
+    <p className="text-muted text-sm">Your character is on the map. Select it and choose Remove token to bring a different one.</p>
+  </div> : <form className="card space-y-3 p-5!" onSubmit={addToken}>
+    <label className="field-label block" htmlFor={isDM ? "room-token-name" : "room-token-sheet"}>{isDM ? "Add a table token" : "Bring a character to the map"}</label>
+    {isDM ? <>
+      <input id="room-token-name" className="w-full" value={tokenName} onChange={(e) => setTokenName(e.target.value)} placeholder={monsterChoice ? `${monsters.find((item) => item.id === monsterChoice)?.name ?? "Monster"} (numbered automatically)` : "Token name"} />
+      {monsters.length > 0 && <>
+        <label className="field-label block" htmlFor="room-token-monster">Monster <span className="text-muted font-normal">(optional)</span></label>
+        <select id="room-token-monster" className="w-full min-w-0" value={monsterChoice} onChange={(e) => {
+          setMonsterChoice(e.target.value);
+          if (e.target.value) {
+            setSheet("");
+            setTokenName("");
+          }
+        }}>
+          <option value="">No monster</option>
+          {monsters.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}
+        </select>
+      </>}
+      <label className="field-label block" htmlFor="room-token-sheet">Character sheet <span className="text-muted font-normal">(optional)</span></label>
+    </> : null}
+    <div className="flex flex-col gap-3">
+      <select id="room-token-sheet" className="w-full min-w-0" value={sheet} disabled={isDM && !!monsterChoice} onChange={(e) => setSheet(e.target.value)}>
+        <option value="">{isDM ? "No character sheet" : "Choose a character sheet"}</option>
+        {roomSheets.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}
+      </select>
+      <button className="btn shrink-0" disabled={(!isDM && !sheet) || busy}>{busy ? "Adding…" : placingToken ? "Cancel placing" : "Add token"}</button>
+    </div>
+    {!isDM && roomSheets.length === 0 && <p className="text-muted text-sm">No {state.room.rule_book.name} characters yet. <Link className="text-[var(--accent)] underline underline-offset-4" to={`/sheets?room=${encodeURIComponent(state.room.id)}`}>Create a character</Link> to place a token.</p>}
+    {isDM && <p className="text-muted text-sm">DM tokens do not require a character sheet. A monster token gets its own copy of the rule book's stat block and attacks; players never see its stats.</p>}
+  </form>}
+  </>;
+
+  return <div className="room-screen grid gap-3" style={{ "--room-fill": fill ? `${fill}px` : "70dvh" } as CSSProperties}>
+    <RoomHeader room={state.room} connection={connection} isDM={isDM} toolsLabel={isDM ? "Map & tokens" : "Character & tokens"} toolsOpen={toolsOpen} toolsButtonRef={toolsToggleRef}
+      onOpenTools={() => setToolsOpen(true)}
+      onOpenChat={() => {
+        setSideTab("chat");
+        sideRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+        document.getElementById("chat-message")?.focus({ preventScroll: true });
+      }} />
+    <div ref={gridRef} className="grid grid-cols-[minmax(0,1fr)] gap-3 md:grid-cols-[240px_minmax(0,1fr)] lg:h-[var(--room-fill)] lg:grid-cols-[240px_minmax(0,1fr)_300px] xl:grid-cols-[270px_minmax(0,1fr)_340px]">
+      {toolsOpen && <div className="fixed inset-0 z-40 bg-black/50 md:hidden" aria-hidden="true" onClick={closeTools} />}
+      <aside id="room-tools-panel" className={`${toolsOpen ? "flex" : "hidden"} fixed inset-y-3 left-3 z-50 w-[300px] max-w-[calc(100vw-24px)] min-w-0 flex-col gap-3 rounded-xl border border-[var(--line)] bg-[var(--ink)] p-3 shadow-xl [&_.card]:p-4! md:static md:z-auto md:flex md:h-[var(--room-fill)] md:w-auto md:max-w-none md:rounded-none md:border-0 md:bg-transparent md:p-0 md:shadow-none lg:h-full`} aria-label={isDM ? "Map and token tools" : "Character and token tools"} onKeyDown={(event) => {
+        if (event.key === "Escape" && toolsOpen) closeTools();
       }}>
-        <button ref={toolsToggleRef} className="btn md:hidden!" type="button" aria-expanded={toolsOpen} aria-controls="room-tools-panel" onClick={() => setToolsOpen((open) => !open)}>
-          <MapTrifold size={20} aria-hidden="true" />{toolsOpen ? "Close tools" : isDM ? "Map & tokens" : "Character & tokens"}
-        </button>
-        <aside id="room-tools-panel" className={`${toolsOpen ? "grid" : "hidden"} fixed inset-y-4 left-5 w-[300px] max-w-[calc(100vw-40px)] content-start gap-4 overflow-y-auto overscroll-contain rounded-xl border border-[var(--line)] bg-[var(--ink)] p-2 shadow-xl md:static md:-m-1 md:grid md:max-h-[calc(100dvh-32px)] md:w-auto md:max-w-none md:rounded-none md:border-0 md:bg-transparent md:p-1 md:shadow-none`} aria-label="Map and token controls">
-          <button className="btn-secondary md:hidden!" type="button" onClick={() => {
-            setToolsOpen(false);
-            toolsToggleRef.current?.focus();
-          }}>Close tools</button>
-        {state.activeMap && <CharacterStatusCard tokens={state.visibleTokens} selectedTokenIds={selectedTokens.map((token) => token.id)} isDM={isDM} onSend={sendMap} />}
-        {settingsToken && <TokenSettingsPanel key={settingsToken.id} token={settingsToken} isDM={isDM} canManage={canManageSelectedToken} members={members} busy={busy}
-          onSave={(patch) => void update(() => patchToken(settingsToken.id, patch))}
-          onUploadImage={(file) => uploadTokenImage(settingsToken.id, file)}
-          onClearImage={() => void update(() => patchToken(settingsToken.id, { image_asset_id: null }))}
-          onSend={sendMap} />}
+        <button className="btn-secondary min-h-9 shrink-0 px-3 py-1.5 text-xs md:hidden!" type="button" onClick={closeTools}>Close tools</button>
+        {isDM ? <RoomTabs label="Game master tools" idPrefix="room-tools" active={toolsTab} onChange={setToolsTab} className="min-h-0 flex-1" panelClassName="min-h-0 flex-1 space-y-3 overflow-y-auto overscroll-contain" tabs={[
+          { id: "map", label: "Map", content: <>
         {isDM && <form className="card space-y-4 p-5!" onSubmit={attachMap}>
           <h2 className="flex items-center gap-2 text-xl"><MapTrifold size={22} className="text-[var(--accent)]" aria-hidden="true" />Room map</h2>
           <p className="text-muted text-sm">Choose one of your maps and make it active at this table.</p>
@@ -396,7 +496,6 @@ export function RoomPage() {
           </div>
           {maps.length === 0 && <p className="text-muted text-sm">No saved maps yet. Start a blank map below, or <Link className="text-[var(--accent)] underline underline-offset-4" to="/maps">create one in Maps</Link>.</p>}
         </form>}
-
         {isDM && <form className="card space-y-3 p-5!" onSubmit={startBlankMap}>
           <h2 className="text-xl">Start a blank map</h2>
           <p className="text-muted text-sm">Creates an empty map in your library and makes it active here right away.</p>
@@ -414,39 +513,9 @@ export function RoomPage() {
           </div>
           <button className="btn-secondary w-full" disabled={busy}>{busy ? "Saving…" : "Start blank map"}</button>
         </form>}
-
-        {!isDM && state.ownTokens.length > 0 ? <div className="card space-y-3 p-5!">
-          <p className="text-muted text-sm">Your character is on the map. Select it and choose Remove token to bring a different one.</p>
-        </div> : <form className="card space-y-3 p-5!" onSubmit={addToken}>
-          <label className="field-label block" htmlFor={isDM ? "room-token-name" : "room-token-sheet"}>{isDM ? "Add a table token" : "Bring a character to the map"}</label>
-          {isDM ? <>
-            <input id="room-token-name" className="w-full" value={tokenName} onChange={(e) => setTokenName(e.target.value)} placeholder={monsterChoice ? `${monsters.find((item) => item.id === monsterChoice)?.name ?? "Monster"} (numbered automatically)` : "Token name"} />
-            {monsters.length > 0 && <>
-              <label className="field-label block" htmlFor="room-token-monster">Monster <span className="text-muted font-normal">(optional)</span></label>
-              <select id="room-token-monster" className="w-full min-w-0" value={monsterChoice} onChange={(e) => {
-                setMonsterChoice(e.target.value);
-                if (e.target.value) {
-                  setSheet("");
-                  setTokenName("");
-                }
-              }}>
-                <option value="">No monster</option>
-                {monsters.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}
-              </select>
-            </>}
-            <label className="field-label block" htmlFor="room-token-sheet">Character sheet <span className="text-muted font-normal">(optional)</span></label>
-          </> : null}
-          <div className="flex flex-col gap-3">
-            <select id="room-token-sheet" className="w-full min-w-0" value={sheet} disabled={isDM && !!monsterChoice} onChange={(e) => setSheet(e.target.value)}>
-              <option value="">{isDM ? "No character sheet" : "Choose a character sheet"}</option>
-              {roomSheets.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}
-            </select>
-            <button className="btn shrink-0" disabled={(!isDM && !sheet) || busy}>{busy ? "Adding…" : placingToken ? "Cancel placing" : "Add token"}</button>
-          </div>
-          {!isDM && roomSheets.length === 0 && <p className="text-muted text-sm">No {state.room.rule_book.name} characters yet. <Link className="text-[var(--accent)] underline underline-offset-4" to={`/sheets?room=${encodeURIComponent(state.room.id)}`}>Create a character</Link> to place a token.</p>}
-          {isDM && <p className="text-muted text-sm">DM tokens do not require a character sheet. A monster token gets its own copy of the rule book's stat block and attacks; players never see its stats.</p>}
-        </form>}
-
+          </> },
+          { id: "tokens", label: "Tokens", content: tokenCards },
+          { id: "structures", label: "Structures", content: <>
         {isDM && <div className="card space-y-3 p-5!">
           <h2 className="text-xl">Place structure</h2>
           {!state.activeMap && <p className="text-muted text-sm">No map yet. Placing a structure starts a blank 30 × 30 m map for this room.</p>}
@@ -473,49 +542,47 @@ export function RoomPage() {
             setToolsOpen(false);
           }}>{placingStructure ? "Stop placing" : "Place on map"}</button>
         </div>}
-
-        {isDM && <CheckPromptForm members={members} onPrompt={(request) => sendMap("check.prompt", request)} />}
-
-        {actionEditorToken && <ActionsEditor key={actionEditorToken.id} owner={actionEditorToken} busy={busy}
-          onSave={(lists) => void update(() => patchJSON(`/api/rooms/${roomId}/tokens/${actionEditorToken.id}/actions`, lists))}
-          onClose={() => setActionEditorTokenId(null)} />}
-
-        </aside>
-      </div>
-      <section className="col-start-1 row-start-2 min-w-0 space-y-3 md:col-start-2 md:row-start-1" aria-label="Tabletop">
-          <div className="flex flex-wrap items-center justify-between gap-2"><h2 className="text-xl">{state.activeMap?.name ?? "The tabletop"}</h2><p className="text-muted text-xs">{state.metersPerGrid} m per grid square</p></div>
-          <p className="text-muted text-xs">{isDM ? "Left-drag a structure to move it. Drag the round handle above the selected structure to rotate it; hold Shift to snap to 15°. Drag a token to move it freely; hold Shift to snap it to the grid. Walls stop a dragged token, which slides along them, and it stays wherever the drag ends. Drag across empty space to select several tokens, then drag one of them to move the group. Right-click any token without dragging to open its action wheel: pick an attack, spell, item, check or death save, click a target or the point where an area lands, then press Roll on the confirm card. Hits change hit points at once. Select an object to hide it from or reveal it to players. Hold the right mouse button and drag to measure distance; release to hide the ruler. Use Place structure to add walls, doors, windows, cover or terrain to this room's map, and select a structure to remove it; these changes stay in this room and never alter the saved map." : "Drag a token to move it freely; hold Shift to snap it to the grid. Walls stop a dragged token, which slides along them, and it stays wherever the drag ends. Drag across empty space to select several tokens, then drag one of them to move the group. Right-click a token you control without dragging to open its action wheel: pick an attack, spell, item, check or death save and see its range, click a highlighted target or the point where an area lands, then press Roll on the confirm card. Hits change hit points at once. Walls and other attack-blocking structures stop attacks unless they let attacks pass. Hold the right mouse button and drag to measure distance; release to hide the ruler."}</p>
-          <TurnOrderStrip combat={state.combat} tokens={state.visibleTokens} isDM={isDM} currentUserId={user?.id} onSend={sendMap} />
-          <div className="grid grid-cols-1 items-center gap-3 rounded-lg border border-[var(--paper)]/10 bg-[var(--input)] px-3 py-2 sm:grid-cols-[minmax(0,1fr)_auto]" role="group" aria-label="Selected tabletop object">
-            {selectedTokens.length === 1
-              ? <p className="min-w-0 truncate text-sm text-[var(--paper)]"><span className="text-muted mr-2 text-xs uppercase tracking-[0.12em]">token</span>{selectedTokens[0].name}{isDM && <span className="text-muted ml-2 text-xs">{selectedTokens[0].is_hidden ? "Hidden" : "Visible"}</span>}</p>
-              : selectedTokens.length > 1
-                ? <p className="min-w-0 truncate text-sm text-[var(--paper)]">{`${selectedTokens.length} tokens selected`}</p>
-                : selectedStructure
-                  ? <p className="min-w-0 truncate text-sm text-[var(--paper)]"><span className="text-muted mr-2 text-xs uppercase tracking-[0.12em]">structure</span>{selectedStructure.kind}<span className="text-muted ml-2 text-xs">{selectedStructure.is_hidden ? "Hidden" : "Visible"}</span></p>
-                  : <p className="text-muted min-w-0 truncate text-sm">{isDM ? "Select a token or structure on the map to manage it." : "Select your token on the map to manage it."}</p>}
-            <div className="flex flex-wrap justify-end gap-2" role="group" aria-label="Selected object actions">
-              {isDM && <button className={`btn-secondary min-h-9 shrink-0 px-3 py-1.5 text-xs${hasSelection ? "" : " invisible"}`} type="button" disabled={!hasSelection} aria-hidden={!hasSelection} onClick={toggleSelectedVisibility}>
-                {selectionHides ? <EyeSlash size={16} aria-hidden="true" /> : <Eye size={16} aria-hidden="true" />}
-                {selectionHides ? "Hide from players" : "Reveal to players"}
-              </button>}
-              {removableTokens.length > 0 && <button className="btn-secondary min-h-9 shrink-0 px-3 py-1.5 text-xs" type="button" onClick={removeSelectedTokens}>
-                <Trash size={16} aria-hidden="true" />
-                {confirmRemove ? "Confirm remove" : removableTokens.length > 1 ? `Remove ${removableTokens.length} tokens` : "Remove token"}
-              </button>}
-              {selectedStructure && <button className="btn-secondary min-h-9 shrink-0 px-3 py-1.5 text-xs" type="button" onClick={() => {
-                if (!confirmRemove) {
-                  setConfirmRemove(true);
-                  return;
-                }
-                if (sendMap("structure.remove", { structureId: selectedStructure.id })) setMapSelection(null);
-              }}>
-                <Trash size={16} aria-hidden="true" />
-                {confirmRemove ? "Confirm remove" : "Remove structure"}
-              </button>}
-            </div>
+          </> },
+          { id: "checks", label: "Checks", count: openCheckCount, content: <CheckPromptForm members={members} onPrompt={(request) => sendMap("check.prompt", request)} /> },
+        ]} /> : <div className="min-h-0 flex-1 space-y-3 overflow-y-auto overscroll-contain">{tokenCards}</div>}
+      </aside>
+      <section className="flex h-[var(--room-fill)] min-h-0 min-w-0 flex-col gap-2 lg:h-full" aria-label="Tabletop">
+        {myPendingChecks.length > 0 && <div className="max-h-40 shrink-0 overflow-y-auto overscroll-contain">
+          <RoomChecks pinned checks={myPendingChecks} members={members} currentUserId={user?.id} isDM={false}
+            onRoll={(checkId, userId, options) => sendMap("check.roll", { checkId, userId, ...options })}
+            onClose={(checkId) => sendMap("check.close", { checkId })} />
+        </div>}
+        <TurnOrderStrip combat={state.combat} tokens={state.visibleTokens} isDM={isDM} currentUserId={user?.id} onSend={sendMap} />
+        <div className="grid grid-cols-1 items-center gap-3 rounded-lg border border-[var(--paper)]/10 bg-[var(--input)] px-3 py-2 sm:grid-cols-[minmax(0,1fr)_auto]" role="group" aria-label="Selected tabletop object">
+          {selectedTokens.length === 1
+            ? <p className="min-w-0 truncate text-sm text-[var(--paper)]"><span className="text-muted mr-2 text-xs uppercase tracking-[0.12em]">token</span>{selectedTokens[0].name}{isDM && <span className="text-muted ml-2 text-xs">{selectedTokens[0].is_hidden ? "Hidden" : "Visible"}</span>}</p>
+            : selectedTokens.length > 1
+              ? <p className="min-w-0 truncate text-sm text-[var(--paper)]">{`${selectedTokens.length} tokens selected`}</p>
+              : selectedStructure
+                ? <p className="min-w-0 truncate text-sm text-[var(--paper)]"><span className="text-muted mr-2 text-xs uppercase tracking-[0.12em]">structure</span>{selectedStructure.kind}<span className="text-muted ml-2 text-xs">{selectedStructure.is_hidden ? "Hidden" : "Visible"}</span></p>
+                : <p className="text-muted min-w-0 truncate text-sm">{isDM ? "Select a token or structure on the map to manage it." : "Select your token on the map to manage it."}</p>}
+          <div className="flex flex-wrap justify-end gap-2" role="group" aria-label="Selected object actions">
+            {isDM && <button className={`btn-secondary min-h-9 shrink-0 px-3 py-1.5 text-xs${hasSelection ? "" : " invisible"}`} type="button" disabled={!hasSelection} aria-hidden={!hasSelection} onClick={toggleSelectedVisibility}>
+              {selectionHides ? <EyeSlash size={16} aria-hidden="true" /> : <Eye size={16} aria-hidden="true" />}
+              {selectionHides ? "Hide from players" : "Reveal to players"}
+            </button>}
+            {removableTokens.length > 0 && <button className="btn-secondary min-h-9 shrink-0 px-3 py-1.5 text-xs" type="button" onClick={removeSelectedTokens}>
+              <Trash size={16} aria-hidden="true" />
+              {confirmRemove ? "Confirm remove" : removableTokens.length > 1 ? `Remove ${removableTokens.length} tokens` : "Remove token"}
+            </button>}
+            {selectedStructure && <button className="btn-secondary min-h-9 shrink-0 px-3 py-1.5 text-xs" type="button" onClick={() => {
+              if (!confirmRemove) {
+                setConfirmRemove(true);
+                return;
+              }
+              if (sendMap("structure.remove", { structureId: selectedStructure.id })) setMapSelection(null);
+            }}>
+              <Trash size={16} aria-hidden="true" />
+              {confirmRemove ? "Confirm remove" : "Remove structure"}
+            </button>}
           </div>
-          <div className="h-[70dvh] min-h-[360px]">
+        </div>
+        <div className="relative min-h-0 flex-1 overflow-hidden">
           <MapCanvas
             state={state}
             selectedTokenIds={mapSelection?.kind === "tokens" ? mapSelection.ids : undefined}
@@ -542,7 +609,6 @@ export function RoomPage() {
             onAction={(request) => sendMap(request.type, request.body)}
             onEditActions={(tokenId) => {
               setActionEditorTokenId(tokenId);
-              setToolsOpen(true);
             }}
             placingStructure={placingStructure ? { kind: structureKind } : null}
             onPlaceStructure={(geometry) => sendMap("structure.create", { kind: structureKind, geometry, ...structureBlocks })}
@@ -551,21 +617,32 @@ export function RoomPage() {
             onPlaceToken={placeToken}
             onCancelTokenPlacement={() => setPlacingToken(null)}
           />
-          </div>
-          {!state.activeMap && <p className="text-muted text-sm">{isDM ? "No map is active. Choose or start one in the Map & tokens controls, or use Place structure to start a blank map." : "No map is active. Ask your game master to choose a room map."}</p>}
+        </div>
+        {!state.activeMap && <p className="text-muted text-sm">{isDM ? "No map is active. Choose or start one in the Map & tokens controls, or use Place structure to start a blank map." : "No map is active. Ask your game master to choose a room map."}</p>}
       </section>
-      <aside className="col-start-1 row-start-3 min-w-0 space-y-6 md:col-start-2 md:row-start-2 2xl:col-start-3 2xl:row-start-1 2xl:[&_.card]:p-5!" aria-label="Room members and chat">
-        <section className="card">
-          <h2 className="flex items-center gap-2 text-xl"><UsersThree size={22} className="text-[var(--accent)]" aria-hidden="true" />At the table</h2>
-          <div className="mt-5 space-y-4">{members.length === 0 ? <p className="text-muted text-sm">No members to display.</p> : members.map((member) => <div className="space-y-2 border-t border-[var(--paper)]/10 pt-3" key={member.user_id}><div className="flex items-start justify-between gap-3"><span className="min-w-0 break-words text-sm"><PresenceDot online={onlineUserIds.has(member.user_id)} /><PlayerName player={{ id: member.user_id, username: member.username, pronouns: member.pronouns }} />{member.user_id === user?.id ? " (you)" : ""}</span><span className="shrink-0 text-xs text-[var(--muted)]">{member.is_dm ? "Game master" : "Player"}</span></div>{(isDM || member.user_id === user?.id) && <label className="block text-xs text-[var(--muted)]">{isDM ? "Assigned character" : "Your character"}<select className="mt-2 w-full text-sm" value={member.sheet_id ?? ""} disabled={busy} onChange={(e) => { const sheetId = e.target.value || null; void update(() => patchJSON(`/api/rooms/${roomId}/members/${member.user_id}`, { sheet_id: sheetId })); }}><option value="">No sheet</option>{roomSheets.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label>}</div>)}</div>
-        </section>
-        {isDM && roomId && <RoomInvitePanel roomId={roomId} memberCount={members.length} />}
-        <RoomChecks checks={state.checks ?? []} members={members} currentUserId={user?.id} isDM={isDM}
-          onRoll={(checkId, userId, options) => sendMap("check.roll", { checkId, userId, ...options })}
-          onClose={(checkId) => sendMap("check.close", { checkId })} />
-        <ChatPanel key={roomId} roomId={roomId ?? ""} messages={state.chatHistory ?? []} hasEarlier={!!state.chatHasEarlier} members={members} isDM={isDM} onSend={(text, recipientUserIds, rollExpression) => send("chat.send", { text, recipientUserIds, rollExpression })} />
+      <aside ref={sideRef} className="flex h-[min(85dvh,720px)] min-h-0 min-w-0 scroll-mt-3 flex-col md:col-span-2 lg:col-span-1 lg:h-full [&_.card]:p-4!" aria-label="Chat, checks and players">
+        <RoomTabs label="Table" idPrefix="room-side" active={sideTab} onChange={setSideTab} className="min-h-0 flex-1" panelClassName="min-h-0 flex-1 overflow-y-auto overscroll-contain" tabs={[
+          { id: "chat", label: "Chat", content: <ChatPanel key={roomId} roomId={roomId ?? ""} messages={state.chatHistory ?? []} hasEarlier={!!state.chatHasEarlier} members={members} isDM={isDM} onSend={(text, recipientUserIds, rollExpression) => send("chat.send", { text, recipientUserIds, rollExpression })} /> },
+          { id: "checks", label: "Checks", count: openCheckCount, content: (state.checks ?? []).length === 0
+            ? <p className="text-muted px-1 text-sm">No checks yet. {isDM ? "Ask for one under Checks in your tools." : "When the game master asks for a roll, it shows up here."}</p>
+            : <RoomChecks checks={state.checks ?? []} members={members} currentUserId={user?.id} isDM={isDM}
+              onRoll={(checkId, userId, options) => sendMap("check.roll", { checkId, userId, ...options })}
+              onClose={(checkId) => sendMap("check.close", { checkId })} /> },
+          { id: "players", label: "Players", count: members.length, content: <div className="space-y-3">
+            <section className="card">
+              <h2 className="flex items-center gap-2 text-xl"><UsersThree size={22} className="text-[var(--accent)]" aria-hidden="true" />At the table</h2>
+              <div className="mt-5 space-y-4">{members.length === 0 ? <p className="text-muted text-sm">No members to display.</p> : members.map((member) => <div className="space-y-2 border-t border-[var(--paper)]/10 pt-3" key={member.user_id}><div className="flex items-start justify-between gap-3"><span className="min-w-0 break-words text-sm"><PresenceDot online={onlineUserIds.has(member.user_id)} /><PlayerName player={{ id: member.user_id, username: member.username, pronouns: member.pronouns }} />{member.user_id === user?.id ? " (you)" : ""}</span><span className="shrink-0 text-xs text-[var(--muted)]">{member.is_dm ? "Game master" : "Player"}</span></div>{(isDM || member.user_id === user?.id) && <label className="block text-xs text-[var(--muted)]">{isDM ? "Assigned character" : "Your character"}<select className="mt-2 w-full text-sm" value={member.sheet_id ?? ""} disabled={busy} onChange={(e) => { const sheetId = e.target.value || null; void update(() => patchJSON(`/api/rooms/${roomId}/members/${member.user_id}`, { sheet_id: sheetId }), ["members"]); }}><option value="">No sheet</option>{roomSheets.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label>}</div>)}</div>
+            </section>
+            {isDM && roomId && <RoomInvitePanel roomId={roomId} memberCount={members.length} />}
+          </div> },
+        ]} />
       </aside>
     </div>
+    {actionEditorToken && <Dialog name={{ labelledBy: `actions-heading-${actionEditorToken.id}` }} wide onClose={() => setActionEditorTokenId(null)}>
+      <ActionsEditor key={actionEditorToken.id} owner={actionEditorToken} busy={busy}
+        onSave={(lists) => void update(() => patchJSON(`/api/rooms/${roomId}/tokens/${actionEditorToken.id}/actions`, lists))}
+        onClose={() => setActionEditorTokenId(null)} />
+    </Dialog>}
   </div>;
 }
 
@@ -597,6 +674,10 @@ function withoutKeys(map: ReadonlyMap<string, Point>, ids: readonly string[]): R
   const next = new Map(map);
   ids.forEach((id) => next.delete(id));
   return next;
+}
+
+function isUserIdBody(body: unknown): body is { user_id: string } {
+  return !!body && typeof body === "object" && "user_id" in body && typeof body.user_id === "string";
 }
 
 function isErrorBody(body: unknown): body is { message: string } {

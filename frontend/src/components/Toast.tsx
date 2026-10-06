@@ -1,11 +1,13 @@
 import { Bell, CheckCircle, WarningCircle, X } from "@phosphor-icons/react";
 import { createContext, useCallback, useContext, useEffect, useRef, useState, type ReactNode } from "react";
 
-export type ToastInput = { kind: "success" | "error" | "info"; message: string };
+/** `action` adds a button that runs it and dismisses the toast; such toasts stay up longer. */
+export type ToastInput = { kind: "success" | "error" | "info"; message: string; action?: { label: string; onClick: () => void } };
 type ToastItem = ToastInput & { id: number };
 
 const MAX_TOASTS = 4;
 const DURATION_MS: Record<ToastInput["kind"], number> = { success: 5000, error: 8000, info: 7000 };
+const ACTION_DURATION_MS = 15000;
 
 const ToastContext = createContext<((toast: ToastInput) => void) | null>(null);
 
@@ -25,7 +27,7 @@ export function ToastProvider({ children }: { children: ReactNode }) {
       const id = ++nextId.current;
       timers.current.set(
         id,
-        window.setTimeout(() => dismiss(id), DURATION_MS[toast.kind]),
+        window.setTimeout(() => dismiss(id), toast.action ? ACTION_DURATION_MS : DURATION_MS[toast.kind]),
       );
       setToasts((current) => {
         const next = [...current, { ...toast, id }];
@@ -65,6 +67,10 @@ export function ToastProvider({ children }: { children: ReactNode }) {
               <CheckCircle aria-hidden="true" size={20} weight="fill" className="shrink-0 text-[var(--green)]" />
             )}
             <p className="min-w-0 flex-1 break-words">{toast.message}</p>
+            {toast.action && <button type="button" className="btn min-h-8 shrink-0 px-3 py-1 text-xs" onClick={() => {
+              toast.action?.onClick();
+              dismiss(toast.id);
+            }}>{toast.action.label}</button>}
             <button
               type="button"
               aria-label="Dismiss notification"

@@ -583,6 +583,9 @@ func (s *Server) handleMemberPatch(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	row, err := s.oneJSON(r.Context(), `update room_members set sheet_id=case when $5 then $3::uuid else sheet_id end, is_dm=coalesce($4,is_dm) where room_id=$1 and user_id=$2 returning jsonb_build_object('id',id::text,'room_id',room_id::text,'user_id',user_id::text,'sheet_id',sheet_id::text,'is_dm',is_dm)`, roomID, target, sheetID, dmChange, setSheet)
+	if err == nil {
+		s.Hub.PublishMemberUpdated(roomID, target)
+	}
 	respondRaw(w, row, err)
 }
 

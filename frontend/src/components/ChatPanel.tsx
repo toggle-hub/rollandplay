@@ -86,7 +86,7 @@ export function ChatPanel({ roomId, messages, hasEarlier, members, isDM, onSend 
     try { onSend(text, chosenRecipients, roll.trim() || undefined); justSent.current = true; setText(""); setRoll(""); }
     catch (err) { setError(err instanceof Error ? err.message : "Could not send your message."); }
   }
-  return <section className="flex min-w-0 flex-col overflow-hidden rounded-xl border border-[var(--line)] bg-[var(--surface)]" aria-labelledby="chat-heading">
+  return <section className="flex h-full min-h-0 min-w-0 flex-col overflow-hidden rounded-xl border border-[var(--line)] bg-[var(--surface)]" aria-labelledby="chat-heading">
     <header className="flex items-center gap-3 border-b border-[var(--line)] px-4 py-4">
       <span className="grid size-9 shrink-0 place-items-center rounded-lg bg-[var(--purple)]/15 text-[var(--purple)]"><ChatCircle size={20} weight="duotone" aria-hidden="true" /></span>
       <div>
@@ -94,7 +94,7 @@ export function ChatPanel({ roomId, messages, hasEarlier, members, isDM, onSend 
         <p className="mb-0 mt-0.5 text-xs text-[var(--muted)]">The story between the rolls.</p>
       </div>
     </header>
-    <div ref={feedRef} role="log" aria-label="Room messages" aria-live="polite" aria-relevant="additions" tabIndex={0} className="h-80 max-h-[50dvh] min-h-48 space-y-4 overflow-y-auto overscroll-contain p-4">
+    <div ref={feedRef} role="log" aria-label="Room messages" aria-live="polite" aria-relevant="additions" tabIndex={0} className="min-h-48 flex-1 space-y-4 overflow-y-auto overscroll-contain p-4">
       {feed.canLoadEarlier && feed.messages.length > 0 && <div className="flex flex-col items-center gap-1.5">
         <button type="button" className="rounded-md border border-[var(--line)] px-3 py-1.5 text-xs text-[var(--lavender)] transition-colors hover:border-[var(--lavender)] disabled:opacity-60" onClick={() => void loadEarlier()} disabled={loadingEarlier}>{loadingEarlier ? "Loading earlier messages…" : "Load earlier messages"}</button>
         {earlierError && <p role="alert" className="mb-0 text-xs text-[var(--pink)]">{earlierError}</p>}

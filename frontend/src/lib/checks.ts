@@ -1,4 +1,4 @@
-import type { CheckKind } from "../api/types";
+import type { CheckKind, RoomCheck } from "../api/types";
 import { dndAbilities } from "./attacks";
 
 /** Built-in D&D book skills; the server maps each to its ability (Go `DnDSkillAbility`). */
@@ -32,4 +32,9 @@ export function defaultCheckKey(kind: CheckKind): string {
 export function humanizeKey(key: string): string {
   const text = key.replaceAll("_", " ");
   return text.charAt(0).toUpperCase() + text.slice(1);
+}
+
+/** An open check that still waits for `userId` to roll. */
+export function isPendingFor(check: RoomCheck, userId: string | undefined): boolean {
+  return !check.closed_at && !!userId && check.targets.some((target) => target.user_id === userId && !target.roll);
 }
