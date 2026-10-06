@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MapCanvas } from "./MapCanvas";
 import type { ResolvedTokenAction, RoomToken, VisibleRoomState } from "../api/types";
@@ -110,17 +110,20 @@ describe("MapCanvas", () => {
     globalThis.__canvasContext.fillText.mockClear();
   });
   it.each(["release", "pointercancel", "lostcapture", "Escape", "blur", "chorded release"])(
-    "shows the ruler only during a right drag and hides it on %s, including late server results",
+    "measures locally during a right drag and takes the shared ruler back on %s",
     (end) => {
       const measure = vi.fn();
-      const { container, rerender } = render(<MapCanvas state={state} onMeasure={measure} />);
+      const measureEnd = vi.fn();
+      const { container } = render(<MapCanvas state={state} onMeasure={measure} onMeasureEnd={measureEnd} />);
       const canvas = container.querySelector("canvas")!;
       const ctx = globalThis.__canvasContext;
       fireEvent.pointerDown(canvas, { clientX: 0, clientY: 0, button: 2, buttons: 2 });
       fireEvent.pointerMove(canvas, { clientX: 216, clientY: 0, buttons: 2 });
       expect(measure).toHaveBeenCalledWith({ x: 0, y: 0 }, { x: 3, y: 0 });
-      rerender(<MapCanvas state={state} onMeasure={measure} rulerDistanceMeters={3} />);
-      expect(ctx.fillText).toHaveBeenCalledWith("3.00 m", expect.any(Number), expect.any(Number));
+      // The distance shows at once, to one decimal place, without waiting for the server.
+      expect(ctx.fillText).toHaveBeenCalledWith("3 m · 3 squares", expect.any(Number), expect.any(Number));
+      fireEvent.pointerMove(canvas, { clientX: 216, clientY: 108, buttons: 2 });
+      expect(ctx.fillText).toHaveBeenCalledWith("3.4 m · 3 squares", expect.any(Number), expect.any(Number));
       ctx.fillText.mockClear();
       if (end === "release") fireEvent.pointerUp(canvas, { clientX: 216, clientY: 0, button: 2 });
       else if (end === "pointercancel") fireEvent.pointerCancel(canvas);
@@ -129,17 +132,26 @@ describe("MapCanvas", () => {
       else if (end === "blur") fireEvent(window, new Event("blur"));
       else fireEvent.mouseUp(canvas, { button: 2, buttons: 1 });
       expect(ctx.fillText).not.toHaveBeenCalled();
+      expect(measureEnd).toHaveBeenCalledTimes(1);
       measure.mockClear();
-      rerender(<MapCanvas state={state} onMeasure={measure} rulerDistanceMeters={4} />);
       fireEvent.pointerMove(canvas, { clientX: 288, clientY: 0, buttons: 0 });
       expect(ctx.fillText).not.toHaveBeenCalled();
       expect(measure).not.toHaveBeenCalled();
+      expect(measureEnd).toHaveBeenCalledTimes(1);
     },
   );
 
+  it("draws the rulers others at the table are holding, with who is measuring", () => {
+    const { rerender } = render(<MapCanvas state={state} remoteRulers={[{ id: "c1", from: { x: 0, y: 0 }, to: { x: 0, y: 4.5 }, name: "Ana" }]} />);
+    expect(globalThis.__canvasContext.fillText).toHaveBeenCalledWith("Ana · 4.5 m · 5 squares", expect.any(Number), expect.any(Number));
+    globalThis.__canvasContext.fillText.mockClear();
+    rerender(<MapCanvas state={state} remoteRulers={[]} />);
+    expect(globalThis.__canvasContext.fillText).not.toHaveBeenCalled();
+  });
+
   it("does not measure when dragging empty space with the left button", () => {
     const measure = vi.fn();
-    const { container } = render(<MapCanvas state={state} onMeasure={measure} rulerDistanceMeters={3} />);
+    const { container } = render(<MapCanvas state={state} onMeasure={measure} />);
     const canvas = container.querySelector("canvas")!;
     fireEvent.pointerDown(canvas, { clientX: 0, clientY: 0, button: 0 });
     fireEvent.pointerMove(canvas, { clientX: 216, clientY: 0, buttons: 1 });
@@ -302,9 +314,9 @@ describe("MapCanvas", () => {
       fireEvent.pointerDown(canvas, { clientX: 72, clientY: 72, button: 0 });
       fireEvent.pointerMove(canvas, { clientX: 216, clientY: 144 });
       expect(onDragTokens).toHaveBeenLastCalledWith([{ tokenId: "token", to: { x: 3, y: 2 } }]);
-      expect(arc).toHaveBeenCalledWith(72, 48, 12, 0, Math.PI * 2);
+      expect(arc).toHaveBeenCalledWith(216, 144, 36, 0, Math.PI * 2);
       // Not snapped without Shift.
-      expect(arc).not.toHaveBeenCalledWith(84, 60, 12, 0, Math.PI * 2);
+      expect(arc).not.toHaveBeenCalledWith(252, 180, 36, 0, Math.PI * 2);
       fireEvent.pointerUp(canvas, { clientX: 217, clientY: 145 });
       expect(onMoveToken).toHaveBeenCalledExactlyOnceWith("token", { x: 3.01, y: 2.01 }, [{ x: 1, y: 1 }, { x: 3.01, y: 2.01 }]);
       fireEvent.lostPointerCapture(canvas);
@@ -319,13 +331,13 @@ describe("MapCanvas", () => {
       arc.mockClear();
       // Pressing Shift snaps the token at once, without moving the pointer, and the table sees it snap too.
       fireEvent.keyDown(canvas, { key: "Shift", shiftKey: true });
-      expect(arc).toHaveBeenCalledWith(84, 60, 12, 0, Math.PI * 2);
-      expect(arc).not.toHaveBeenCalledWith(72, 48, 12, 0, Math.PI * 2);
+      expect(arc).toHaveBeenCalledWith(252, 180, 36, 0, Math.PI * 2);
+      expect(arc).not.toHaveBeenCalledWith(216, 144, 36, 0, Math.PI * 2);
       expect(onDragTokens).toHaveBeenLastCalledWith([{ tokenId: "token", to: { x: 3.5, y: 2.5 } }]);
       arc.mockClear();
       fireEvent.keyUp(canvas, { key: "Shift" });
-      expect(arc).toHaveBeenCalledWith(72, 48, 12, 0, Math.PI * 2);
-      expect(arc).not.toHaveBeenCalledWith(84, 60, 12, 0, Math.PI * 2);
+      expect(arc).toHaveBeenCalledWith(216, 144, 36, 0, Math.PI * 2);
+      expect(arc).not.toHaveBeenCalledWith(252, 180, 36, 0, Math.PI * 2);
       expect(onDragTokens).toHaveBeenLastCalledWith([{ tokenId: "token", to: { x: 3, y: 2 } }]);
       fireEvent.pointerUp(canvas, { clientX: 216, clientY: 144, shiftKey: true });
       expect(onMoveToken).toHaveBeenCalledExactlyOnceWith("token", { x: 3.5, y: 2.5 }, [{ x: 1, y: 1 }, { x: 3.5, y: 2.5 }]);
@@ -351,7 +363,7 @@ describe("MapCanvas", () => {
       fireEvent.pointerDown(canvas, { clientX: 72, clientY: 72, button: 0 });
       arc.mockClear();
       fireEvent.pointerMove(canvas, { clientX: 216, clientY: 144 });
-      expect(arc).not.toHaveBeenCalledWith(24, 24, 12, 0, Math.PI * 2);
+      expect(arc).not.toHaveBeenCalledWith(72, 72, 36, 0, Math.PI * 2);
     });
 
     describe("into walls", () => {
@@ -399,8 +411,8 @@ describe("MapCanvas", () => {
       const arc = globalThis.__canvasContext.arc;
       arc.mockClear();
       render(<MapCanvas state={{ ...state, visibleTokens: [token] }} remoteDragPositions={new Map([["token", { x: 5, y: 5 }]])} />);
-      expect(arc).toHaveBeenCalledWith(120, 120, 12, 0, Math.PI * 2);
-      expect(arc).not.toHaveBeenCalledWith(24, 24, 12, 0, Math.PI * 2);
+      expect(arc).toHaveBeenCalledWith(360, 360, 36, 0, Math.PI * 2);
+      expect(arc).not.toHaveBeenCalledWith(72, 72, 36, 0, Math.PI * 2);
     });
 
     it("moves the viewer's fog of war with their token while dragging and after the drop", () => {
@@ -414,25 +426,25 @@ describe("MapCanvas", () => {
       const { container, rerender } = render(<MapCanvas state={fogged()} onMoveToken={vi.fn()} />);
       const canvas = container.querySelector("canvas")!;
       // At rest the server's polygon is drawn as sent.
-      expect(moveTo).toHaveBeenCalledWith(12, 6);
+      expect(moveTo).toHaveBeenCalledWith(36, 18);
 
       fireEvent.pointerDown(canvas, { clientX: 72, clientY: 72, button: 0 });
       moveTo.mockClear();
       fireEvent.pointerMove(canvas, { clientX: 216, clientY: 144 });
       // Recast around the token under the pointer at (3, 2): its first ray ends 10 m east.
-      expect(moveTo).toHaveBeenCalledWith(13 * 24, 2 * 24);
-      expect(moveTo).not.toHaveBeenCalledWith(12, 6);
+      expect(moveTo).toHaveBeenCalledWith(13 * 72, 2 * 72);
+      expect(moveTo).not.toHaveBeenCalledWith(36, 18);
       fireEvent.pointerUp(canvas, { clientX: 216, clientY: 144 });
 
       // The dropped token sits on its landing cell before the server recasts its vision.
       moveTo.mockClear();
       const landed = { ...token, x_m: 3.5, y_m: 2.5 };
       rerender(<MapCanvas state={fogged([landed])} onMoveToken={vi.fn()} />);
-      expect(moveTo).toHaveBeenCalledWith(13.5 * 24, 2.5 * 24);
+      expect(moveTo).toHaveBeenCalledWith(13.5 * 72, 2.5 * 72);
 
       moveTo.mockClear();
       rerender(<MapCanvas state={fogged([landed], [{ ...area, origin: { x: 3.5, y: 2.5 } }])} onMoveToken={vi.fn()} />);
-      expect(moveTo).toHaveBeenCalledWith(12, 6);
+      expect(moveTo).toHaveBeenCalledWith(36, 18);
     });
   });
 
@@ -455,10 +467,10 @@ describe("MapCanvas", () => {
     expect(moveStructure).toHaveBeenCalledWith("wall", [{ x: 3, y: 2 }, { x: 3, y: 4 }]);
   });
 
-  // Vertical wall centred on (2, 4); its padded frame tops out at y = 2.75 m,
-  // so the rotate handle sits 24 canvas px (1 m) above, at (2, 1.75).
+  // Vertical wall centred on (2, 4); at 72 px per meter its frame is padded 6 px above y = 3 m and the rotate
+  // handle sits 24 px (a third of a meter) above that, at (2, 2.58).
   const lowWall = { ...wall, geometry: [{ x: 2, y: 3 }, { x: 2, y: 5 }] };
-  const lowWallHandle: [number, number] = [2, 1.75];
+  const lowWallHandle: [number, number] = [2, 3 - 30 / 72];
 
   it("rotates the selected structure by dragging its round handle, ahead of tokens underneath", () => {
     const moveStructure = vi.fn();
@@ -466,7 +478,7 @@ describe("MapCanvas", () => {
     const select = vi.fn();
     const { container } = render(
       <MapCanvas
-        state={{ ...state, structures: [lowWall], visibleTokens: [{ ...hero, x_m: 2, y_m: 1.75 }] }}
+        state={{ ...state, structures: [lowWall], visibleTokens: [{ ...hero, x_m: 2, y_m: 2.5 }] }}
         selectedStructureId="wall"
         canMoveStructures
         onMoveStructure={moveStructure}
@@ -475,17 +487,17 @@ describe("MapCanvas", () => {
       />,
     );
     const canvas = container.querySelector("canvas")!;
-    fireEvent.pointerMove(canvas, { clientX: 144, clientY: 126 });
+    fireEvent.pointerMove(canvas, { clientX: 144, clientY: 186 });
     expect(canvas.style.cursor).toBe("grab");
     fireEvent.pointerMove(canvas, { clientX: 144, clientY: 288 });
     expect(canvas.style.cursor).toBe("move");
 
     globalThis.__canvasContext.arc.mockClear();
-    fireEvent.pointerDown(canvas, { clientX: 144, clientY: 126, button: 0 });
+    fireEvent.pointerDown(canvas, { clientX: 144, clientY: 186, button: 0 });
     expect(canvas.style.cursor).toBe("grabbing");
     fireEvent.pointerMove(canvas, { clientX: 288, clientY: 288 });
     // The handle follows the pointer around the centre instead of snapping to a new bounding box.
-    expect(globalThis.__canvasContext.arc).toHaveBeenLastCalledWith(102, 96, 7, 0, Math.PI * 2);
+    expect(globalThis.__canvasContext.arc).toHaveBeenLastCalledWith(246.24, 288, 7, 0, Math.PI * 2);
     fireEvent.pointerUp(canvas, { clientX: 288, clientY: 288 });
     expect(moveStructure).toHaveBeenCalledExactlyOnceWith("wall", [{ x: 3, y: 4 }, { x: 1, y: 4 }]);
     expect(moveToken).not.toHaveBeenCalled();
@@ -534,7 +546,7 @@ describe("MapCanvas", () => {
     const { container } = render(
       <MapCanvas state={{ ...state, structures: [topWall] }} selectedStructureId="wall" canMoveStructures onMoveStructure={moveStructure} />,
     );
-    dragStructure(container.querySelector("canvas")!, [2.5, 1.25], [4.5, 0]);
+    dragStructure(container.querySelector("canvas")!, [2.5, 30 / 72], [4.5, 0]);
     expect(moveStructure).toHaveBeenCalledExactlyOnceWith("wall", [{ x: 2.5, y: 1.5 }, { x: 2.5, y: -1.5 }]);
   });
 
@@ -544,7 +556,7 @@ describe("MapCanvas", () => {
       <MapCanvas state={{ ...state, structures: [lowWall] }} selectedStructureId="wall" canMoveStructures onMoveStructure={moveStructure} />,
     );
     const canvas = container.querySelector("canvas")!;
-    fireEvent.pointerDown(canvas, { clientX: 144, clientY: 126, button: 0 });
+    fireEvent.pointerDown(canvas, { clientX: 144, clientY: 186, button: 0 });
     fireEvent.pointerMove(canvas, { clientX: 288, clientY: 288 });
     if (cancel === "Escape") fireEvent.keyDown(canvas, { key: "Escape" });
     else fireEvent.pointerCancel(canvas);
@@ -562,7 +574,7 @@ describe("MapCanvas", () => {
       <MapCanvas state={roomState} selectedStructureId="wall" canMoveStructures onMoveStructure={moveStructure} />,
     );
     const canvas = container.querySelector("canvas")!;
-    fireEvent.pointerDown(canvas, { clientX: 144, clientY: 126, button: 0 });
+    fireEvent.pointerDown(canvas, { clientX: 144, clientY: 186, button: 0 });
     fireEvent.pointerMove(canvas, { clientX: 288, clientY: 288 });
     rerender(<MapCanvas state={roomState} selectedStructureId="wall" canMoveStructures={false} onMoveStructure={moveStructure} />);
     fireEvent.pointerUp(canvas, { clientX: 288, clientY: 288 });
@@ -675,7 +687,7 @@ describe("MapCanvas", () => {
     expect(screen.getByRole("status")).toHaveTextContent("Fire burst · 1 m radius — click where it lands");
     arc.mockClear();
     fireEvent.pointerMove(canvas, { clientX: 2.5 * 72, clientY: 2 * 72 });
-    expect(arc).toHaveBeenCalledWith(60, 48, 24, 0, Math.PI * 2);
+    expect(arc).toHaveBeenCalledWith(180, 144, 72, 0, Math.PI * 2);
 
     clickAt(canvas, 4, 2);
     expect(screen.getByRole("status")).toHaveTextContent("Blocked by a structure");
@@ -823,7 +835,7 @@ describe("MapCanvas", () => {
         ]}
       />,
     );
-    expect(fillText).toHaveBeenCalledWith("-7", 60, 2);
+    expect(fillText).toHaveBeenCalledWith("-7", 180, 26);
     expect(fillText).not.toHaveBeenCalledWith("Miss", expect.any(Number), expect.any(Number));
   });
 
@@ -862,5 +874,209 @@ describe("MapCanvas", () => {
     const { container } = render(<MapCanvas state={state} placingStructure={{ kind: "door" }} onPlaceStructure={vi.fn()} onCancelPlacement={cancel} />);
     fireEvent.keyDown(container.querySelector("canvas")!, { key: "Escape" });
     expect(cancel).toHaveBeenCalledTimes(1);
+  });
+
+  describe("camera", () => {
+    it("starts fitted, zooms with the buttons and the wheel around the pointer, and Fit brings the whole map back", () => {
+      const move = vi.fn();
+      const token = { ...tokenBase, id: "token", name: "Hero", x_m: 4, y_m: 4 };
+      const { container } = render(<MapCanvas state={{ ...state, visibleTokens: [token] }} onMoveToken={move} />);
+      const canvas = container.querySelector("canvas")!;
+      const view = screen.getByRole("group", { name: "Map view" });
+      expect(view).toHaveTextContent("300%");
+
+      // Zooming in 25% around the view's centre puts map point (4, 4) at 4 × 90 − 90 = 270 px.
+      fireEvent.click(screen.getByRole("button", { name: "Zoom in" }));
+      expect(view).toHaveTextContent("375%");
+      fireEvent.pointerDown(canvas, { clientX: 270, clientY: 270, button: 0 });
+      fireEvent.pointerMove(canvas, { clientX: 360, clientY: 270 });
+      fireEvent.pointerUp(canvas, { clientX: 360, clientY: 270 });
+      expect(move).toHaveBeenCalledExactlyOnceWith("token", { x: 5, y: 4 }, [{ x: 4, y: 4 }, { x: 5, y: 4 }]);
+
+      fireEvent.click(screen.getByRole("button", { name: "Fit the whole map in view" }));
+      expect(view).toHaveTextContent("300%");
+      // The wheel zooms around the pointer: the map corner under it stays put, so (4, 4) is now 4 m × 24 × 3.66 px away.
+      fireEvent.wheel(canvas, { deltaY: -100, clientX: 0, clientY: 0 });
+      expect(view).toHaveTextContent("366%");
+      const meter = 24 * 3 * Math.exp(0.2);
+      move.mockClear();
+      fireEvent.pointerDown(canvas, { clientX: 4 * meter, clientY: 4 * meter, button: 0 });
+      fireEvent.pointerMove(canvas, { clientX: 4 * meter, clientY: 5 * meter });
+      fireEvent.pointerUp(canvas, { clientX: 4 * meter, clientY: 5 * meter });
+      expect(move).toHaveBeenCalledExactlyOnceWith("token", { x: 4, y: 5 }, [{ x: 4, y: 4 }, { x: 4, y: 5 }]);
+    });
+
+    it("pans with the middle button without touching tokens", () => {
+      const move = vi.fn();
+      const select = vi.fn();
+      const token = { ...tokenBase, id: "token", name: "Hero", x_m: 1, y_m: 1 };
+      const { container } = render(<MapCanvas state={{ ...state, visibleTokens: [token] }} onMoveToken={move} onSelect={select} />);
+      const canvas = container.querySelector("canvas")!;
+      fireEvent.pointerDown(canvas, { clientX: 72, clientY: 72, button: 1 });
+      fireEvent.pointerMove(canvas, { clientX: 144, clientY: 72 });
+      fireEvent.pointerUp(canvas, { clientX: 144, clientY: 72, button: 1 });
+      expect(move).not.toHaveBeenCalled();
+      expect(select).not.toHaveBeenCalled();
+      // The token now sits 72 px further right.
+      fireEvent.pointerDown(canvas, { clientX: 144, clientY: 72, button: 0 });
+      fireEvent.pointerMove(canvas, { clientX: 216, clientY: 72 });
+      fireEvent.pointerUp(canvas, { clientX: 216, clientY: 72 });
+      expect(move).toHaveBeenCalledExactlyOnceWith("token", { x: 2, y: 1 }, [{ x: 1, y: 1 }, { x: 2, y: 1 }]);
+    });
+  });
+
+  describe("touch", () => {
+    class TouchPointerEvent extends MouseEvent {
+      pointerType: string;
+      pointerId: number;
+      constructor(type: string, init: MouseEventInit & { pointerType?: string; pointerId?: number } = {}) {
+        super(type, init);
+        this.pointerType = init.pointerType ?? "mouse";
+        this.pointerId = init.pointerId ?? 1;
+      }
+    }
+    beforeEach(() => vi.stubGlobal("PointerEvent", TouchPointerEvent));
+    afterEach(() => vi.useRealTimers());
+    const touch = { pointerType: "touch", button: 0 };
+
+    it("opens the action wheel when a finger is held on a token the player controls, without moving it", () => {
+      vi.useFakeTimers();
+      const move = vi.fn();
+      const canvas = renderActionMap({ onMoveToken: move });
+      fireEvent.pointerDown(canvas, { ...touch, pointerId: 1, clientX: 72, clientY: 72 });
+      act(() => vi.advanceTimersByTime(499));
+      expect(screen.queryByRole("menu")).not.toBeInTheDocument();
+      act(() => vi.advanceTimersByTime(1));
+      expect(screen.getByRole("menu", { name: "Hero actions" })).toBeInTheDocument();
+      fireEvent.pointerUp(canvas, { ...touch, pointerId: 1, clientX: 72, clientY: 72 });
+      expect(screen.getByRole("menu", { name: "Hero actions" })).toBeInTheDocument();
+      expect(move).not.toHaveBeenCalled();
+    });
+
+    it("drags instead when the finger moves before the long press", () => {
+      vi.useFakeTimers();
+      const move = vi.fn();
+      const canvas = renderActionMap({ onMoveToken: move });
+      fireEvent.pointerDown(canvas, { ...touch, pointerId: 1, clientX: 72, clientY: 72 });
+      fireEvent.pointerMove(canvas, { ...touch, pointerId: 1, clientX: 72, clientY: 144 });
+      act(() => vi.advanceTimersByTime(600));
+      expect(screen.queryByRole("menu")).not.toBeInTheDocument();
+      fireEvent.pointerUp(canvas, { ...touch, pointerId: 1, clientX: 72, clientY: 144 });
+      expect(move).toHaveBeenCalledExactlyOnceWith("hero", { x: 1, y: 2 }, [{ x: 1, y: 1 }, { x: 1, y: 2 }]);
+    });
+
+    it("pinches to zoom and pans with two fingers", () => {
+      const move = vi.fn();
+      const canvas = renderActionMap({ onMoveToken: move });
+      fireEvent.pointerDown(canvas, { ...touch, pointerId: 1, clientX: 300, clientY: 360 });
+      fireEvent.pointerDown(canvas, { ...touch, pointerId: 2, clientX: 420, clientY: 360 });
+      fireEvent.pointerMove(canvas, { ...touch, pointerId: 2, clientX: 540, clientY: 360 });
+      expect(screen.getByRole("group", { name: "Map view" })).toHaveTextContent("600%");
+      fireEvent.pointerUp(canvas, { ...touch, pointerId: 2, clientX: 540, clientY: 360 });
+      fireEvent.pointerUp(canvas, { ...touch, pointerId: 1, clientX: 300, clientY: 360 });
+      expect(move).not.toHaveBeenCalled();
+    });
+  });
+
+  it("opens the action wheel of the selected token from its Actions button or with Enter", () => {
+    const { container } = render(
+      <MapCanvas state={{ ...state, visibleTokens: [hero, goblin] }} selectedTokenIds={["hero"]} onAction={vi.fn()} />,
+    );
+    const canvas = container.querySelector("canvas")!;
+    fireEvent.click(screen.getByRole("button", { name: "Actions for Hero" }));
+    expect(screen.getByRole("menu", { name: "Hero actions" })).toBeInTheDocument();
+    fireEvent.keyDown(screen.getByRole("menuitem", { name: "Attacks" }), { key: "Escape" });
+    expect(screen.queryByRole("menu")).not.toBeInTheDocument();
+    fireEvent.keyDown(canvas, { key: "Enter" });
+    expect(screen.getByRole("menu", { name: "Hero actions" })).toBeInTheDocument();
+  });
+
+  it("offers no Actions button for a selected token the viewer cannot act with", () => {
+    render(<MapCanvas state={{ ...state, visibleTokens: [hero, goblin] }} selectedTokenIds={["goblin"]} onAction={vi.fn()} />);
+    expect(screen.queryByRole("button", { name: /^Actions for/ })).not.toBeInTheDocument();
+  });
+
+  it("keeps targeting after a click on empty space and keeps the confirm card after a click on the map", () => {
+    const action = vi.fn();
+    const canvas = renderActionMap({ onAction: action });
+    choose(canvas, "Attacks", /Sword/);
+    clickAt(canvas, 6, 6);
+    expect(screen.getByRole("status")).toHaveTextContent("Sword · 1.5 m — No target there — click a highlighted target");
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+
+    clickAt(canvas, 2.5, 1);
+    expect(screen.getByRole("dialog", { name: "Confirm Sword" })).toBeInTheDocument();
+    clickAt(canvas, 6, 6);
+    expect(screen.getByRole("dialog", { name: "Confirm Sword" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Roll" })).toHaveFocus();
+    fireEvent.click(screen.getByRole("button", { name: "Roll" }));
+    expect(action).toHaveBeenCalledExactlyOnceWith({
+      type: "action.resolve",
+      body: { sourceTokenId: "hero", source: "attack", actionId: "sword", targetTokenId: "goblin" },
+    });
+  });
+
+  describe("placing a new token", () => {
+    function renderPlacing(roomState = { ...state, visibleTokens: [goblin] }) {
+      const place = vi.fn();
+      const cancel = vi.fn();
+      const select = vi.fn();
+      const { container } = render(
+        <MapCanvas state={roomState} placingToken={{ label: "Goblin 2", sizeM: 1 }} onPlaceToken={place} onCancelTokenPlacement={cancel} onSelect={select} />,
+      );
+      return { canvas: container.querySelector("canvas")!, place, cancel, select };
+    }
+
+    it("drops the token where the map is clicked, off any token already there", () => {
+      const { canvas, place, select } = renderPlacing();
+      expect(screen.getByRole("status")).toHaveTextContent("Placing Goblin 2 — click the map where it should stand");
+      clickAt(canvas, 6, 6);
+      expect(place).toHaveBeenLastCalledWith({ x: 6, y: 6 });
+      clickAt(canvas, 2.5, 1);
+      const at = place.mock.lastCall![0];
+      expect(Math.hypot(at.x - 2.5, at.y - 1)).toBeGreaterThanOrEqual(0.99);
+      expect(Math.hypot(at.x - 2.5, at.y - 1)).toBeLessThan(1.5);
+      expect(select).not.toHaveBeenCalled();
+    });
+
+    it("stops with Escape", () => {
+      const { canvas, place, cancel } = renderPlacing();
+      fireEvent.keyDown(canvas, { key: "Escape" });
+      expect(cancel).toHaveBeenCalledTimes(1);
+      expect(place).not.toHaveBeenCalled();
+    });
+
+    it("places only where the viewer can see once they have sight under fog", () => {
+      const area = { tokenId: "hero", origin: { x: 1, y: 1 }, polygon: [{ x: 0, y: 0 }, { x: 4, y: 0 }, { x: 4, y: 4 }, { x: 0, y: 4 }] };
+      const { canvas, place } = renderPlacing({
+        ...state, visibleTokens: [hero], visibility: { fog: true, visionAreas: [area], visibleTokenIds: ["hero"], visibleStructureIds: [] },
+      });
+      clickAt(canvas, 8, 8);
+      expect(place).not.toHaveBeenCalled();
+      expect(screen.getByRole("status")).toHaveTextContent("You can only place it where you can see");
+      clickAt(canvas, 3, 3);
+      expect(place).toHaveBeenCalledExactlyOnceWith({ x: 3, y: 3 });
+    });
+
+    it("places anywhere under fog when the viewer has no sight yet", () => {
+      const { canvas, place } = renderPlacing({
+        ...state, visibility: { fog: true, visionAreas: [], visibleTokenIds: [], visibleStructureIds: [] },
+      });
+      clickAt(canvas, 8, 8);
+      expect(place).toHaveBeenCalledExactlyOnceWith({ x: 8, y: 8 });
+    });
+  });
+
+  it("shows how far a dragged token walked, and its speed once it walks further", () => {
+    const fillText = globalThis.__canvasContext.fillText;
+    const token = { ...tokenBase, id: "token", name: "Hero", x_m: 1, y_m: 1, speed_m: 2 };
+    const { container } = render(<MapCanvas state={{ ...state, visibleTokens: [token] }} onMoveToken={vi.fn()} />);
+    const canvas = container.querySelector("canvas")!;
+    fireEvent.pointerDown(canvas, { clientX: 72, clientY: 72, button: 0 });
+    fireEvent.pointerMove(canvas, { clientX: 144, clientY: 72 });
+    expect(fillText).toHaveBeenCalledWith("1 m · 1 square", expect.any(Number), expect.any(Number));
+    fireEvent.pointerMove(canvas, { clientX: 288, clientY: 72 });
+    expect(fillText).toHaveBeenCalledWith("3 m · 3 squares · speed 2 m", expect.any(Number), expect.any(Number));
+    fireEvent.pointerUp(canvas, { clientX: 288, clientY: 72 });
   });
 });

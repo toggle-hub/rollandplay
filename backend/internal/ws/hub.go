@@ -43,6 +43,7 @@ type client struct {
 	dragging     []string     // token IDs of this connection's live drag; touched only on the read goroutine
 	dragTokens   []game.Token // room tokens cached for drag frames
 	dragTokensAt time.Time
+	measuring    bool // this connection's ruler is shown to the table; touched only on the read goroutine
 }
 type envelope struct {
 	Type      string  `json:"type"`
@@ -278,6 +279,7 @@ func (c *client) writeLoop() {
 }
 func (c *client) close() {
 	c.endDrag()
+	c.clearRuler()
 	closed := false
 	c.hub.mu.Lock()
 	if c.hub.clients[c] {
@@ -355,15 +357,9 @@ func (c *client) handle(msg clientEnvelope) {
 	case "combat.end":
 		c.combatEnd(msg)
 	case "ruler.measure":
-		var req struct {
-			From game.Point `json:"from"`
-			To   game.Point `json:"to"`
-		}
-		if json.Unmarshal(msg.Body, &req) != nil {
-			c.error(msg.RequestID, "bad_json", "invalid body")
-			return
-		}
-		c.send <- envelope{Type: "ruler.result", RequestID: &msg.RequestID, Body: map[string]any{"room_id": c.roomID, "meters": game.MeasureDistanceMeters(req.From, req.To)}}
+		c.rulerMeasure(msg)
+	case "ruler.clear":
+		c.clearRuler()
 	default:
 		c.error(msg.RequestID, "unknown_type", "unknown websocket message type")
 	}

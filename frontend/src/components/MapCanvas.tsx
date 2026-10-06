@@ -1,13 +1,19 @@
-import { useEffect, useRef, useState, type MouseEvent, type PointerEvent } from "react";
+import { useEffect, useLayoutEffect, useRef, useState, type MouseEvent, type PointerEvent } from "react";
+import { Sword } from "@phosphor-icons/react";
 import { assetURL } from "../api/client";
 import type { MapStructure, RoomToken, VisibleRoomState } from "../api/types";
 import { choiceRequest, choiceTargeting, choiceTitle, choiceUsesD20, confirmLines, type ActionRequest, type FloatTone, type WheelChoice } from "../lib/actions";
 import { attackLineBlocked, attackTargetStatus, type AttackTargetStatus } from "../lib/attacks";
+import { drawLabel } from "../lib/canvasLabel";
+import { distanceLabel, formatMeters, pathLength } from "../lib/distance";
 import { geometryCenter, rotateGeometry, type Point } from "../lib/geometryTransforms";
+import { clampCamera, fitCamera, mapToView, pinchCamera, pixelsPerMeter, viewToMap, wheelZoomFactor, zoomAt, type Camera, type Size } from "../lib/mapCamera";
+import type { RemoteRuler } from "../lib/rulers";
 import { structureLabel, templateGeometry } from "../lib/structures";
 import { extendPath, movementBarriers, walkToken } from "../lib/movement";
 import { clampTokenCenter, snapTokenCenter } from "../lib/tokenGrid";
 import { drawToken, drawTokenLabels } from "../lib/tokenDrawing";
+import { placementSpot } from "../lib/tokenPlacement";
 import { castVision } from "../lib/vision";
 import { ActionConfirmCard } from "./ActionConfirmCard";
 import { TokenActionWheel } from "./TokenActionWheel";
@@ -21,12 +27,16 @@ type Props = {
   selectedStructureId?: string;
   movableTokenIds?: ReadonlySet<string>;
   canMoveStructures?: boolean;
-  rulerDistanceMeters?: number;
   /** `path` is the way the token walked around movement-blocking structures, from where it started to `to`. */
   onMoveToken?: (tokenId: string, to: Point, path: Point[]) => void;
   onMoveTokens?: (moves: TokenMove[]) => void;
   onMoveStructure?: (structureId: string, geometry: Point[]) => void;
+  /** Called while the viewer holds a ruler, so the table can see it. */
   onMeasure?: (from: Point, to: Point) => void;
+  /** The viewer's ruler was released or cancelled. */
+  onMeasureEnd?: () => void;
+  /** Rulers others at the table are holding right now. */
+  remoteRulers?: readonly RemoteRuler[];
   onSelect?: (selection: MapSelection | null) => void;
   /** Sent when the viewer presses Roll on the confirm card of an action, check or death save. */
   onAction?: (request: ActionRequest) => void;
@@ -35,6 +45,11 @@ type Props = {
   placingStructure?: { kind: string } | null;
   onPlaceStructure?: (geometry: Point[]) => void;
   onCancelPlacement?: () => void;
+  /** A new token waiting for a click on the map; `sizeM` sizes its preview. */
+  placingToken?: { label: string; sizeM: number } | null;
+  /** Where the new token should stand: inside the map and moved off any token it would cover. */
+  onPlaceToken?: (at: Point) => void;
+  onCancelTokenPlacement?: () => void;
   /** Where tokens dragged by someone else at the table are right now. */
   remoteDragPositions?: ReadonlyMap<string, Point>;
   /** Live positions of the tokens being dragged, before they are dropped. */
@@ -81,6 +96,13 @@ const framePaddingPx = 6;
 const rotationHandleOffsetPx = 24;
 const rotationHandleRadiusPx = 7;
 const rotationHandleHitRadiusPx = 10;
+/** How far a press may wander, in CSS pixels, before it counts as a drag; fingers wobble more than mice. */
+const mouseSlopPx = 4;
+const touchSlopPx = 10;
+/** Holding a finger on a token this long opens its action wheel. */
+const longPressMs = 500;
+/** Each zoom button press or +/- key zooms by this factor. */
+const zoomStep = 1.25;
 
 export function MapCanvas({
   state,
@@ -88,11 +110,12 @@ export function MapCanvas({
   selectedStructureId,
   movableTokenIds,
   canMoveStructures = false,
-  rulerDistanceMeters,
   onMoveToken,
   onMoveTokens,
   onMoveStructure,
   onMeasure,
+  onMeasureEnd,
+  remoteRulers,
   onSelect,
   onAction,
   onEditActions,
@@ -100,16 +123,32 @@ export function MapCanvas({
   placingStructure,
   onPlaceStructure,
   onCancelPlacement,
+  placingToken,
+  onPlaceToken,
+  onCancelTokenPlacement,
   remoteDragPositions,
   onDragTokens,
   onDragTokensEnd,
 }: Props) {
+  const rootRef = useRef<HTMLDivElement>(null);
   const ref = useRef<HTMLCanvasElement>(null);
+  const pendingFrame = useRef<HTMLDivElement>(null);
   const fogLayer = useRef<HTMLCanvasElement | null>(null);
   const images = useRef(new Map<string, HTMLImageElement>());
   const [imageVersion, setImageVersion] = useState(0);
   const pointerActive = useRef(false);
+  // How far the current press may move before it counts as a drag.
+  const slop = useRef(mouseSlopPx);
   const rightGesture = useRef<{ from: Point; clientX: number; clientY: number; moved: boolean } | null>(null);
+  // Whether this viewer's ruler has been shared with the table and needs taking back when it ends.
+  const measuring = useRef(false);
+  const spaceHeld = useRef(false);
+  // A middle-button or Space drag that pans the view.
+  const pan = useRef<{ pointerId: number; clientX: number; clientY: number; camera: Camera } | null>(null);
+  // Fingers on the canvas, by pointer id, in client pixels; two of them pinch and pan the view.
+  const touches = useRef(new Map<number, Point>());
+  const pinch = useRef<{ camera: Camera; mid: Point; distance: number } | null>(null);
+  const longPress = useRef<{ pointerId: number; clientX: number; clientY: number; timer: number } | null>(null);
   const [drag, setDrag] = useState<TokenDrag | null>(null);
   // The drag as of the latest event, ahead of the render that draws it.
   const dragRef = useRef<TokenDrag | null>(null);
@@ -132,6 +171,13 @@ export function MapCanvas({
   // A chosen action waiting on the confirm card's Roll.
   const [pending, setPending] = useState<{ sourceTokenId: string; choice: WheelChoice; targetTokenId?: string; point?: Point } | null>(null);
   const [placementPoint, setPlacementPoint] = useState<Point | null>(null);
+  // Where the new token would stand if the viewer clicked now.
+  const [tokenGhost, setTokenGhost] = useState<Point | null>(null);
+  // Set when a click tried to place the new token somewhere the viewer cannot see.
+  const [placeMessage, setPlaceMessage] = useState<string | null>(null);
+  const [view, setView] = useState<Size>({ width: 0, height: 0 });
+  // The view the viewer zoomed or panned to; null keeps the whole map fitted to the view.
+  const [userCamera, setUserCamera] = useState<Camera | null>(null);
   const placingKind = placingStructure?.kind;
   const findToken = (tokenId?: string) => tokenId === undefined ? undefined : state.visibleTokens.find((token) => token.id === tokenId);
   const targetingSource = findToken(targeting?.tokenId);
@@ -143,22 +189,43 @@ export function MapCanvas({
   const selectedStructure = canMoveStructures && selectedStructureId !== undefined
     ? state.structures.find((structure) => structure.id === selectedStructureId)
     : undefined;
-  const scale = 24;
   const active = state.activeMap;
   const gridSize = n(active?.grid_size_m, n(state.metersPerGrid, 1));
-  const toCanvas = (p: Point) => ({ x: p.x * scale, y: p.y * scale });
-  const fromCanvas = (x: number, y: number) => ({ x: x / scale, y: y / scale });
-  const eventPoint = (event: Pick<PointerEvent<HTMLCanvasElement> | MouseEvent<HTMLCanvasElement>, "currentTarget" | "clientX" | "clientY">) => {
-    const canvas = event.currentTarget;
-    const rect = canvas.getBoundingClientRect();
-    return fromCanvas(
-      (event.clientX - rect.left) * (canvas.width / rect.width),
-      (event.clientY - rect.top) * (canvas.height / rect.height),
-    );
-  };
   const mapWidth = n(active?.width_m, 30);
   const mapHeight = n(active?.height_m, 30);
+  const mapSize = { width: mapWidth, height: mapHeight };
+  const camera = userCamera ? clampCamera(userCamera, view, mapSize) : fitCamera(view, mapSize);
+  // CSS pixels per meter at the current zoom. The context is translated to the camera but never scaled
+  // by the zoom, so line widths, labels and handles keep their pixel sizes.
+  const scale = pixelsPerMeter * camera.zoom;
+  const toCanvas = (p: Point) => ({ x: p.x * scale, y: p.y * scale });
+  const eventPoint = (event: Pick<PointerEvent<HTMLCanvasElement> | MouseEvent<HTMLCanvasElement>, "currentTarget" | "clientX" | "clientY">) => {
+    const rect = event.currentTarget.getBoundingClientRect();
+    return viewToMap(camera, { x: event.clientX - rect.left, y: event.clientY - rect.top });
+  };
   const isMovable = (token: RoomToken) => movableTokenIds?.has(token.id) ?? true;
+  // The one selected token the viewer may act with: the Actions button and Enter open its wheel.
+  const actionToken = onAction && selectedTokenIds?.length === 1
+    ? state.visibleTokens.find((token) => token.id === selectedTokenIds[0] && token.can_act)
+    : undefined;
+  function changeCamera(change: (current: Camera) => Camera) {
+    setUserCamera((current) => change(current ? clampCamera(current, view, mapSize) : fitCamera(view, mapSize)));
+  }
+  function zoomBy(factor: number) {
+    changeCamera((current) => zoomAt(current, { x: view.width / 2, y: view.height / 2 }, current.zoom * factor, view, mapSize));
+  }
+  // A new token goes where the viewer points, moved off any token they can see that it would cover.
+  // Tokens hidden from the viewer are not in visibleTokens, so the nudge never gives them away.
+  function tokenSpot(point: Point) {
+    const others = state.visibleTokens.map((token) => ({ center: tokenCenter(token), sizeM: n(token.size_m, 1) }));
+    return placementSpot(point, placingToken?.sizeM ?? 1, others, mapWidth, mapHeight, movementBarriers(state.structures));
+  }
+  // Under fog, a viewer who already sees part of the map places only where they see. A viewer with no sight
+  // yet (a player bringing their character) may place anywhere; game masters have no fog.
+  function canPlaceAt(point: Point) {
+    const areas = state.visibility?.fog ? state.visibility.visionAreas : [];
+    return areas.length === 0 || areas.some((area) => pointInPolygon(point, area.polygon));
+  }
   // Where the dragged tokens head for, ignoring structures. Free, the grabbed one stays under the pointer, to the
   // hundredth of a meter the server stores; with Shift it snaps to the grid. The rest keep their offsets to it.
   function dragTargets(tokenDrag: TokenDrag, pointer: Point, snap: boolean) {
@@ -220,28 +287,42 @@ export function MapCanvas({
   }
   useEffect(() => {
     const c = ref.current;
-    if (!c) return;
+    if (!c || view.width === 0 || view.height === 0) return;
     const ctx = c.getContext("2d")!;
+    // A backing store at the screen's pixel density keeps lines and text sharp.
+    const dpr = window.devicePixelRatio || 1;
+    const backingWidth = Math.round(view.width * dpr);
+    const backingHeight = Math.round(view.height * dpr);
+    if (c.width !== backingWidth) c.width = backingWidth;
+    if (c.height !== backingHeight) c.height = backingHeight;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.fillStyle = "#141019";
+    ctx.fillRect(0, 0, view.width, view.height);
+    // From here on, drawing is in CSS pixels from the map's top-left corner.
+    ctx.setTransform(dpr, 0, 0, dpr, camera.x * dpr, camera.y * dpr);
     const w = mapWidth * scale;
     const h = mapHeight * scale;
-    c.width = w;
-    c.height = h;
     ctx.fillStyle = "#221c2b";
     ctx.fillRect(0, 0, w, h);
     ctx.strokeStyle = "#40364c";
     ctx.lineWidth = 1;
     const grid = n(state.metersPerGrid, 1) * scale;
-    for (let x = 0; x <= w; x += grid) {
-      ctx.beginPath();
-      ctx.moveTo(x, 0);
-      ctx.lineTo(x, h);
-      ctx.stroke();
-    }
-    for (let y = 0; y <= h; y += grid) {
-      ctx.beginPath();
-      ctx.moveTo(0, y);
-      ctx.lineTo(w, y);
-      ctx.stroke();
+    // Only the lines in view, and none once they would crowd into a solid fill.
+    if (grid >= 4) {
+      const right = Math.min(w, view.width - camera.x);
+      const bottom = Math.min(h, view.height - camera.y);
+      for (let x = Math.max(0, Math.floor(-camera.x / grid) * grid); x <= right; x += grid) {
+        ctx.beginPath();
+        ctx.moveTo(x, 0);
+        ctx.lineTo(x, h);
+        ctx.stroke();
+      }
+      for (let y = Math.max(0, Math.floor(-camera.y / grid) * grid); y <= bottom; y += grid) {
+        ctx.beginPath();
+        ctx.moveTo(0, y);
+        ctx.lineTo(w, y);
+        ctx.stroke();
+      }
     }
     // Tokens being dragged here or by someone else at the table are drawn, and see, from where they are now.
     const positions = drag?.moved ? drag.at : undefined;
@@ -250,9 +331,10 @@ export function MapCanvas({
     if (state.visibility?.fog) {
       // Cut every token's sight out of an opaque layer, then lay that layer over the map.
       const layer = fogLayer.current ??= document.createElement("canvas");
-      layer.width = w;
-      layer.height = h;
+      layer.width = backingWidth;
+      layer.height = backingHeight;
       const fog = layer.getContext("2d")!;
+      fog.setTransform(dpr, 0, 0, dpr, camera.x * dpr, camera.y * dpr);
       fog.fillStyle = "rgba(12,10,16,.82)";
       fog.fillRect(0, 0, w, h);
       fog.globalCompositeOperation = "destination-out";
@@ -274,7 +356,9 @@ export function MapCanvas({
         fog.fill();
       });
       fog.globalCompositeOperation = "source-over";
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
       ctx.drawImage(layer, 0, 0);
+      ctx.setTransform(dpr, 0, 0, dpr, camera.x * dpr, camera.y * dpr);
     }
     state.visibleTokens.forEach((t) => {
       const image = t.image_asset_id ? images.current.get(t.image_asset_id) : undefined;
@@ -299,6 +383,21 @@ export function MapCanvas({
       });
       ctx.stroke();
       ctx.setLineDash([]);
+    }
+    if (placingToken && tokenGhost) {
+      const center = toCanvas(tokenGhost);
+      const radius = (placingToken.sizeM * scale) / 2;
+      const allowed = canPlaceAt(tokenGhost);
+      ctx.fillStyle = allowed ? "rgba(190,140,255,.25)" : "rgba(128,115,142,.25)";
+      ctx.strokeStyle = allowed ? "#be8cff" : "#80738e";
+      ctx.lineWidth = 2;
+      ctx.setLineDash([6, 6]);
+      ctx.beginPath();
+      ctx.arc(center.x, center.y, radius, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.stroke();
+      ctx.setLineDash([]);
+      drawLabel(ctx, placingToken.label, center.x + radius + 6, center.y);
     }
     const rangeSource = targetingSpec ? targetingSource : previewToken;
     const rangeM = targetingSpec?.rangeM ?? rangePreview?.rangeM;
@@ -369,18 +468,40 @@ export function MapCanvas({
       ctx.stroke();
       ctx.setLineDash([]);
     }
-    if (ruler) {
-      const a = toCanvas(ruler.from),
-        b = toCanvas(ruler.to);
-      ctx.strokeStyle = "#d9ffb5";
+    remoteRulers?.forEach((remote) => {
+      const a = toCanvas(remote.from),
+        b = toCanvas(remote.to);
+      ctx.strokeStyle = "#ebc7ff";
+      ctx.lineWidth = 2;
+      ctx.setLineDash([8, 5]);
       ctx.beginPath();
       ctx.moveTo(a.x, a.y);
       ctx.lineTo(b.x, b.y);
       ctx.stroke();
-      if (rulerDistanceMeters !== undefined) {
-        ctx.fillStyle = "#f6effa";
-        ctx.fillText(`${rulerDistanceMeters.toFixed(2)} m`, b.x + 8, b.y - 8);
-      }
+      ctx.setLineDash([]);
+      const meters = Math.hypot(remote.to.x - remote.from.x, remote.to.y - remote.from.y);
+      drawLabel(ctx, `${remote.name ? `${remote.name} · ` : ""}${distanceLabel(meters, gridSize)}`, b.x + 8, b.y - 12, "#ebc7ff");
+    });
+    if (ruler) {
+      const a = toCanvas(ruler.from),
+        b = toCanvas(ruler.to);
+      ctx.strokeStyle = "#d9ffb5";
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(a.x, a.y);
+      ctx.lineTo(b.x, b.y);
+      ctx.stroke();
+      drawLabel(ctx, distanceLabel(Math.hypot(ruler.to.x - ruler.from.x, ruler.to.y - ruler.from.y), gridSize), b.x + 8, b.y - 12);
+    }
+    if (drag?.moved) {
+      // How far the grabbed token walked, around walls, against its speed when the sheet has one.
+      const at = drag.at.get(drag.grabbed.id)!;
+      const walked = pathLength(drag.paths.get(drag.grabbed.id)!);
+      const speed = drag.grabbed.speed_m;
+      const tooFar = speed !== undefined && walked > speed + 1e-9;
+      const center = toCanvas(at);
+      const radius = (n(drag.grabbed.size_m, 1) * scale) / 2;
+      drawLabel(ctx, `${distanceLabel(walked, gridSize)}${tooFar ? ` · speed ${formatMeters(speed)} m` : ""}`, center.x + radius + 6, center.y - radius, tooFar ? "#ffb887" : "#f6effa");
     }
     if (floatingResults?.length) {
       const font = ctx.font;
@@ -396,7 +517,7 @@ export function MapCanvas({
       ctx.textAlign = "start";
       ctx.font = font;
     }
-  }, [state, selectedTokenIds, selectedStructureId, canMoveStructures, rulerDistanceMeters, drag, remoteDragPositions, marquee, structureDrag, ruler, rangePreview, targeting, placingKind, placementPoint, gridSize, imageVersion, floatingResults]);
+  }, [state, selectedTokenIds, selectedStructureId, canMoveStructures, drag, remoteDragPositions, remoteRulers, marquee, structureDrag, ruler, rangePreview, targeting, placingKind, placementPoint, placingToken?.label, placingToken?.sizeM, tokenGhost, gridSize, imageVersion, floatingResults, view, camera.x, camera.y, scale]);
   useEffect(() => {
     state.visibleTokens.forEach((token) => {
       const id = token.image_asset_id;
@@ -416,6 +537,50 @@ export function MapCanvas({
     setPending(null);
     closeWheel();
   }, [placingKind]);
+  useEffect(() => {
+    setPlaceMessage(null);
+    if (!placingToken) {
+      setTokenGhost(null);
+      return;
+    }
+    setTargeting(null);
+    setPending(null);
+    closeWheel();
+  }, [!!placingToken]);
+  // Another map starts fitted to the view.
+  useEffect(() => setUserCamera(null), [active?.id]);
+  useLayoutEffect(() => {
+    const root = rootRef.current;
+    const canvas = ref.current;
+    if (!root || !canvas) return;
+    const measure = () => {
+      const rect = root.getBoundingClientRect();
+      const fallback = canvas.getBoundingClientRect();
+      const width = Math.round(rect.width || fallback.width);
+      const height = Math.round(rect.height || fallback.height);
+      if (width > 0 && height > 0) setView((current) => current.width === width && current.height === height ? current : { width, height });
+    };
+    measure();
+    if (!("ResizeObserver" in window)) return;
+    const observer = new ResizeObserver(measure);
+    observer.observe(root);
+    return () => observer.disconnect();
+  }, []);
+  // React's wheel listener is passive, and the page must not scroll while the map zooms.
+  useEffect(() => {
+    const canvas = ref.current;
+    if (!canvas) return;
+    const zoomWithWheel = (event: WheelEvent) => {
+      if (event.deltaY === 0) return;
+      event.preventDefault();
+      const rect = canvas.getBoundingClientRect();
+      const anchor = { x: event.clientX - rect.left, y: event.clientY - rect.top };
+      const factor = wheelZoomFactor(event, view.height);
+      changeCamera((current) => zoomAt(current, anchor, current.zoom * factor, view, mapSize));
+    };
+    canvas.addEventListener("wheel", zoomWithWheel, { passive: false });
+    return () => canvas.removeEventListener("wheel", zoomWithWheel);
+  }, [view, mapWidth, mapHeight]);
   useEffect(() => {
     if (targeting && !targetingSource) setTargeting(null);
     if (pending && !pendingSource) setPending(null);
@@ -439,6 +604,20 @@ export function MapCanvas({
     setActionWheel(null);
     setRangePreview(null);
   }
+  // Opens the action wheel of a token the viewer may act with, at a point in view pixels.
+  function openWheel(token: RoomToken, at: Point) {
+    setActionWheel({ tokenId: token.id, x: at.x, y: at.y });
+    setRangePreview(null);
+    setTargeting(null);
+    setPending(null);
+    onSelect?.({ kind: "tokens", ids: [token.id] });
+  }
+  // A click on the map while the confirm card is open keeps it, and points the viewer back to it.
+  function nudgePending() {
+    const frame = pendingFrame.current;
+    frame?.animate?.([{ transform: "translateX(0)" }, { transform: "translateX(-6px)" }, { transform: "translateX(6px)" }, { transform: "translateX(0)" }], { duration: 240 });
+    frame?.querySelector<HTMLButtonElement>('[role="dialog"] button.btn')?.focus({ preventScroll: true });
+  }
   function chooseAction(choice: WheelChoice) {
     if (!actionWheel) return;
     const tokenId = actionWheel.tokenId;
@@ -461,6 +640,26 @@ export function MapCanvas({
   function stopPlacing() {
     onCancelPlacement?.();
     ref.current?.focus({ preventScroll: true });
+  }
+  function stopPlacingToken() {
+    onCancelTokenPlacement?.();
+    ref.current?.focus({ preventScroll: true });
+  }
+  function cancelLongPress() {
+    if (!longPress.current) return;
+    window.clearTimeout(longPress.current.timer);
+    longPress.current = null;
+  }
+  // A finger held still on a token the viewer may act with opens its action wheel instead of dragging it.
+  function longPressed(tokenId: string, at: Point) {
+    longPress.current = null;
+    const token = findToken(tokenId);
+    if (!token || dragRef.current?.moved) return;
+    updateDrag(null);
+    endStreaming();
+    setMarquee(null);
+    pointerActive.current = false;
+    openWheel(token, at);
   }
   function pickMovableStructure(point: Point) {
     if (!canMoveStructures) return;
@@ -513,11 +712,18 @@ export function MapCanvas({
   function cancelPointerAction() {
     if (dragRef.current) dropTokens(dragRef.current);
     endStreaming();
+    cancelLongPress();
     rightGesture.current = null;
     pointerActive.current = false;
+    pan.current = null;
+    pinch.current = null;
     setMarquee(null);
     setStructureDrag(null);
     setRuler(null);
+    if (measuring.current) {
+      measuring.current = false;
+      onMeasureEnd?.();
+    }
   }
   // A right click without a drag on a token the viewer may act with opens its action wheel.
   function finishRightGesture(event: MouseEvent<HTMLCanvasElement> | PointerEvent<HTMLCanvasElement>) {
@@ -525,20 +731,19 @@ export function MapCanvas({
     if (!gesture) return;
     cancelPointerAction();
     event.currentTarget.style.cursor = "default";
-    if (gesture.moved || placingKind || !onAction) return;
+    if (gesture.moved || placingKind || placingToken || !onAction) return;
     const token = pickToken(gesture.from, (candidate) => !!candidate.can_act);
     if (!token) return;
     const rect = event.currentTarget.getBoundingClientRect();
-    setActionWheel({ tokenId: token.id, x: event.clientX - rect.left, y: event.clientY - rect.top });
-    setRangePreview(null);
-    setTargeting(null);
-    setPending(null);
-    onSelect?.({ kind: "tokens", ids: [token.id] });
+    openWheel(token, { x: event.clientX - rect.left, y: event.clientY - rect.top });
   }
   // Window blur drops a drag with this render's props and structures.
   const cancelLatest = useRef(cancelPointerAction);
+  // A long press fires after a delay, with whatever the latest render holds.
+  const longPressLatest = useRef(longPressed);
   useEffect(() => {
     cancelLatest.current = cancelPointerAction;
+    longPressLatest.current = longPressed;
   });
   useEffect(() => {
     const cancel = () => cancelLatest.current();
@@ -571,21 +776,51 @@ export function MapCanvas({
       onCancel={closePending}
     />;
   }
+  // Where the Actions button of the selected token sits: beside it, while nothing else is going on.
+  const actionAnchor = actionToken && !placingKind && !placingToken && !targeting && !pending && !actionWheel && !drag?.moved
+    ? mapToView(camera, remoteDragPositions?.get(actionToken.id) ?? tokenCenter(actionToken))
+    : undefined;
+  const actionAnchorInView = !!actionAnchor && actionAnchor.x >= 0 && actionAnchor.y >= 0 && actionAnchor.x <= view.width && actionAnchor.y <= view.height;
+  const banner = "absolute left-1/2 top-3 z-30 flex max-w-[calc(100%-1.5rem)] -translate-x-1/2 items-center gap-3 rounded-lg border border-[var(--paper)]/15 bg-[var(--input)] px-3 py-2 text-xs text-[var(--paper)] shadow-xl";
+  const bannerButton = "shrink-0 text-[var(--accent)] underline underline-offset-4 hover:text-[var(--paper)]";
+  const viewButton = "grid h-9 min-w-9 place-items-center rounded-md border border-[var(--paper)]/15 bg-[var(--input)] px-2 text-sm text-[var(--paper)] hover:border-[var(--accent)]";
   return (
-    <div className="relative min-w-0">
+    <div ref={rootRef} className="relative h-full min-h-0 w-full min-w-0 overflow-hidden rounded-xl border border-[var(--paper)]/15 bg-[var(--input)]">
       <canvas
         ref={ref}
-        className="block h-auto w-full max-w-full touch-none rounded-xl border border-[var(--paper)]/15 bg-[var(--surface)] focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)]"
+        className="absolute inset-0 block h-full w-full touch-none select-none focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-[var(--accent)]"
         role="img"
         tabIndex={0}
-        aria-label="Interactive tabletop map. Drag a structure to move it. Drag the round handle above the selected structure to rotate it; hold Shift to snap rotation to 15 degrees. Drag a token to move it freely; hold Shift to snap it to the grid when dropped. Everyone at the table sees it move. Walls stop it and it slides along them; it stays wherever the drag ends. Drag across empty space to select several tokens, then drag one of them to move the group. Right click a token you control without dragging to open its action wheel, pick an attack, spell, item, check or death save, click a target or the point where an area lands, then press Roll on the confirm card. Hold the right mouse button and drag to measure distance; release to hide the ruler. Press Escape to end a drag where the token is, or to close the action wheel or cancel an action. While placing a structure, click the map to place it; press Escape to stop."
+        aria-label="Interactive tabletop map. Scroll or pinch to zoom; drag with the middle mouse button, hold Space and drag, or drag with two fingers to pan; the plus and minus keys zoom and 0 fits the whole map. Drag a structure to move it. Drag the round handle above the selected structure to rotate it; hold Shift to snap rotation to 15 degrees. Drag a token to move it freely; hold Shift to snap it to the grid when dropped. The distance it walked shows beside it. Everyone at the table sees it move. Walls stop it and it slides along them; it stays wherever the drag ends. Drag across empty space to select several tokens, then drag one of them to move the group. To act with a token you control, right click it, press and hold it, or select it and press Enter or its Actions button; pick an attack, spell, item, check or death save, click a highlighted target or the point where an area lands, then press Roll on the confirm card. Hold the right mouse button and drag to measure distance; everyone at the table sees the ruler until you release it. Press Escape to end a drag where the token is, close the action wheel, cancel an action, or stop placing. While placing a structure or a token, click the map where it goes."
         onContextMenu={(event) => event.preventDefault()}
         onPointerDown={(event) => {
-          if ((event.button !== 0 && event.button !== 2) || pointerActive.current) return;
-          event.currentTarget.focus({ preventScroll: true });
-          event.currentTarget.setPointerCapture?.(event.pointerId);
-          pointerActive.current = true;
+          const canvas = event.currentTarget;
+          if (event.pointerType === "touch") {
+            touches.current.set(event.pointerId, { x: event.clientX, y: event.clientY });
+            if (touches.current.size > 1) {
+              // A second finger turns whatever the first one started into a pinch.
+              if (touches.current.size === 2 && !pinch.current) {
+                cancelPointerAction();
+                canvas.setPointerCapture?.(event.pointerId);
+                const [a, b] = [...touches.current.values()];
+                const rect = canvas.getBoundingClientRect();
+                pinch.current = { camera, mid: { x: (a.x + b.x) / 2 - rect.left, y: (a.y + b.y) / 2 - rect.top }, distance: Math.hypot(a.x - b.x, a.y - b.y) };
+              }
+              return;
+            }
+          }
+          const panning = event.button === 1 || (event.button === 0 && spaceHeld.current);
+          if (pinch.current || pan.current || pointerActive.current || (!panning && event.button !== 0 && event.button !== 2)) return;
+          canvas.focus({ preventScroll: true });
+          canvas.setPointerCapture?.(event.pointerId);
           closeWheel();
+          if (panning) {
+            pan.current = { pointerId: event.pointerId, clientX: event.clientX, clientY: event.clientY, camera };
+            canvas.style.cursor = "grabbing";
+            return;
+          }
+          pointerActive.current = true;
+          slop.current = event.pointerType === "touch" ? touchSlopPx : mouseSlopPx;
           const point = eventPoint(event);
           setRuler(null);
           if (event.button === 2) {
@@ -596,8 +831,14 @@ export function MapCanvas({
             onPlaceStructure?.(templateGeometry(placingKind, point, gridSize));
             return;
           }
+          if (placingToken) {
+            const spot = tokenSpot(point);
+            if (canPlaceAt(spot)) onPlaceToken?.(spot);
+            else setPlaceMessage("You can only place it where you can see");
+            return;
+          }
           if (pending) {
-            setPending(null);
+            nudgePending();
             return;
           }
           if (targeting) {
@@ -618,7 +859,8 @@ export function MapCanvas({
             }
             const target = pickToken(point, (candidate) => targetingSpec.allowSelf || candidate.id !== targetingSource.id);
             if (!target) {
-              setTargeting(null);
+              // A near miss keeps the action; only Esc or Cancel stops it.
+              setTargeting({ ...targeting, message: "No target there — click a highlighted target" });
               return;
             }
             const status = target.id === targetingSource.id ? "valid" : attackTargetStatus(from, tokenCenter(target), targetingSpec.rangeM, state.structures);
@@ -642,6 +884,17 @@ export function MapCanvas({
             });
             event.currentTarget.style.cursor = "grabbing";
             return;
+          }
+          const actor = event.pointerType === "touch" && onAction ? pickToken(point, (candidate) => !!candidate.can_act) : undefined;
+          if (actor) {
+            const rect = canvas.getBoundingClientRect();
+            const at = { x: event.clientX - rect.left, y: event.clientY - rect.top };
+            longPress.current = {
+              pointerId: event.pointerId,
+              clientX: event.clientX,
+              clientY: event.clientY,
+              timer: window.setTimeout(() => longPressLatest.current(actor.id, at), longPressMs),
+            };
           }
           const token = pickToken(point, isMovable);
           if (token) {
@@ -678,6 +931,30 @@ export function MapCanvas({
           setMarquee({ from: point, to: point, clientX: event.clientX, clientY: event.clientY, moved: false });
         }}
         onPointerMove={(event) => {
+          if (event.pointerType === "touch" && touches.current.has(event.pointerId)) {
+            touches.current.set(event.pointerId, { x: event.clientX, y: event.clientY });
+            const gesture = pinch.current;
+            if (gesture) {
+              const [a, b] = [...touches.current.values()];
+              if (!b) return;
+              const rect = event.currentTarget.getBoundingClientRect();
+              const mid = { x: (a.x + b.x) / 2 - rect.left, y: (a.y + b.y) / 2 - rect.top };
+              setUserCamera(pinchCamera(gesture.camera, gesture.mid, gesture.distance, mid, Math.hypot(a.x - b.x, a.y - b.y), view, mapSize));
+              return;
+            }
+          }
+          const panning = pan.current;
+          if (panning) {
+            if (event.pointerId !== panning.pointerId) return;
+            setUserCamera(clampCamera({
+              ...panning.camera,
+              x: panning.camera.x + event.clientX - panning.clientX,
+              y: panning.camera.y + event.clientY - panning.clientY,
+            }, view, mapSize));
+            return;
+          }
+          const press = longPress.current;
+          if (press && event.pointerId === press.pointerId && Math.hypot(event.clientX - press.clientX, event.clientY - press.clientY) >= slop.current) cancelLongPress();
           const point = eventPoint(event);
           const gesture = rightGesture.current;
           if (gesture) {
@@ -689,12 +966,24 @@ export function MapCanvas({
             gesture.moved = true;
             setRuler({ from: gesture.from, to: point });
             event.currentTarget.style.cursor = "crosshair";
-            onMeasure?.(gesture.from, point);
+            if (onMeasure) {
+              measuring.current = true;
+              onMeasure(gesture.from, point);
+            }
             return;
           }
           if (!pointerActive.current) {
+            if (spaceHeld.current) {
+              event.currentTarget.style.cursor = "grab";
+              return;
+            }
             if (placingKind) {
               setPlacementPoint(point);
+              event.currentTarget.style.cursor = "crosshair";
+              return;
+            }
+            if (placingToken) {
+              setTokenGhost(tokenSpot(point));
               event.currentTarget.style.cursor = "crosshair";
               return;
             }
@@ -718,14 +1007,14 @@ export function MapCanvas({
           }
           const current = dragRef.current;
           if (current) {
-            const moved = current.moved || Math.hypot(event.clientX - current.clientX, event.clientY - current.clientY) >= 4;
+            const moved = current.moved || Math.hypot(event.clientX - current.clientX, event.clientY - current.clientY) >= slop.current;
             const next = advanceDrag(current, point, event.shiftKey, moved);
             updateDrag(next);
             streamDrag(next);
             return;
           }
           if (marquee) {
-            setMarquee({ ...marquee, to: point, moved: marquee.moved || Math.hypot(event.clientX - marquee.clientX, event.clientY - marquee.clientY) >= 4 });
+            setMarquee({ ...marquee, to: point, moved: marquee.moved || Math.hypot(event.clientX - marquee.clientX, event.clientY - marquee.clientY) >= slop.current });
             return;
           }
           if (structureDrag) {
@@ -752,6 +1041,18 @@ export function MapCanvas({
           }
         }}
         onPointerUp={(event) => {
+          if (event.pointerType === "touch") touches.current.delete(event.pointerId);
+          if (pinch.current) {
+            if (touches.current.size < 2) pinch.current = null;
+            return;
+          }
+          if (pan.current) {
+            if (event.pointerId !== pan.current.pointerId) return;
+            pan.current = null;
+            event.currentTarget.style.cursor = spaceHeld.current ? "grab" : "default";
+            return;
+          }
+          cancelLongPress();
           if (event.button === 2) {
             finishRightGesture(event);
             return;
@@ -759,14 +1060,14 @@ export function MapCanvas({
           if (!pointerActive.current) return;
           const current = dragRef.current;
           if (current) {
-            const moved = current.moved || Math.hypot(event.clientX - current.clientX, event.clientY - current.clientY) >= 4;
+            const moved = current.moved || Math.hypot(event.clientX - current.clientX, event.clientY - current.clientY) >= slop.current;
             dropTokens(moved ? advanceDrag(current, eventPoint(event), event.shiftKey, true) : current);
             if (!moved) {
               // A click on one token of a group selects just that token.
               if (current.tokens.length > 1) onSelect?.({ kind: "tokens", ids: [current.grabbed.id] });
             }
           } else if (marquee) {
-            if (marquee.moved || Math.hypot(event.clientX - marquee.clientX, event.clientY - marquee.clientY) >= 4) {
+            if (marquee.moved || Math.hypot(event.clientX - marquee.clientX, event.clientY - marquee.clientY) >= slop.current) {
               const to = eventPoint(event);
               const left = Math.min(marquee.from.x, to.x), right = Math.max(marquee.from.x, to.x);
               const top = Math.min(marquee.from.y, to.y), bottom = Math.max(marquee.from.y, to.y);
@@ -787,12 +1088,14 @@ export function MapCanvas({
           updateDrag(null);
           setMarquee(null);
           setStructureDrag(null);
-          event.currentTarget.style.cursor = placingKind ? "crosshair" : "default";
+          event.currentTarget.style.cursor = placingKind || placingToken ? "crosshair" : "default";
         }}
         onPointerCancel={(event) => {
+          touches.current.delete(event.pointerId);
           cancelPointerAction();
           event.currentTarget.style.cursor = "default";
         }}
+        onPointerLeave={() => setTokenGhost(null)}
         // pointerdown already focuses the canvas; the browser's own mousedown focus would come later and
         // steal focus from the confirm card's Roll button that a target click just opened.
         onMouseDown={(event) => event.preventDefault()}
@@ -800,12 +1103,34 @@ export function MapCanvas({
           // pointerup waits for the last held mouse button; mouseup does not.
           if (event.button === 2) finishRightGesture(event);
         }}
-        onLostPointerCapture={cancelPointerAction}
-        onBlur={cancelPointerAction}
+        onLostPointerCapture={(event) => {
+          touches.current.delete(event.pointerId);
+          cancelPointerAction();
+        }}
+        onBlur={() => {
+          spaceHeld.current = false;
+          cancelPointerAction();
+        }}
         onKeyDown={(event) => {
           if (event.key === "Shift") setDragSnap(true);
+          if (event.key === " ") {
+            // Space held turns a left drag into a pan instead of scrolling the page.
+            event.preventDefault();
+            spaceHeld.current = true;
+            if (!pointerActive.current) event.currentTarget.style.cursor = pan.current ? "grabbing" : "grab";
+            return;
+          }
+          if (event.key === "+" || event.key === "=") zoomBy(zoomStep);
+          if (event.key === "-" || event.key === "_") zoomBy(1 / zoomStep);
+          if (event.key === "0") setUserCamera(null);
+          if (event.key === "Enter" && actionToken && !placingKind && !placingToken && !targeting && !pending) {
+            event.preventDefault();
+            openWheel(actionToken, mapToView(camera, tokenCenter(actionToken)));
+            return;
+          }
           if (event.key !== "Escape") return;
           if (placingKind) onCancelPlacement?.();
+          if (placingToken) onCancelTokenPlacement?.();
           closeWheel();
           setTargeting(null);
           setPending(null);
@@ -813,8 +1138,30 @@ export function MapCanvas({
         }}
         onKeyUp={(event) => {
           if (event.key === "Shift") setDragSnap(false);
+          if (event.key === " ") {
+            spaceHeld.current = false;
+            if (!pan.current) event.currentTarget.style.cursor = "default";
+          }
         }}
       />
+      {actionToken && actionAnchor && actionAnchorInView && <button
+        className="absolute z-20 inline-flex h-9 items-center gap-1.5 rounded-md border border-[var(--accent)] bg-[var(--input)] px-2.5 text-xs font-medium text-[var(--paper)] shadow-xl hover:bg-[var(--surface-raised)]"
+        style={{
+          left: Math.max(4, Math.min(actionAnchor.x + (n(actionToken.size_m, 1) * scale) / 2 + 6, view.width - 96)),
+          top: Math.max(4, Math.min(actionAnchor.y - 18, view.height - 40)),
+        }}
+        type="button"
+        aria-label={`Actions for ${actionToken.name}`}
+        onClick={() => openWheel(actionToken, actionAnchor)}
+      >
+        <Sword size={14} className="text-[var(--accent)]" aria-hidden="true" />Actions
+      </button>}
+      <div className="absolute bottom-3 right-3 z-20 flex items-center gap-1 rounded-lg border border-[var(--paper)]/10 bg-[var(--input)]/90 p-1 shadow-xl" role="group" aria-label="Map view">
+        <button className={viewButton} type="button" aria-label="Zoom out" onClick={() => zoomBy(1 / zoomStep)}>−</button>
+        <span className="w-11 text-center text-xs tabular-nums text-[var(--muted)]">{Math.round(camera.zoom * 100)}%</span>
+        <button className={viewButton} type="button" aria-label="Zoom in" onClick={() => zoomBy(zoomStep)}>+</button>
+        <button className={`${viewButton} text-xs`} type="button" aria-label="Fit the whole map in view" aria-pressed={!userCamera} onClick={() => setUserCamera(null)}>Fit</button>
+      </div>
       {actionWheel && wheelToken && <TokenActionWheel
         x={actionWheel.x}
         y={actionWheel.y}
@@ -830,15 +1177,26 @@ export function MapCanvas({
           ref.current?.focus({ preventScroll: true });
         }}
       />}
-      {placingKind ? <div className="absolute left-1/2 top-3 z-30 flex -translate-x-1/2 items-center gap-3 rounded-lg border border-[var(--paper)]/15 bg-[var(--input)] px-3 py-2 text-xs text-[var(--paper)] shadow-xl" role="status" aria-live="polite">
+      {placingKind ? <div className={banner} role="status" aria-live="polite">
         <span>{`Placing ${structureLabel(placingKind)} — click the map to place it`}</span>
-        <button className="shrink-0 text-[var(--accent)] underline underline-offset-4 hover:text-[var(--paper)]" type="button" onClick={stopPlacing}>Stop placing</button>
-      </div> : targeting && targetingSpec ? <div className="absolute left-1/2 top-3 z-30 flex -translate-x-1/2 items-center gap-3 rounded-lg border border-[var(--paper)]/15 bg-[var(--input)] px-3 py-2 text-xs text-[var(--paper)] shadow-xl" role="status" aria-live="polite">
-        <span>{targetingSpec.areaRadiusM > 0
-          ? `${choiceTitle(targeting.choice)} · ${targetingSpec.areaRadiusM} m radius — click where it lands`
-          : `${choiceTitle(targeting.choice)} · ${targetingSpec.rangeM} m — click a highlighted target`}{targeting.message && ` · ${targeting.message}`}</span>
-        <button className="shrink-0 text-[var(--accent)] underline underline-offset-4 hover:text-[var(--paper)]" type="button" onClick={cancelTargeting}>Cancel</button>
-      </div> : pendingCard()}
+        <button className={bannerButton} type="button" onClick={stopPlacing}>Stop placing</button>
+      </div> : placingToken ? <div className={banner} role="status" aria-live="polite">
+        <span>
+          {`Placing ${placingToken.label} — `}
+          <span className={placeMessage ? "text-[var(--pink)]" : undefined}>{placeMessage ?? "click the map where it should stand"}</span>
+        </span>
+        <button className={bannerButton} type="button" onClick={stopPlacingToken}>Cancel</button>
+      </div> : targeting && targetingSpec ? <div className={banner} role="status" aria-live="polite">
+        <span>
+          {targetingSpec.areaRadiusM > 0
+            ? `${choiceTitle(targeting.choice)} · ${targetingSpec.areaRadiusM} m radius — `
+            : `${choiceTitle(targeting.choice)} · ${targetingSpec.rangeM} m — `}
+          <span className={targeting.message ? "text-[var(--pink)]" : undefined}>
+            {targeting.message ?? (targetingSpec.areaRadiusM > 0 ? "click where it lands" : "click a highlighted target")}
+          </span>
+        </span>
+        <button className={bannerButton} type="button" onClick={cancelTargeting}>Cancel</button>
+      </div> : pending && <div ref={pendingFrame} className="pointer-events-none absolute inset-0 z-30 [&>*]:pointer-events-auto">{pendingCard()}</div>}
     </div>
   );
 }

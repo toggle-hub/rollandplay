@@ -47,6 +47,7 @@ type Token struct {
 	Conditions       []string         `json:"conditions"`                     // everyone at the table
 	Status           string           `json:"status,omitempty"`               // everyone: down|stable|dead, never HP numbers
 	Side             string           `json:"side,omitempty"`                 // per viewer: own|party|npc
+	SpeedM           *float64         `json:"speed_m,omitempty"`              // per viewer: those who may move the token
 }
 
 // MovableBy reports whether userID may move the token: its owner, the game master,

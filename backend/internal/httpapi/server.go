@@ -1842,6 +1842,10 @@ func (s *Server) visibleState(ctx context.Context, roomID, userID string) (map[s
 		t.CanAct = isDM || t.OwnerUserID == userID
 		t.Side = t.SideFor(userID, gameMasters)
 		t.Status = game.HealthStatus(t.Stats)
+		// Movers get the walking speed so the drag readout can warn past it.
+		if speed, ok := t.Stats["speed_m"].(float64); ok && speed > 0 && t.CanMove {
+			t.SpeedM = &speed
+		}
 		if isDM || t.OwnerUserID == userID || (t.SheetOwnerUserID != "" && t.SheetOwnerUserID == userID) {
 			t.HitPoints, t.MaxHitPoints = t.Health()
 			t.TempHitPoints = t.TempHealth()

@@ -241,6 +241,8 @@ export type RoomToken = {
   status?: TokenStatus;
   /** Whose token this is for the viewer: their own, another player's, or one only the game master controls. */
   side?: TokenSide;
+  /** Walking speed in meters (`speed_m` on the sheet or stat block); sent only to viewers who may move the token. */
+  speed_m?: number;
 };
 export type TokenStatus = "down" | "stable" | "dead";
 export type TokenSide = "own" | "party" | "npc";

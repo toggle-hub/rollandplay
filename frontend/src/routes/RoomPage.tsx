@@ -19,6 +19,7 @@ import { useToast } from "../components/Toast";
 import { defaultBlocksForKind, structureTypes, type StructureBlocks } from "../lib/structures";
 import { createFrameThrottle } from "../lib/frameThrottle";
 import { floatText, isActionRoll } from "../lib/actions";
+import { isClearedRuler, isSharedRuler, remoteRulers, type SharedRuler } from "../lib/rulers";
 
 type Point = { x: number; y: number };
 
@@ -30,7 +31,6 @@ export function RoomPage() {
   const [members, setMembers] = useState<RoomMember[]>([]);
   const [sheets, setSheets] = useState<Sheet[]>([]);
   const [maps, setMaps] = useState<GameMap[]>([]);
-  const [ruler, setRuler] = useState<number | undefined>();
   const [loadError, setLoadError] = useState("");
   const [connected, setConnected] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -53,6 +53,10 @@ export function RoomPage() {
   const [remoteDrags, setRemoteDrags] = useState<ReadonlyMap<string, Point>>(() => new Map());
   // Members with the room open right now, from the room socket's presence.changed events.
   const [onlineUserIds, setOnlineUserIds] = useState<ReadonlySet<string>>(() => new Set());
+  // Rulers others at the table are holding, by their connection.
+  const [sharedRulers, setSharedRulers] = useState<ReadonlyMap<string, SharedRuler>>(() => new Map());
+  // A token from the Add token form, waiting for a click on the map.
+  const [placingToken, setPlacingToken] = useState<{ body: Record<string, unknown>; label: string; sizeM: number } | null>(null);
   const previousMapId = useRef("");
   const toolsToggleRef = useRef<HTMLButtonElement>(null);
   const wsRef = useRef<WebSocket | null>(null);
@@ -68,6 +72,7 @@ export function RoomPage() {
     () => new Set(state?.visibleTokens.filter((token) => token.can_move).map((token) => token.id)),
     [state?.visibleTokens],
   );
+  const rulerList = useMemo(() => remoteRulers(sharedRulers, members), [sharedRulers, members]);
   const selectedTokens = mapSelection?.kind === "tokens" ? state?.visibleTokens.filter((token) => mapSelection.ids.includes(token.id)) ?? [] : [];
   const removableTokens = selectedTokens.filter((token) => isDM || token.owner_user_id === user?.id);
   const selectedStructure = mapSelection?.kind === "structure" ? state?.structures.find((structure) => structure.id === mapSelection.id) : undefined;
@@ -112,6 +117,7 @@ export function RoomPage() {
     setActionEditorTokenId(null);
     // Placing the first structure in a map-less room starts a map; keep the brush active through that.
     if (previousMapId.current) setPlacingStructure(false);
+    setPlacingToken(null);
     previousMapId.current = currentMapId;
   }, [currentMapId]);
 
@@ -140,7 +146,10 @@ export function RoomPage() {
       }
       if (event.type === "token.updated" || event.type === "token.removed" || event.type === "structure.moved" || event.type === "structure.updated" || event.type === "structure.created" || event.type === "structure.removed" || event.type === "map.activated" || event.type === "vision.update" || event.type === "check.changed" || event.type === "member.joined" || event.type === "state.snapshot") void load();
       if (event.type === "combat.changed") void load();
-      if (event.type === "map.activated" || event.type === "state.snapshot") setRemoteDrags(new Map());
+      if (event.type === "map.activated" || event.type === "state.snapshot") {
+        setRemoteDrags(new Map());
+        setSharedRulers(new Map());
+      }
       // The preview stays on the landing position until the reloaded state has the token there.
       if (event.type === "token.moved" && isTokenIdsBody(event.body)) {
         const ids = event.body.token_ids;
@@ -163,7 +172,18 @@ export function RoomPage() {
         setRemoteDrags((current) => withoutKeys(current, [id]));
       }
       if (event.type === "presence.changed" && isPresenceBody(event.body)) setOnlineUserIds(new Set(event.body.online_user_ids));
-      if (event.type === "ruler.result" && isMetersBody(event.body)) setRuler(Number(event.body.meters));
+      if (event.type === "ruler.shown" && isSharedRuler(event.body)) {
+        const ruler = event.body;
+        setSharedRulers((current) => new Map(current).set(ruler.conn_id, ruler));
+      }
+      if (event.type === "ruler.cleared" && isClearedRuler(event.body)) {
+        const id = event.body.conn_id;
+        setSharedRulers((current) => {
+          const next = new Map(current);
+          next.delete(id);
+          return next;
+        });
+      }
       if (event.type === "error" && isErrorBody(event.body)) {
         toast({ kind: "error", message: event.body.message });
         void load();
@@ -178,10 +198,12 @@ export function RoomPage() {
       setConnected(false);
       setRemoteDrags(new Map());
       setOnlineUserIds(new Set());
+      setSharedRulers(new Map());
     };
     ws.onerror = () => toast({ kind: "error", message: "The live connection was interrupted. Reload this room to reconnect." });
     return () => {
       dragFrames.cancel();
+      measure.cancel();
       ws.onopen = null;
       ws.onclose = null;
       ws.onerror = null;
@@ -256,7 +278,7 @@ export function RoomPage() {
     } : current);
   }
 
-  const measure = useMemo(() => throttlePoint((from: Point, to: Point) => sendMap("ruler.measure", { from, to }), 100), [roomId]);
+  const measure = useMemo(() => createFrameThrottle(({ from, to }: { from: Point; to: Point }) => trySend("ruler.measure", { from, to }), 50), [roomId]);
   const dragFrames = useMemo(() => createFrameThrottle((moves: { tokenId: string; to: Point }[]) => trySend("token.drag", { moves }), 50), [roomId]);
 
   async function update(action: () => Promise<unknown>) {
@@ -286,17 +308,35 @@ export function RoomPage() {
     });
   }
 
+  // Add token arms a placement: the token is created where the user next clicks the map.
   function addToken(e: FormEvent) {
     e.preventDefault();
-    if (isDM) {
-      // Monster tokens are named and numbered by the server unless the DM typed a name.
-      const body = monsterChoice
-        ? { monster_id: monsterChoice, name: tokenName.trim() || undefined, x_m: 2, y_m: 2 }
-        : { name: tokenName.trim() || sheets.find((item) => item.id === sheet)?.name || "Token", sheet_id: sheet || undefined, x_m: 2, y_m: 2 };
-      void update(() => postJSON(`/api/rooms/${roomId}/tokens`, body));
+    if (placingToken) {
+      setPlacingToken(null);
       return;
     }
-    if (sheet) void update(() => postJSON(`/api/rooms/${roomId}/tokens`, { sheet_id: sheet, name: sheets.find((item) => item.id === sheet)?.name ?? "Token", x_m: 2, y_m: 2 }));
+    const sheetName = sheets.find((item) => item.id === sheet)?.name;
+    const monster = monsters.find((item) => item.id === monsterChoice);
+    if (isDM) {
+      // Monster tokens are named and numbered by the server unless the DM typed a name.
+      const body = monster
+        ? { monster_id: monster.id, name: tokenName.trim() || undefined }
+        : { name: tokenName.trim() || sheetName || "Token", sheet_id: sheet || undefined };
+      setPlacingToken({ body, label: tokenName.trim() || monster?.name || sheetName || "Token", sizeM: monster?.size_m ?? 1 });
+    } else if (sheet) {
+      setPlacingToken({ body: { sheet_id: sheet, name: sheetName ?? "Token" }, label: sheetName ?? "your character", sizeM: 1 });
+    } else {
+      return;
+    }
+    setPlacingStructure(false);
+    setToolsOpen(false);
+  }
+
+  function placeToken(at: Point) {
+    if (!placingToken) return;
+    const { body } = placingToken;
+    setPlacingToken(null);
+    void update(() => postJSON(`/api/rooms/${roomId}/tokens`, { ...body, x_m: at.x, y_m: at.y }));
   }
 
   function attachMap(e: FormEvent) {
@@ -401,7 +441,7 @@ export function RoomPage() {
               <option value="">{isDM ? "No character sheet" : "Choose a character sheet"}</option>
               {roomSheets.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}
             </select>
-            <button className="btn shrink-0" disabled={(!isDM && !sheet) || busy}>{busy ? "Adding…" : "Add token"}</button>
+            <button className="btn shrink-0" disabled={(!isDM && !sheet) || busy}>{busy ? "Adding…" : placingToken ? "Cancel placing" : "Add token"}</button>
           </div>
           {!isDM && roomSheets.length === 0 && <p className="text-muted text-sm">No {state.room.rule_book.name} characters yet. <Link className="text-[var(--accent)] underline underline-offset-4" to={`/sheets?room=${encodeURIComponent(state.room.id)}`}>Create a character</Link> to place a token.</p>}
           {isDM && <p className="text-muted text-sm">DM tokens do not require a character sheet. A monster token gets its own copy of the rule book's stat block and attacks; players never see its stats.</p>}
@@ -429,6 +469,7 @@ export function RoomPage() {
               return;
             }
             setPlacingStructure(true);
+            setPlacingToken(null);
             setToolsOpen(false);
           }}>{placingStructure ? "Stop placing" : "Place on map"}</button>
         </div>}
@@ -474,13 +515,13 @@ export function RoomPage() {
               </button>}
             </div>
           </div>
+          <div className="h-[70dvh] min-h-[360px]">
           <MapCanvas
             state={state}
             selectedTokenIds={mapSelection?.kind === "tokens" ? mapSelection.ids : undefined}
             selectedStructureId={mapSelection?.kind === "structure" ? mapSelection.id : undefined}
             movableTokenIds={movableTokenIds}
             canMoveStructures={isDM}
-            rulerDistanceMeters={ruler}
             onSelect={setMapSelection}
             onMoveToken={(tokenId, to, path) => moveRoomTokens("token.move", { tokenId, to, path }, [{ tokenId, to }])}
             onMoveTokens={(moves) => moveRoomTokens("tokens.move", { moves }, moves)}
@@ -492,7 +533,12 @@ export function RoomPage() {
               trySend("token.drag.end", {});
             }}
             onMoveStructure={moveRoomStructure}
-            onMeasure={measure}
+            onMeasure={(from, to) => measure.push({ from, to })}
+            onMeasureEnd={() => {
+              measure.cancel();
+              trySend("ruler.clear", {});
+            }}
+            remoteRulers={rulerList}
             onAction={(request) => sendMap(request.type, request.body)}
             onEditActions={(tokenId) => {
               setActionEditorTokenId(tokenId);
@@ -501,7 +547,11 @@ export function RoomPage() {
             placingStructure={placingStructure ? { kind: structureKind } : null}
             onPlaceStructure={(geometry) => sendMap("structure.create", { kind: structureKind, geometry, ...structureBlocks })}
             onCancelPlacement={() => setPlacingStructure(false)}
+            placingToken={placingToken}
+            onPlaceToken={placeToken}
+            onCancelTokenPlacement={() => setPlacingToken(null)}
           />
+          </div>
           {!state.activeMap && <p className="text-muted text-sm">{isDM ? "No map is active. Choose or start one in the Map & tokens controls, or use Place structure to start a blank map." : "No map is active. Ask your game master to choose a room map."}</p>}
       </section>
       <aside className="col-start-1 row-start-3 min-w-0 space-y-6 md:col-start-2 md:row-start-2 2xl:col-start-3 2xl:row-start-1 2xl:[&_.card]:p-5!" aria-label="Room members and chat">
@@ -519,17 +569,6 @@ export function RoomPage() {
   </div>;
 }
 
-function throttlePoint(fn: (from: Point, to: Point) => void, ms: number) {
-  let last = 0;
-  return (from: Point, to: Point) => {
-    const now = Date.now();
-    if (now - last > ms) {
-      last = now;
-      fn(from, to);
-    }
-  };
-}
-
 function activeMapId(state: VisibleRoomState) {
   return state.activeMap?.map_id ?? state.activeMap?.id ?? "";
 }
@@ -541,11 +580,6 @@ function isChatMessage(body: unknown): body is ChatMessage {
 function isPresenceBody(body: unknown): body is PresenceChange {
   return !!body && typeof body === "object" && "online_user_ids" in body && Array.isArray(body.online_user_ids);
 }
-
-function isMetersBody(body: unknown): body is { meters: number } {
-  return !!body && typeof body === "object" && "meters" in body && typeof body.meters === "number";
-}
-
 function isTokenIdsBody(body: unknown): body is { token_ids: string[] } {
   return !!body && typeof body === "object" && "token_ids" in body && Array.isArray(body.token_ids);
 }
