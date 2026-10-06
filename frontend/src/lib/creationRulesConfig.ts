@@ -1,5 +1,6 @@
 import type { ActionLists, CreationRules } from "../api/types";
 import { fieldFromValue, objectFromFields, parseAttributes, type Field } from "./attributeFields";
+import { uniqueSlug } from "./ruleBooks";
 
 function object(value: unknown, label: string): Record<string, unknown> {
   if (value === null || typeof value !== "object" || Array.isArray(value)) throw new Error(`${label} must be an object.`);
@@ -160,11 +161,18 @@ function draftInteger(value: string, label: string) {
   return number;
 }
 
+/** A class without an id (a new one) gets one from its name; saved classes keep theirs when renamed. */
 export function rulesFromDraft(draft: CreationRulesDraft, attributes?: Record<string, unknown>, compendium?: ActionLists): CreationRules {
   if (draft.mode === "json") return parseCreationRules(draft.json, attributes, compendium);
   const rules: CreationRules = {};
-  if (draft.classes.length) rules.classes = draft.classes.map((cls) => ({
-    id: cls.id, name: cls.name, ...(cls.description ? { description: cls.description } : {}), defaults: objectFromFields(cls.defaults, `${cls.name || "Class"} defaults`),
+  const taken = new Set(draft.classes.map((cls) => cls.id).filter(Boolean));
+  const classIds = draft.classes.map((cls) => {
+    const id = cls.id || uniqueSlug(cls.name, taken, "class");
+    taken.add(id);
+    return id;
+  });
+  if (draft.classes.length) rules.classes = draft.classes.map((cls, index) => ({
+    id: classIds[index], name: cls.name, ...(cls.description ? { description: cls.description } : {}), defaults: objectFromFields(cls.defaults, `${cls.name || "Class"} defaults`),
     choices: cls.choices.map((choice) => ({ attribute: choice.attribute, label: choice.label, count: draftInteger(choice.count, `${choice.label || "Choice group"} selection count`), options: [...choice.options] })),
     ...(equipmentLists.some((list) => cls.startingEquipment[list].length) ? { starting_equipment: { attacks: [...cls.startingEquipment.attacks], actions: [...cls.startingEquipment.actions], items: [...cls.startingEquipment.items] } } : {}),
     ...(cls.spellList ? { spell_list: [...cls.spellList] } : {}),

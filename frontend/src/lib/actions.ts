@@ -1,6 +1,8 @@
 import type {
+  ActionKind,
   ActionLists,
   ActionRoll,
+  CheckKind,
   ResolvedTokenAction,
   ResolvedTokenAttack,
   ResolvedTokenItem,
@@ -22,7 +24,7 @@ export const damageTypes = [
   "acid", "bludgeoning", "cold", "fire", "force", "lightning", "necrotic", "piercing", "poison", "psychic", "radiant", "slashing", "thunder",
 ];
 
-export type QuickCheck = { kind: "ability" | "save" | "skill"; key: string };
+export type QuickCheck = { kind: CheckKind; key: string };
 
 export type WheelChoice =
   | { kind: "attack"; attack: ResolvedTokenAttack }
@@ -257,4 +259,54 @@ export function compendiumSummary(entry: TokenAttack | TokenAction | TokenItem):
   parts.push(`${entry.range_m} m`);
   if ("quantity" in entry) parts.push(`×${entry.quantity}`);
   return parts.join(" · ");
+}
+
+/** A score's modifier like the server's `abilityMod`: a missing or non-number score counts as 0. */
+export function abilityModifier(stats: Record<string, unknown>, ability: string): number {
+  const score = stats[ability];
+  return typeof score === "number" ? Math.floor((score - 10) / 2) : 0;
+}
+
+/** An attack or effect being edited, with its bonuses already parsed. */
+export type RollPreviewInput = {
+  kind: ActionKind;
+  ability: string;
+  proficient: boolean;
+  bonus: number;
+  dice: string;
+  diceBonus: number;
+  abilityToDice: boolean;
+  damageType: string;
+};
+
+/** "+ Strength modifier + 2", "- 1": the terms after the first in a sum. */
+function terms(parts: (string | number)[]): string {
+  return parts.map((part) => typeof part === "number" ? (part < 0 ? ` - ${-part}` : ` + ${part}`) : ` + ${part}`).join("");
+}
+
+/**
+ * What an attack or effect will roll, the way the server resolves it (`ResolveAction`). With the
+ * owner's stats the totals are worked out; without them the formula names what gets added.
+ */
+export function rollPreview(p: RollPreviewInput, stats?: Record<string, unknown>): string[] {
+  const ability = p.ability ? humanizeKey(p.ability) : "";
+  const dice = p.dice.replace(/\s+/g, "") || "no dice yet";
+  const effect = p.kind === "heal" ? "Healing" : "Damage";
+  const type = p.damageType && p.kind !== "heal" ? ` ${p.damageType}` : "";
+  const lines: string[] = [];
+  if (stats) {
+    const mod = p.ability ? abilityModifier(stats, p.ability) : 0;
+    const bonus = stats.proficiency_bonus;
+    const prof = p.proficient && typeof bonus === "number" ? Math.round(bonus) : 0;
+    const why = [ability && `${ability} ${signed(mod)}`, p.proficient && `proficiency ${signed(prof)}`, p.bonus !== 0 && `bonus ${signed(p.bonus)}`].filter(Boolean).join(", ");
+    if (p.kind === "attack") lines.push(`To hit: ${signed(mod + prof + p.bonus)}${why ? ` (${why})` : ""}`);
+    if (p.kind === "save") lines.push(`Save DC: ${8 + mod + prof + p.bonus} (8${why ? `, ${why}` : ""})`);
+    lines.push(`${effect}: ${dice}${formatModifier(p.diceBonus + (p.abilityToDice ? mod : 0))}${type}`);
+    return lines;
+  }
+  const added = [...ability ? [`${ability} modifier`] : [], ...p.proficient ? ["proficiency bonus"] : [], ...p.bonus !== 0 ? [p.bonus] : []];
+  if (p.kind === "attack") lines.push(`To hit: 1d20${terms(added)}`);
+  if (p.kind === "save") lines.push(`Save DC: 8${terms(added)}`);
+  lines.push(`${effect}: ${dice}${terms([...p.abilityToDice && ability ? [`${ability} modifier`] : [], ...p.diceBonus !== 0 ? [p.diceBonus] : []])}${type}`);
+  return lines;
 }

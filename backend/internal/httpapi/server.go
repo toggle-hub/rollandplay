@@ -93,6 +93,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/rule-books", s.handleRuleBookCreate)
 	mux.HandleFunc("GET /api/rule-books/{ruleBookID}", s.handleRuleBookGet)
 	mux.HandleFunc("PATCH /api/rule-books/{ruleBookID}", s.handleRuleBookPatch)
+	mux.HandleFunc("DELETE /api/rule-books/{ruleBookID}", s.handleRuleBookDelete)
 	mux.HandleFunc("POST /api/rule-books/{ruleBookID}/editors", s.handleRuleBookEditor)
 	mux.HandleFunc("GET /api/sheets", s.handleSheetsList)
 	mux.HandleFunc("POST /api/sheets", s.handleSheetCreate)

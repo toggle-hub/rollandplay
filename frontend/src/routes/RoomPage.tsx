@@ -28,6 +28,8 @@ import { createRefreshQueue, type RefreshQueue } from "../lib/refreshQueue";
 import { keepSocketOpen } from "../lib/reconnectingSocket";
 import { allRoomParts, partsToReload, type RoomPart } from "../lib/roomEvents";
 import { useViewportFill } from "../lib/useViewportFill";
+import { quickCheckGroups } from "../lib/checks";
+import { useRuleBook } from "../lib/useRuleBook";
 
 type Point = { x: number; y: number };
 
@@ -84,6 +86,7 @@ export function RoomPage() {
   const loaded = useRef(false);
   const toast = useToast();
   const [gridRef, fill] = useViewportFill<HTMLDivElement>(roomBottomGapPx, 360);
+  const ruleBook = useRuleBook(state?.room.rule_book.id);
   const myMember = members.find((member) => member.user_id === user?.id);
   const isDM = !!myMember?.is_dm;
   // Characters usable at this table: the room's rule book, and for players only their own sheets.
@@ -607,6 +610,7 @@ export function RoomPage() {
             }}
             remoteRulers={rulerList}
             onAction={(request) => sendMap(request.type, request.body)}
+            checkGroups={quickCheckGroups(ruleBook?.attributes)}
             onEditActions={(tokenId) => {
               setActionEditorTokenId(tokenId);
             }}
@@ -640,6 +644,7 @@ export function RoomPage() {
     </div>
     {actionEditorToken && <Dialog name={{ labelledBy: `actions-heading-${actionEditorToken.id}` }} wide onClose={() => setActionEditorTokenId(null)}>
       <ActionsEditor key={actionEditorToken.id} owner={actionEditorToken} busy={busy}
+        stats={actionEditorToken.sheet_id ? sheets.find((item) => item.id === actionEditorToken.sheet_id)?.data : actionEditorToken.attributes}
         onSave={(lists) => void update(() => patchJSON(`/api/rooms/${roomId}/tokens/${actionEditorToken.id}/actions`, lists))}
         onClose={() => setActionEditorTokenId(null)} />
     </Dialog>}

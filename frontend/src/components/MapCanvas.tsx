@@ -6,6 +6,7 @@ import { choiceRequest, choiceTargeting, choiceTitle, choiceUsesD20, confirmLine
 import { attackLineBlocked, attackTargetStatus, type AttackTargetStatus } from "../lib/attacks";
 import { drawLabel } from "../lib/canvasLabel";
 import { distanceLabel, formatMeters, pathLength } from "../lib/distance";
+import type { QuickCheckGroup } from "../lib/checks";
 import { geometryCenter, rotateGeometry, type Point } from "../lib/geometryTransforms";
 import { clampCamera, fitCamera, mapToView, pinchCamera, pixelsPerMeter, viewToMap, wheelZoomFactor, zoomAt, type Camera, type Size } from "../lib/mapCamera";
 import type { RemoteRuler } from "../lib/rulers";
@@ -41,6 +42,8 @@ type Props = {
   /** Sent when the viewer presses Roll on the confirm card of an action, check or death save. */
   onAction?: (request: ActionRequest) => void;
   onEditActions?: (tokenId: string) => void;
+  /** The action wheel's Checks, built from the room rule book; D&D checks when absent. */
+  checkGroups?: QuickCheckGroup[];
   floatingResults?: readonly FloatingResult[];
   placingStructure?: { kind: string } | null;
   onPlaceStructure?: (geometry: Point[]) => void;
@@ -119,6 +122,7 @@ export function MapCanvas({
   onSelect,
   onAction,
   onEditActions,
+  checkGroups,
   floatingResults,
   placingStructure,
   onPlaceStructure,
@@ -1166,6 +1170,7 @@ export function MapCanvas({
         x={actionWheel.x}
         y={actionWheel.y}
         token={wheelToken}
+        checkGroups={checkGroups}
         onPreview={(rangeM) => setRangePreview(rangeM === null ? null : { tokenId: wheelToken.id, rangeM })}
         onChoose={chooseAction}
         onEdit={wheelToken.actions_editable && onEditActions ? () => {

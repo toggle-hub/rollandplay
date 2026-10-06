@@ -38,3 +38,29 @@ export function humanizeKey(key: string): string {
 export function isPendingFor(check: RoomCheck, userId: string | undefined): boolean {
   return !check.closed_at && !!userId && check.targets.some((target) => target.user_id === userId && !target.roll);
 }
+
+export type QuickCheckGroup = { label: string; kind: CheckKind; keys: string[] };
+
+const dndCheckGroups: QuickCheckGroup[] = [
+  { label: "Saving throws", kind: "save", keys: dndAbilities },
+  { label: "Skills", kind: "skill", keys: dndSkills },
+  { label: "Ability checks", kind: "ability", keys: dndAbilities },
+];
+
+/** Numbers the table tracks rather than rolls: health, armor, movement, level and the like. */
+const trackedKeys: Record<string, true> = {
+  level: true, proficiency_bonus: true, armor_class: true, speed_m: true, vision_range_m: true, hit_points: true, max_hit_points: true,
+  temporary_hit_points: true, hit_die: true, death_save_successes: true, death_save_failures: true,
+};
+const attributeKey = new RegExp(`^${attributeKeyPattern}$`);
+
+/**
+ * The checks a token can roll from the action wheel. A book with the six D&D ability scores (or an
+ * unknown book) gets saving throws, skills and ability checks; any other book gets one check per
+ * top-level number attribute, added to the d20 as-is.
+ */
+export function quickCheckGroups(attributes?: Record<string, unknown>): QuickCheckGroup[] {
+  if (!attributes || dndAbilities.every((ability) => typeof attributes[ability] === "number")) return dndCheckGroups;
+  const keys = Object.keys(attributes).filter((key) => typeof attributes[key] === "number" && attributeKey.test(key) && !Object.hasOwn(trackedKeys, key));
+  return keys.length ? [{ label: "Checks", kind: "attribute", keys }] : [];
+}

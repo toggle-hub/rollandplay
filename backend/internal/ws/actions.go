@@ -444,8 +444,8 @@ func (c *client) deathSave(msg clientEnvelope) {
 	c.finishRoll(ctx, tx, msg.RequestID, withNote(fmt.Sprintf("%s makes a death saving throw", token.Name), req.RollOptions), roll, true)
 }
 
-// checkQuick rolls an ability check, saving throw or skill check for a token the sender
-// controls, without a DC. Body: {tokenId, kind, key, mode?, bonus?}.
+// checkQuick rolls an ability check, saving throw, skill check or attribute check for a token
+// the sender controls, without a DC. Body: {tokenId, kind, key, mode?, bonus?}.
 func (c *client) checkQuick(msg clientEnvelope) {
 	var req struct {
 		TokenID string `json:"tokenId"`
@@ -472,10 +472,6 @@ func (c *client) checkQuick(msg clientEnvelope) {
 		return
 	}
 	check := game.Check{Kind: req.Kind, Key: req.Key}
-	if !slices.Contains([]string{game.CheckAbility, game.CheckSave, game.CheckSkill}, check.Kind) {
-		c.error(msg.RequestID, "invalid_check", "check kind must be ability, save or skill")
-		return
-	}
 	if err := check.Validate(); err != nil {
 		c.error(msg.RequestID, "invalid_check", err.Error())
 		return

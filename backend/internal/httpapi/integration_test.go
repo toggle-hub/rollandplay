@@ -1279,7 +1279,7 @@ func TestRoomTokenActions(t *testing.T) {
 	expectError("action.resolve", "no-point", "no_point", act("action", "burst", nil))
 	expectError("action.resolve", "bad-source", "bad_json", act("spell", "burst", nil))
 	expectError("death.save", "not-dying", "not_dying", map[string]any{"tokenId": heroID})
-	expectError("check.quick", "bad-check", "invalid_check", map[string]any{"tokenId": heroID, "kind": "attribute", "key": "speed_m"})
+	expectError("check.quick", "bad-check", "invalid_check", map[string]any{"tokenId": heroID, "kind": "initiative", "key": "dexterity"})
 
 	// Every roll is broadcast, so drain it from both sockets to keep them in step.
 	roll := func(conn *websocket.Conn, typ, id string, body map[string]any) (string, map[string]any) {
@@ -1305,6 +1305,11 @@ func TestRoomTokenActions(t *testing.T) {
 	body, action := roll(pWS, "check.quick", "stealth", map[string]any{"tokenId": heroID, "kind": "skill", "key": "stealth"})
 	if body != "Hero: Stealth check" || action["expression"] != "1d20+1" {
 		t.Fatalf("quick check: %q %+v", body, action)
+	}
+	// Rule books other than D&D use attribute checks: the attribute's value is added as-is.
+	body, action = roll(pWS, "check.quick", "dexterity-attribute", map[string]any{"tokenId": heroID, "kind": "attribute", "key": "dexterity"})
+	if body != "Hero: Dexterity check" || action["expression"] != "1d20+12" {
+		t.Fatalf("attribute quick check: %q %+v", body, action)
 	}
 
 	body, action = roll(pWS, "action.resolve", "hero-sword", act("attack", "sword", map[string]any{"targetTokenId": goblinID}))
