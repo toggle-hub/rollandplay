@@ -24,6 +24,9 @@ type creationClass struct {
 	Defaults          map[string]any     `json:"defaults"`
 	Choices           []creationChoice   `json:"choices,omitempty"`
 	StartingEquipment *startingEquipment `json:"starting_equipment,omitempty"`
+	// SpellList names the compendium actions characters of this class may pick at creation;
+	// absent offers every action, empty offers none.
+	SpellList []string `json:"spell_list,omitempty"`
 }
 
 // startingEquipment names compendium entries a class's characters start with; the client
@@ -161,6 +164,14 @@ func parseCreationRules(raw json.RawMessage, attributes map[string]any, compendi
 						return rules, fmt.Errorf("%s: starting equipment %q is not in the compendium", class.Name, id)
 					}
 				}
+			}
+		}
+		if !distinctNames(class.SpellList) {
+			return rules, fmt.Errorf("%s: spell list repeats an entry", class.Name)
+		}
+		for _, id := range class.SpellList {
+			if !compendium.Has("actions", id) {
+				return rules, fmt.Errorf("%s: spell list entry %q is not in the compendium", class.Name, id)
 			}
 		}
 		groups := make(map[string]bool)

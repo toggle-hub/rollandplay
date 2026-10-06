@@ -80,6 +80,8 @@ export type CharacterClass = {
   choices?: ClassChoice[];
   /** Compendium ids the class pre-picks at character creation. */
   starting_equipment?: StartingEquipment;
+  /** Compendium action ids the class may pick at creation; absent offers every action, empty none. */
+  spell_list?: string[];
 };
 export type StartingEquipment = { attacks?: string[]; actions?: string[]; items?: string[] };
 export type PointBuyRules = {

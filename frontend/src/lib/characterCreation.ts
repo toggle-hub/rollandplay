@@ -1,8 +1,8 @@
 import type { CharacterCreation, CreationRules, RuleBook } from "../api/types";
 
-export type CreationErrorGroup = "form" | "name" | "book" | "class" | `choice:${string}` | "points" | "values";
+export type CreationErrorGroup = "form" | "name" | "book" | "class" | `choice:${string}` | "points" | "values" | `value:${string}`;
 
-/** A character-creation error shown at the top of the form group it belongs to. */
+/** A character-creation error shown next to the field or group it belongs to. */
 export class CreationError extends Error {
   constructor(message: string, readonly group: CreationErrorGroup) { super(message); }
 }
@@ -51,7 +51,8 @@ export function completeCharacterData(book: RuleBook, creation: CharacterCreatio
   return { ...book.attributes, ...data, ...managedCharacterData(book, creation) };
 }
 
-function equalValue(left: unknown, right: unknown): boolean {
+/** Deep equality for JSON values. */
+export function equalValue(left: unknown, right: unknown): boolean {
   if (left === right) return true;
   if (left === null || right === null || typeof left !== "object" || typeof right !== "object") return false;
   if (Array.isArray(left) !== Array.isArray(right)) return false;
@@ -62,12 +63,12 @@ function equalValue(left: unknown, right: unknown): boolean {
 export function validateManagedData(book: RuleBook, creation: CharacterCreation, data: Record<string, unknown>) {
   for (const [key, expected] of Object.entries(managedCharacterData(book, creation))) {
     if (Object.hasOwn(data, key) && !equalValue(data[key], expected)) {
-      throw new CreationError(`${creationLabel(key)} is set by your class or point allocation. Change it using the controls above, not the character JSON.`, "values");
+      throw new CreationError(`${creationLabel(key)} is set by your class or ability scores, so it can't also be a custom detail.`, "values");
     }
   }
 }
 
-export function validateCharacterCreation(book: RuleBook, creation: CharacterCreation) {
+export function validateClassSelection(book: RuleBook, creation: CharacterCreation) {
   const rules = book.creation_rules;
   const selected = rules.classes?.find((item) => item.id === creation.class_id);
   if (rules.classes?.length && !selected) throw new CreationError("Choose a class for your character.", "class");
@@ -77,7 +78,10 @@ export function validateCharacterCreation(book: RuleBook, creation: CharacterCre
       throw new CreationError(`${choice.label}: choose exactly ${choice.count} different options from the list.`, `choice:${choice.attribute}`);
     }
   }
-  const points = rules.point_buy;
+}
+
+export function validatePointAllocation(book: RuleBook, creation: CharacterCreation) {
+  const points = book.creation_rules.point_buy;
   if (!points) return;
   let spent = 0, bonuses = 0;
   for (const attribute of points.attributes) {

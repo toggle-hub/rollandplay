@@ -107,3 +107,23 @@ func TestCreationAcceptsStartingEquipmentFromCompendium(t *testing.T) {
 		t.Fatal("repeated starting equipment accepted")
 	}
 }
+
+func TestCreationClassSpellListNamesCompendiumActions(t *testing.T) {
+	compendium := game.Compendium{Actions: []game.Action{{ID: "bolt", Name: "Bolt"}}}
+	for _, raw := range []string{
+		`{"classes":[{"id":"a","name":"A","defaults":{},"spell_list":["bolt"]}]}`,
+		`{"classes":[{"id":"a","name":"A","defaults":{},"spell_list":[]}]}`,
+	} {
+		if _, err := parseCreationRules(json.RawMessage(raw), nil, compendium); err != nil {
+			t.Fatalf("valid spell list rejected: %s: %v", raw, err)
+		}
+	}
+	for _, raw := range []string{
+		`{"classes":[{"id":"a","name":"A","defaults":{},"spell_list":["fireball"]}]}`,
+		`{"classes":[{"id":"a","name":"A","defaults":{},"spell_list":["bolt","bolt"]}]}`,
+	} {
+		if _, err := parseCreationRules(json.RawMessage(raw), nil, compendium); err == nil {
+			t.Fatalf("invalid spell list accepted: %s", raw)
+		}
+	}
+}

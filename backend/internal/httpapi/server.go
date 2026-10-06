@@ -96,6 +96,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/sheets", s.handleSheetCreate)
 	mux.HandleFunc("GET /api/sheets/{sheetID}", s.handleSheetGet)
 	mux.HandleFunc("PATCH /api/sheets/{sheetID}", s.handleSheetPatch)
+	mux.HandleFunc("DELETE /api/sheets/{sheetID}", s.handleSheetDelete)
 	mux.HandleFunc("PATCH /api/sheets/{sheetID}/actions", s.handleSheetActionsPatch)
 	mux.HandleFunc("GET /api/maps", s.handleMapsList)
 	mux.HandleFunc("POST /api/maps", s.handleMapCreate)
@@ -959,7 +960,13 @@ func (s *Server) handleSheetPatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	req, raw, _ := readJSONWithRaw(r)
-	if data, ok := req["data"].(map[string]any); ok {
+	_, hasData := req["data"]
+	if hasData {
+		data, err := requestObject(req, "data")
+		if err != nil {
+			WriteError(w, 400, "invalid_data", err.Error())
+			return
+		}
 		if err := game.ValidateStatLists(data); err != nil {
 			WriteError(w, 400, "invalid_actions", err.Error())
 			return
@@ -971,7 +978,14 @@ func (s *Server) handleSheetPatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	row, err := s.oneJSON(r.Context(), `update sheets set name=coalesce($3,name),data=coalesce($4,data),is_public=coalesce($5,is_public),key_order=key_order||$6,updated_at=now() where id=$1 and user_id=$2 returning `+sheetJSON, r.PathValue("sheetID"), u.ID, nullableString(req, "name"), nullableJSON(req, "data"), nullableBool(req, "is_public"), order)
-	respondRaw(w, row, err)
+	if err != nil {
+		respondRaw(w, nil, err)
+		return
+	}
+	if hasData {
+		s.refreshSheetTokens(r.Context(), r.PathValue("sheetID"))
+	}
+	respondRaw(w, row, nil)
 }
 
 // handleSheetActionsPatch replaces the owner's sheet attacks, spells and abilities, and items,
@@ -1001,22 +1015,7 @@ func (s *Server) handleSheetActionsPatch(w http.ResponseWriter, r *http.Request)
 		respondRaw(w, nil, err)
 		return
 	}
-	// The write succeeded; a failed lookup only skips the live refresh.
-	rows, err := s.Pool.Query(ctx, `select rt.id::text, rm.room_id::text from room_tokens rt join room_maps rm on rm.id=rt.room_map_id where rt.sheet_id=$1`, sheetID)
-	if err == nil {
-		var tokens [][2]string
-		for rows.Next() {
-			var tokenID, roomID string
-			if rows.Scan(&tokenID, &roomID) == nil {
-				tokens = append(tokens, [2]string{tokenID, roomID})
-			}
-		}
-		rows.Close()
-		for _, t := range tokens {
-			s.bumpRoom(ctx, t[1])
-			s.Hub.PublishTokenUpdated(t[1], t[0])
-		}
-	}
+	s.refreshSheetTokens(ctx, sheetID)
 	respondRaw(w, row, nil)
 }
 

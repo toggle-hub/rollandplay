@@ -38,7 +38,7 @@ export function validateCreationRules(value: unknown, attributes?: Record<string
     rules.classes.forEach((entry, index) => {
       const label = `Class ${index + 1}`;
       const cls = object(entry, label);
-      keys(cls, ["id", "name", "description", "defaults", "choices", "starting_equipment"], label);
+      keys(cls, ["id", "name", "description", "defaults", "choices", "starting_equipment", "spell_list"], label);
       text(cls.id, `${label} ID`);
       text(cls.name, `${label} name`);
       if (classIds.has(cls.id) || classNames.has(cls.name)) throw new Error(`${label}: class IDs and names must be unique.`);
@@ -61,6 +61,16 @@ export function validateCreationRules(value: unknown, attributes?: Record<string
             seen.add(id);
             if (compendium && !compendium[list].some((entry) => entry.id === id)) throw new Error(`${label}: starting equipment “${id}” is not in the compendium.`);
           }
+        }
+      }
+      if (cls.spell_list !== undefined) {
+        if (!Array.isArray(cls.spell_list)) throw new Error(`${label} spell list must be a list.`);
+        const seen = new Set<string>();
+        for (const id of cls.spell_list) {
+          text(id, `${label} spell list entry`);
+          if (seen.has(id)) throw new Error(`${label}: spell list repeats “${id}”.`);
+          seen.add(id);
+          if (compendium && !compendium.actions.some((entry) => entry.id === id)) throw new Error(`${label}: spell “${id}” is not in the compendium.`);
         }
       }
       if (cls.choices !== undefined) {
@@ -117,7 +127,8 @@ export function parseCreationRules(json: string, attributes?: Record<string, unk
 }
 
 type ChoiceDraft = { key: string; attribute: string; label: string; count: string; options: string[] };
-export type ClassDraft = { key: string; id: string; name: string; description: string; defaults: Field[]; choices: ChoiceDraft[]; startingEquipment: { attacks: string[]; actions: string[]; items: string[] } };
+/** `spellList` keeps a class's `spell_list` (absent: every spell) through field editing. */
+export type ClassDraft = { key: string; id: string; name: string; description: string; defaults: Field[]; choices: ChoiceDraft[]; startingEquipment: { attacks: string[]; actions: string[]; items: string[] }; spellList?: string[] };
 type PointDraft = { attributes: string[]; min: string; max: string; budget: string; costs: Record<string, string>; bonus_budget: string; bonus_max: string };
 export type CreationRulesDraft = { mode: "fields" | "json"; json: string; classes: ClassDraft[]; pointEnabled: boolean; point: PointDraft };
 
@@ -129,6 +140,7 @@ export function creationRulesDraft(rules: CreationRules = {}): CreationRulesDraf
       key: crypto.randomUUID(), id: cls.id, name: cls.name, description: cls.description ?? "", defaults: Object.entries(cls.defaults).map(([key, value]) => fieldFromValue(key, value)),
       choices: (cls.choices ?? []).map((choice) => ({ ...choice, key: crypto.randomUUID(), count: String(choice.count), options: [...choice.options] })),
       startingEquipment: { attacks: [...cls.starting_equipment?.attacks ?? []], actions: [...cls.starting_equipment?.actions ?? []], items: [...cls.starting_equipment?.items ?? []] },
+      ...(cls.spell_list ? { spellList: [...cls.spell_list] } : {}),
     })),
     pointEnabled: point !== undefined,
     point: point ? { attributes: [...point.attributes], min: String(point.min), max: String(point.max), budget: String(point.budget), costs: Object.fromEntries(Object.entries(point.costs).map(([score, cost]) => [score, String(cost)])), bonus_budget: String(point.bonus_budget), bonus_max: String(point.bonus_max) } : { attributes: [], min: "0", max: "5", budget: "10", costs: { "0": "0", "1": "1", "2": "2", "3": "3", "4": "4", "5": "5" }, bonus_budget: "0", bonus_max: "0" },
@@ -155,6 +167,7 @@ export function rulesFromDraft(draft: CreationRulesDraft, attributes?: Record<st
     id: cls.id, name: cls.name, ...(cls.description ? { description: cls.description } : {}), defaults: objectFromFields(cls.defaults, `${cls.name || "Class"} defaults`),
     choices: cls.choices.map((choice) => ({ attribute: choice.attribute, label: choice.label, count: draftInteger(choice.count, `${choice.label || "Choice group"} selection count`), options: [...choice.options] })),
     ...(equipmentLists.some((list) => cls.startingEquipment[list].length) ? { starting_equipment: { attacks: [...cls.startingEquipment.attacks], actions: [...cls.startingEquipment.actions], items: [...cls.startingEquipment.items] } } : {}),
+    ...(cls.spellList ? { spell_list: [...cls.spellList] } : {}),
   }));
   if (draft.pointEnabled) {
     const point = draft.point;
