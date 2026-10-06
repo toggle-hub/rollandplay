@@ -120,15 +120,34 @@ export async function apiFetch<T>(
     if (res.status === 401 && path !== "/api/me" && !path.startsWith("/api/auth/")) {
       sessionExpiredListeners.forEach((listener) => listener());
     }
-    let message = `${res.status}`;
+    let message = "";
     try {
       const data = await res.json();
-      message = data.error?.message ?? message;
+      if (typeof data?.error?.message === "string") message = data.error.message.trim();
     } catch {}
+    if (!message) message = statusMessage(res.status);
     throw new ApiError(res.status, message);
   }
   if (res.status === 204) return undefined as T;
   return restoreKeyOrder(await res.json()) as T;
+}
+
+/** A plain sentence for an error response that carries no message of its own (proxy errors, outages). */
+function statusMessage(status: number): string {
+  switch (status) {
+    case 400: return "That request couldn’t be processed. Check what you entered and try again.";
+    case 401: return "Your session has ended. Sign in again to continue.";
+    case 403: return "You don’t have permission to do that.";
+    case 404: return "We couldn’t find that. It may have been removed.";
+    case 408:
+    case 504: return "The server took too long to answer. Try again in a moment.";
+    case 409: return "That clashes with a recent change. Reload the page and try again.";
+    case 413: return "That file is too large.";
+    case 429: return "Too many requests at once. Wait a moment and try again.";
+    case 502:
+    case 503: return "The server is unavailable. Try again in a moment.";
+  }
+  return status >= 500 ? "Something went wrong on the server. Try again in a moment." : "That request didn’t go through. Try again.";
 }
 export const postJSON = <T>(path: string, body: unknown) =>
   apiFetch<T>(path, { method: "POST", body: JSON.stringify(body) });

@@ -112,7 +112,7 @@ export function AppShell() {
           </div>
           <div id="workspace-navigation" className={`${menuOpen ? "flex" : "hidden"} w-full flex-col gap-6 lg:flex lg:w-auto lg:flex-1 lg:flex-row lg:items-center lg:justify-between lg:gap-4`}>
             <nav aria-label="Workspace" className="workspace-nav flex flex-wrap gap-1">
-              {[["/rooms", "Rooms"], ["/friends", "Friends"], ["/rule-books", "Rule books"], ["/sheets", "Sheets"], ["/maps", "Maps"]].map(([to, label]) => (
+              {[["/rooms", "Rooms"], ["/friends", "Friends"], ["/rule-books", "Rule books"], ["/sheets", "Characters"], ["/maps", "Maps"]].map(([to, label]) => (
                 <NavLink key={to} to={to} className={({ isActive }) => `nav-link${isActive ? " active" : ""}`}>{label}</NavLink>
               ))}
             </nav>
@@ -122,11 +122,11 @@ export function AppShell() {
                 <span className="sr-only">Your profile: </span>
                 <PlayerName player={currentUser} className="max-w-52 truncate" />
               </Link>}
-              <button className="btn-secondary whitespace-nowrap" onClick={logout} disabled={signingOut}><SignOut aria-hidden="true" size={18} />{signingOut ? "Signing out…" : "Sign out"}</button>
+              <button className="btn-secondary whitespace-nowrap" onClick={logout} disabled={signingOut} aria-busy={signingOut}><SignOut aria-hidden="true" size={18} />{signingOut ? "Signing out…" : "Sign out"}</button>
             </div>
           </div>
-        </> : currentUser ? <div className="ml-auto flex min-w-0 items-center gap-4"><PlayerName player={currentUser} className="text-muted hidden max-w-52 truncate text-sm sm:inline" /><button className="btn-secondary whitespace-nowrap" onClick={logout} disabled={signingOut}><SignOut aria-hidden="true" size={18} />{signingOut ? "Signing out…" : "Sign out"}</button></div> : <nav aria-label="Main" className="header-links">
-          <a href="/#experience" className="nav-link"><span className="sm:hidden">Story</span><span className="hidden sm:inline">The experience</span></a>
+        </> : currentUser ? <div className="ml-auto flex min-w-0 items-center gap-4"><PlayerName player={currentUser} className="text-muted hidden max-w-52 truncate text-sm sm:inline" /><button className="btn-secondary whitespace-nowrap" onClick={logout} disabled={signingOut} aria-busy={signingOut}><SignOut aria-hidden="true" size={18} />{signingOut ? "Signing out…" : "Sign out"}</button></div> : <nav aria-label="Main" className="header-links">
+          <a href="/#experience" className="nav-link"><span className="sm:hidden">Features</span><span className="hidden sm:inline">How it works</span></a>
           <Link to="/login" className="btn">Sign in <ArrowRight aria-hidden="true" size={17} /></Link>
         </nav>}
       </header>
