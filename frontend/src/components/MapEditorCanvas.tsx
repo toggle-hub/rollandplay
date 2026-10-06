@@ -1,11 +1,16 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type MouseEvent, type PointerEvent, type ReactNode } from "react";
 import type { GameMap, MapStructure } from "../api/types";
 import { rotateGeometry, scaleGeometry, type Point } from "../lib/geometryTransforms";
+import { altKeyName } from "../lib/platform";
+import { nearestVertex, scaleFactorTowards, snapMoveDelta, snapPoint, structureVertices, type Snapped } from "../lib/snapping";
 import { expandToGroups } from "../lib/structureGroups";
+import { drawStructureShape, isAreaKind, structureColor } from "../lib/structureStyle";
 import { stampGeometry, structureLabel } from "../lib/structures";
+import { useAssetImage } from "../lib/useAssetImage";
 import { EditorContextMenu, type EditorAction } from "./EditorContextMenu";
 
-export type EditorTool = "select" | "place";
+/** "select" picks and transforms structures, "place" stamps fixed pieces, "draw" draws walls and areas point by point. */
+export type EditorTool = "select" | "place" | "draw";
 export type StampSettings = { kind: string; rotationDeg: number; scalePercent: number };
 type HoverState = { structure: MapStructure; canvasX: number; canvasY: number };
 export type TransformAction = "move" | "resize" | "rotate";
@@ -26,11 +31,13 @@ type TransformState = {
   /** Frame of the targets when the drag started; rotation draws it turned by `degrees`. */
   frame: GeometryFrame;
   anchor: Point;
+  /** Moves: the corner of the targets nearest the grab point, which snaps. Resizes: the dragged handle. */
+  grip: Point;
   startValue: number;
   degrees: number;
   moved: boolean;
 };
-type HandleHit = { kind: "rotate" } | { kind: "resize"; handle: ResizeHandle; anchor: Point };
+type HandleHit = { kind: "rotate" } | { kind: "resize"; handle: ResizeHandle; point: Point; anchor: Point };
 type PanState = {
   x: number;
   y: number;
@@ -45,22 +52,34 @@ type MarqueeState = {
   additive: boolean;
   moved: boolean;
 };
+type ContextMenuState = Point & { target: "selection" | "map" };
 
 type Props = {
   map: GameMap;
   structures: MapStructure[];
   selectedStructureIds?: string[];
-  /** "select" picks and transforms structures; "place" stamps `stamp` wherever the map is clicked. */
   tool?: EditorTool;
+  /** The brush of the Place and Draw tools. */
   stamp?: StampSettings;
-  /** Entries of the right-click menu opened over the selection. */
+  /** Right-click menu entries for the selection. */
   contextActions?: EditorAction[];
+  /** Right-click menu entries for empty map space. */
+  mapContextActions?: EditorAction[];
+  /** Structures not drawn and not pickable in the editor. */
+  hiddenIds?: ReadonlySet<string>;
+  /** Structures that are drawn but can't be selected or moved. */
+  lockedIds?: ReadonlySet<string>;
+  /** A structure to outline, e.g. the layer row under the pointer. */
+  highlightId?: string | null;
   controls?: ReactNode;
   selector?: ReactNode;
-  disabled?: boolean;
+  /** Shown at the right end of the status bar. */
+  status?: ReactNode;
   onSelectStructures?: (structureIds: string[]) => void;
   onTransformStructures?: (changes: StructureGeometryChange[], action: TransformAction) => void;
   onPlace?: (point: Point) => void;
+  /** A finished Draw tool shape; areas arrive closed (last point equals the first). */
+  onDrawShape?: (geometry: Point[]) => void;
   onContextAction?: (id: string) => void;
 };
 
@@ -72,13 +91,16 @@ const dragThreshold = 3;
 const rotateHandleOffset = 28;
 const rotateHandleRadius = 7;
 const handleHitRadius = 12;
+/** Screen pixels within which a point sticks to a structure corner instead of the grid. */
+const snapRadiusPixels = 12;
 const noSelection: string[] = [];
 const noActions: EditorAction[] = [];
+const noIds: ReadonlySet<string> = new Set();
 const n = (value: number | string | undefined, fallback = 0) =>
   typeof value === "number" ? value : value ? Number(value) : fallback;
 const toCanvas = (point: Point) => ({ x: point.x * scale, y: point.y * scale });
-const moveGeometry = (geometry: Point[], dx: number, dy: number) => geometry.map((point) => ({ x: round(point.x + dx), y: round(point.y + dy) }));
 const round = (value: number) => Math.round(value * 100) / 100;
+const samePoint = (a: Point, b: Point) => Math.abs(a.x - b.x) < 0.001 && Math.abs(a.y - b.y) < 0.001;
 
 export function MapEditorCanvas({
   map,
@@ -87,12 +109,17 @@ export function MapEditorCanvas({
   tool = "select",
   stamp,
   contextActions = noActions,
+  mapContextActions = noActions,
+  hiddenIds = noIds,
+  lockedIds = noIds,
+  highlightId = null,
   controls,
   selector,
-  disabled = false,
+  status,
   onSelectStructures,
   onTransformStructures,
   onPlace,
+  onDrawShape,
   onContextAction,
 }: Props) {
   const ref = useRef<HTMLCanvasElement>(null);
@@ -110,28 +137,44 @@ export function MapEditorCanvas({
   const [camera, setCamera] = useState(initialCamera);
   const [viewportSize, setViewportSize] = useState(defaultViewport);
   const [placePoint, setPlacePoint] = useState<Point | null>(null);
-  const [contextMenu, setContextMenu] = useState<Point | null>(null);
+  const [drawPoints, setDrawPoints] = useState<Point[]>([]);
+  const [drawCursor, setDrawCursor] = useState<Snapped | null>(null);
+  const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
+  const background = useAssetImage(map.background_asset_id);
   const selecting = tool === "select";
+  const drawing = tool === "draw";
+  const brushKind = stamp?.kind ?? "wall";
+  const grid = n(map.grid_size_m, 1);
   const items = useMemo(() => {
-    if (!transform) return structures;
+    const shown = hiddenIds.size > 0 ? structures.filter((structure) => !hiddenIds.has(structure.id)) : structures;
+    if (!transform) return shown;
     const transformed = new Map(transform.current.map((change) => [change.id, change.geometry]));
-    return structures.map((structure) => {
+    return shown.map((structure) => {
       const geometry = transformed.get(structure.id);
       return geometry ? { ...structure, geometry } : structure;
     });
-  }, [structures, transform]);
+  }, [structures, transform, hiddenIds]);
+  const pickable = useMemo(() => items.filter((structure) => !lockedIds.has(structure.id)), [items, lockedIds]);
   const selectedIds = useMemo(() => new Set(selectedStructureIds), [selectedStructureIds]);
   const selectedItems = useMemo(() => items.filter((structure) => selectedIds.has(structure.id)), [items, selectedIds]);
   const targetFrame = selecting && selectedItems.length > 0 ? geometryFrame(selectedItems.flatMap((structure) => structure.geometry)) : null;
   const ghost = useMemo(
-    () => !selecting && stamp && placePoint ? stampGeometry(stamp.kind, placePoint, n(map.grid_size_m, 1), stamp.rotationDeg, stamp.scalePercent) : null,
-    [selecting, stamp?.kind, stamp?.rotationDeg, stamp?.scalePercent, placePoint, map.grid_size_m],
+    () => tool === "place" && stamp && placePoint ? stampGeometry(stamp.kind, placePoint, grid, stamp.rotationDeg, stamp.scalePercent) : null,
+    [tool, stamp?.kind, stamp?.rotationDeg, stamp?.scalePercent, placePoint, grid],
   );
   const marqueeIds = useMemo(() => {
     if (!marquee?.moved) return null;
     const rect = rectFromPoints(marquee.from, marquee.to);
-    return new Set(structures.filter((structure) => geometryIntersectsRect(structure.geometry, rect)).map((structure) => structure.id));
-  }, [marquee, structures]);
+    return new Set(pickable.filter((structure) => geometryIntersectsRect(structure.geometry, rect)).map((structure) => structure.id));
+  }, [marquee, pickable]);
+
+  /** Snapping for a pointer: grid corners, or corners of visible structures (other than `exclude`) within reach. */
+  const snapOptions = (free: boolean, exclude?: ReadonlySet<string>, extra: Point[] = []) => ({
+    grid,
+    points: [...structureVertices(items, exclude), ...extra],
+    radius: snapRadiusPixels / (scale * zoom),
+    free,
+  });
 
   const canvasPoint = (event: Pick<PointerEvent<HTMLCanvasElement> | MouseEvent<HTMLCanvasElement>, "currentTarget" | "clientX" | "clientY">) => {
     const rect = event.currentTarget.getBoundingClientRect();
@@ -210,7 +253,7 @@ export function MapEditorCanvas({
     const visibleTop = -camera.y / zoom;
     const visibleRight = (width - camera.x) / zoom;
     const visibleBottom = (height - camera.y) / zoom;
-    const grid = Math.max(n(map.grid_size_m, 1) * scale, 1);
+    const gridPixels = Math.max(grid * scale, 1);
     const mapWidth = n(map.width_m, 30) * scale;
     const mapHeight = n(map.height_m, 30) * scale;
 
@@ -218,22 +261,20 @@ export function MapEditorCanvas({
     ctx.fillRect(visibleLeft, visibleTop, visibleRight - visibleLeft, visibleBottom - visibleTop);
     ctx.fillStyle = "#221c2b";
     ctx.fillRect(0, 0, mapWidth, mapHeight);
-    ctx.fillStyle = "rgba(190,140,255,0.06)";
-    ctx.fillRect(0, 0, mapWidth, Math.max(grid * 2, mapHeight * 0.18));
-    ctx.fillStyle = "rgba(217,255,181,0.08)";
-    ctx.fillRect(0, mapHeight * 0.55, mapWidth, mapHeight * 0.45);
+    // The background is stretched to the map's size, under the grid.
+    if (background) ctx.drawImage(background, 0, 0, mapWidth, mapHeight);
 
     ctx.lineWidth = 1 / zoom;
-    for (let x = Math.floor(visibleLeft / grid) * grid; x <= visibleRight; x += grid) {
-      const major = Math.round(x / grid) % 5 === 0;
+    for (let x = Math.floor(visibleLeft / gridPixels) * gridPixels; x <= visibleRight; x += gridPixels) {
+      const major = Math.round(x / gridPixels) % 5 === 0;
       ctx.strokeStyle = major ? "rgba(235,199,255,0.22)" : "rgba(235,199,255,0.08)";
       ctx.beginPath();
       ctx.moveTo(x, visibleTop);
       ctx.lineTo(x, visibleBottom);
       ctx.stroke();
     }
-    for (let y = Math.floor(visibleTop / grid) * grid; y <= visibleBottom; y += grid) {
-      const major = Math.round(y / grid) % 5 === 0;
+    for (let y = Math.floor(visibleTop / gridPixels) * gridPixels; y <= visibleBottom; y += gridPixels) {
+      const major = Math.round(y / gridPixels) % 5 === 0;
       ctx.strokeStyle = major ? "rgba(235,199,255,0.22)" : "rgba(235,199,255,0.08)";
       ctx.beginPath();
       ctx.moveTo(visibleLeft, y);
@@ -259,12 +300,17 @@ export function MapEditorCanvas({
 
     const highlighted = new Set(selecting ? selectedItems.map((structure) => structure.id) : []);
     marqueeIds?.forEach((id) => highlighted.add(id));
-    items.forEach((structure) => drawStructure(ctx, structure, highlighted.has(structure.id)));
-    if (ghost) drawGhost(ctx, ghost);
+    items.forEach((structure) => drawStructureShape(ctx, structure.kind, structure.geometry, {
+      scale,
+      blocksVision: structure.blocks_vision,
+      halo: highlighted.has(structure.id) ? "selected" : structure.id === highlightId ? "hover" : undefined,
+    }));
+    if (ghost) drawStructureShape(ctx, brushKind, ghost, { scale, ghost: true });
+    if (drawing) drawDraft(ctx, brushKind, drawPoints, drawCursor, zoom);
     if (transform?.action === "rotate") drawSelectionFrame(ctx, transform.frame, zoom, transform.degrees);
     else if (targetFrame) drawSelectionFrame(ctx, targetFrame, zoom, 0);
     if (marquee?.moved) drawMarquee(ctx, marquee, zoom);
-  }, [camera, ghost, items, map.grid_size_m, map.height_m, map.width_m, marquee, marqueeIds, selecting, selectedItems, targetFrame?.minX, targetFrame?.minY, targetFrame?.maxX, targetFrame?.maxY, transform, viewportSize, zoom]);
+  }, [background, brushKind, camera, drawCursor, drawPoints, drawing, ghost, grid, highlightId, items, map.height_m, map.width_m, marquee, marqueeIds, selecting, selectedItems, targetFrame?.minX, targetFrame?.minY, targetFrame?.maxX, targetFrame?.maxY, transform, viewportSize, zoom]);
 
   useEffect(() => {
     if (!contextMenu) return;
@@ -274,16 +320,48 @@ export function MapEditorCanvas({
   }, [contextMenu]);
 
   const hasSelection = selectedStructureIds.length > 0;
-  // The menu acts on the selection: drop it when the tool changes or the selection goes away (e.g. Delete).
+  // The selection menu acts on the selection: drop it when the tool changes or the selection goes away (e.g. Delete).
   useEffect(() => {
-    if (!selecting || !hasSelection) setContextMenu(null);
+    if (!selecting || !hasSelection) setContextMenu((current) => current?.target === "map" && selecting ? current : null);
   }, [selecting, hasSelection]);
 
+  // A shape in progress belongs to the Draw tool and its brush.
+  useEffect(() => {
+    setDrawPoints([]);
+    if (!drawing) setDrawCursor(null);
+  }, [drawing, brushKind]);
+
+  /** Ends the shape being drawn. Areas need three corners and close themselves; lines need two. */
+  const finishDraw = (close = false) => {
+    const area = isAreaKind(brushKind);
+    if (drawPoints.length < (area || close ? 3 : 2)) return false;
+    onDrawShape?.(area || close ? [...drawPoints, drawPoints[0]] : drawPoints);
+    setDrawPoints([]);
+    return true;
+  };
+  const finishDrawRef = useRef(finishDraw);
+  finishDrawRef.current = finishDraw;
+  useEffect(() => {
+    if (!drawing || drawPoints.length === 0) return;
+    // Captured before the page's shortcuts, so Enter, Escape and Backspace act on the shape first.
+    const onKeyDown = (event: KeyboardEvent) => {
+      const target = event.target;
+      if (event.defaultPrevented || (target instanceof HTMLElement && (target.isContentEditable || target.matches("input, textarea, select")))) return;
+      if (event.key === "Enter") finishDrawRef.current();
+      else if (event.key === "Escape") setDrawPoints([]);
+      else if (event.key === "Backspace" || event.key === "Delete") setDrawPoints((current) => current.slice(0, -1));
+      else return;
+      event.preventDefault();
+    };
+    window.addEventListener("keydown", onKeyDown, true);
+    return () => window.removeEventListener("keydown", onKeyDown, true);
+  }, [drawing, drawPoints.length]);
+
   const pickTarget = (point: Point) =>
-    pickStructure(selectedItems, point) ?? pickStructure([...items].reverse(), point);
-  /** Every selection the canvas emits includes whole groups. Returns the expanded ids. */
+    pickStructure(selectedItems, point) ?? pickStructure([...pickable].reverse(), point);
+  /** Every selection the canvas emits includes whole groups, without locked or hidden structures. Returns the expanded ids. */
   const select = (ids: string[]) => {
-    const next = expandToGroups(ids, structures);
+    const next = expandToGroups(ids, structures).filter((id) => !lockedIds.has(id) && !hiddenIds.has(id));
     if (next.length !== selectedStructureIds.length || !next.every((id) => selectedIds.has(id))) onSelectStructures?.(next);
     return next;
   };
@@ -312,6 +390,7 @@ export function MapEditorCanvas({
       current: original,
       frame,
       anchor,
+      grip: hit?.kind === "resize" ? hit.point : nearestVertex(original.flatMap((change) => change.geometry), point),
       startValue: action === "resize"
         ? Math.hypot(point.x - anchor.x, point.y - anchor.y)
         : Math.atan2(point.y - anchor.y, point.x - anchor.x),
@@ -330,36 +409,40 @@ export function MapEditorCanvas({
     return "default";
   };
   const openContextMenu = (event: PointerEvent<HTMLCanvasElement>) => {
-    if (contextActions.length === 0) return;
     const picked = pickTarget(canvasPoint(event));
-    if (!picked) return;
-    if (!selectedIds.has(picked.id)) select([picked.id]);
-    setContextMenu(shellPixels(event));
+    if (picked && contextActions.length > 0) {
+      if (!selectedIds.has(picked.id)) select([picked.id]);
+      setContextMenu({ ...shellPixels(event), target: "selection" });
+    } else if (!picked && mapContextActions.length > 0) {
+      setContextMenu({ ...shellPixels(event), target: "map" });
+    }
   };
   const closeContextMenu = () => {
     setContextMenu(null);
     ref.current?.focus({ preventScroll: true });
   };
 
-  useEffect(() => {
-    if (!disabled) return;
-    clearPointerAction();
-  }, [disabled]);
-
+  const brushName = structureLabel(brushKind).toLowerCase();
   const helpText = transform
-    ? "Esc cancels the drag · Shift snaps rotation to 15° or locks moves to an axis"
+    ? `Esc cancels · hold ${altKeyName} to place freely · Shift ${transform.action === "rotate" ? "snaps to 15°" : "locks to one axis"}`
     : selecting
-      ? "Drag to move · corners resize · round handle rotates · drag empty space to select · right-click for actions · right/middle-drag or Space-drag pans · scroll zooms"
-      : "Click to place · Q/E rotate · [ ] resize · Esc or V returns to Select";
-  const selectionLabel = !selecting
-    ? `Placing ${structureLabel(stamp?.kind ?? "wall")}`
-    : selectedItems.length > 1
-      ? `${selectedItems.length} structures selected`
-      : selectedItems.length === 1 ? `${structureLabel(selectedItems[0].kind)} selected` : "Nothing selected";
+      ? "Drag to move (snaps to the grid) · corners resize · round handle rotates · right-click for more"
+      : drawing
+        ? drawPoints.length === 0
+          ? `Click to start a ${brushName} · corners snap to the grid · hold ${altKeyName} for free placement`
+          : `Click to add corners · Enter or double-click finishes${isAreaKind(brushKind) ? "" : " · click the first point to close"} · Backspace removes a corner · Esc cancels`
+        : "Click to place · Q/E rotate · [ ] resize · Esc returns to Select";
+  const selectionLabel = drawing
+    ? `Drawing ${brushName}${drawPoints.length > 0 ? ` · ${drawPoints.length} ${drawPoints.length === 1 ? "point" : "points"}` : ""}`
+    : !selecting
+      ? `Placing ${brushName}`
+      : selectedItems.length > 1
+        ? `${selectedItems.length} structures selected`
+        : selectedItems.length === 1 ? `${structureLabel(selectedItems[0].kind)} selected` : "Nothing selected";
 
   return (
     <div ref={shellRef} className="relative overflow-hidden rounded-2xl border border-[var(--accent)]/25 bg-[var(--input)] shadow-[0_24px_80px_rgba(0,0,0,0.35)]" data-testid="map-editor-shell">
-      <div className="pointer-events-none absolute bottom-4 left-4 top-4 z-20 flex items-start">
+      <div className="pointer-events-none absolute bottom-16 left-4 top-4 z-20 flex items-start">
         <div
           className="pointer-events-auto flex max-h-full w-[160px] flex-col gap-2 overflow-y-auto overflow-x-hidden rounded-xl border border-[var(--accent)]/20 bg-[var(--input)] p-2 shadow-2xl"
           data-testid="map-editor-toolbar"
@@ -376,7 +459,7 @@ export function MapEditorCanvas({
           {controls}
         </div>
       </div>
-      {selector && <div className="pointer-events-none absolute bottom-4 right-4 top-4 z-20 flex items-start">
+      {selector && <div className="pointer-events-none absolute bottom-16 right-4 top-4 z-20 flex items-start">
         <div
           className="pointer-events-auto flex h-full max-h-full w-[230px] flex-col overflow-hidden rounded-xl border border-[var(--accent)]/20 bg-[var(--input)] shadow-2xl"
           data-testid="map-editor-selector"
@@ -399,17 +482,32 @@ export function MapEditorCanvas({
           tabIndex={0}
           aria-describedby="map-editor-transform-help"
           aria-label={selecting
-            ? "Infinite live map canvas, Select tool. Click a structure to select it (grouped structures select together), Shift-click to add or remove it, or drag across empty space to select every structure in an area. Selected structures move, resize and rotate together: drag inside the dashed frame to move, drag a square corner handle to resize, drag the round handle above the frame to rotate (Shift snaps to 15 degrees). Right-click a structure for actions. Drag with the right or middle mouse button, or hold Space and drag, to pan; scroll to zoom."
-            : "Infinite live map canvas, Place tool. Click to place the stamp shown under the pointer; Q and E rotate it, [ and ] resize it, Escape or V returns to the Select tool. Drag with the right or middle mouse button, or hold Space and drag, to pan; scroll to zoom."}
+            ? "Map canvas, Select tool. Click a structure to select it, Shift-click to add or remove it, or drag across empty space to select an area. Drag the selection to move it, a corner handle to resize it, or the round handle to rotate it; moves and resizes snap to the grid unless you hold Alt. Right-click for actions."
+            : drawing
+              ? "Map canvas, Draw tool. Click to add corners, which snap to the grid and to nearby corners unless you hold Alt. Press Enter or double-click to finish, Escape to cancel."
+              : "Map canvas, Place tool. Click to place the stamp shown under the pointer; Q and E rotate it, [ and ] resize it, Escape returns to the Select tool."}
           onContextMenu={(event) => event.preventDefault()}
+          onDoubleClick={() => {
+            if (drawing) finishDraw();
+          }}
           onPointerDown={(event) => {
             setContextMenu(null);
-            if (disabled || pointerActive.current) return;
+            if (pointerActive.current) return;
             const panGesture = event.button === 1 || event.button === 2 || (event.button === 0 && spaceHeld.current);
             if (!panGesture && event.button !== 0) return;
             event.currentTarget.focus({ preventScroll: true });
-            if (!panGesture && !selecting) {
+            if (!panGesture && tool === "place") {
               onPlace?.(canvasPoint(event));
+              return;
+            }
+            if (!panGesture && drawing) {
+              const snapped = snapPoint(canvasPoint(event), snapOptions(event.altKey, undefined, drawPoints)).point;
+              if (drawPoints.length > 0 && samePoint(snapped, drawPoints[drawPoints.length - 1])) return;
+              if (drawPoints.length >= 3 && samePoint(snapped, drawPoints[0])) {
+                finishDraw(true);
+                return;
+              }
+              setDrawPoints([...drawPoints, snapped]);
               return;
             }
             event.currentTarget.setPointerCapture?.(event.pointerId);
@@ -458,24 +556,24 @@ export function MapEditorCanvas({
             updateMarquee({ from: point, to: point, clientX: event.clientX, clientY: event.clientY, additive: event.shiftKey || event.ctrlKey || event.metaKey, moved: false });
           }}
           onPointerMove={(event) => {
-            if (disabled) return;
             const point = canvasPoint(event);
             const activeTransform = transformRef.current;
             if (pointerActive.current && activeTransform) {
               if (!activeTransform.moved && Math.hypot(point.x - activeTransform.from.x, point.y - activeTransform.from.y) * scale * zoom < dragThreshold) return;
+              const targets = new Set(activeTransform.original.map((change) => change.id));
               let degrees = 0;
               let transformGeometry: (geometry: Point[]) => Point[];
               if (activeTransform.action === "move") {
-                let dx = point.x - activeTransform.from.x;
-                let dy = point.y - activeTransform.from.y;
-                if (event.shiftKey) {
-                  if (Math.abs(dx) >= Math.abs(dy)) dy = 0;
-                  else dx = 0;
-                }
-                transformGeometry = (geometry) => moveGeometry(geometry, dx, dy);
+                const raw = { x: point.x - activeTransform.from.x, y: point.y - activeTransform.from.y };
+                const lock = event.shiftKey ? (Math.abs(raw.x) >= Math.abs(raw.y) ? "y" : "x") : undefined;
+                // The grabbed corner lands on a grid corner or another structure's corner.
+                const delta = snapMoveDelta(activeTransform.grip, raw, snapOptions(event.altKey, targets), lock);
+                transformGeometry = (geometry) => geometry.map((vertex) => ({ x: round(vertex.x + delta.x), y: round(vertex.y + delta.y) }));
               } else if (activeTransform.action === "resize") {
                 const anchor = activeTransform.anchor;
-                const factor = Math.max(0.08, Math.hypot(point.x - anchor.x, point.y - anchor.y) / Math.max(activeTransform.startValue, 0.001));
+                const factor = event.altKey
+                  ? Math.max(0.08, Math.hypot(point.x - anchor.x, point.y - anchor.y) / Math.max(activeTransform.startValue, 0.001))
+                  : scaleFactorTowards(anchor, activeTransform.grip, snapPoint(point, snapOptions(false, targets)).point);
                 transformGeometry = (geometry) => scaleGeometry(geometry, factor, anchor);
               } else {
                 const center = activeTransform.anchor;
@@ -503,6 +601,10 @@ export function MapEditorCanvas({
               return;
             }
             event.currentTarget.style.cursor = cursorAt(point);
+            if (drawing) {
+              setDrawCursor(snapPoint(point, snapOptions(event.altKey, undefined, drawPoints)));
+              return;
+            }
             if (!selecting) {
               setPlacePoint(point);
               setHover(null);
@@ -517,7 +619,7 @@ export function MapEditorCanvas({
             setHover({ structure: picked, canvasX: px.x, canvasY: px.y });
           }}
           onPointerUp={(event) => {
-            if (disabled || !pointerActive.current) return;
+            if (!pointerActive.current) return;
             const activeTransform = transformRef.current;
             const activeMarquee = marqueeRef.current;
             const activePan = panRef.current;
@@ -525,7 +627,7 @@ export function MapEditorCanvas({
               onTransformStructures?.(activeTransform.current, activeTransform.action);
             } else if (activeMarquee?.moved) {
               const base = activeMarquee.additive ? selectedStructureIds : [];
-              const inside = structures
+              const inside = pickable
                 .filter((structure) => geometryIntersectsRect(structure.geometry, rectFromPoints(activeMarquee.from, activeMarquee.to)))
                 .map((structure) => structure.id);
               select([...base, ...inside.filter((id) => !base.includes(id))]);
@@ -546,6 +648,7 @@ export function MapEditorCanvas({
             if (pointerActive.current) return;
             setHover(null);
             setPlacePoint(null);
+            setDrawCursor(null);
           }}
           onBlur={() => {
             spaceHeld.current = false;
@@ -568,21 +671,20 @@ export function MapEditorCanvas({
           }}
         />
       </div>
-      <div
-        id="map-editor-transform-help"
-        className="pointer-events-none absolute bottom-4 left-1/2 z-20 flex max-w-[calc(100%_-_2rem)] -translate-x-1/2 items-center gap-2 rounded-lg border border-[var(--paper)]/15 bg-[var(--input)] px-3 py-2 text-[11px] text-[var(--muted)] shadow-xl lg:max-w-[calc(100%_-_420px)]"
-        role="status"
-        aria-live="polite"
-      >
-        <strong className="shrink-0 font-semibold text-[var(--paper)]">{selectionLabel}</strong>
-        <span aria-hidden="true">·</span>
-        <span className="hidden truncate md:inline">{helpText}</span>
+      <div className="pointer-events-none absolute inset-x-4 bottom-4 z-20 flex items-center gap-3 rounded-lg border border-[var(--paper)]/15 bg-[var(--input)] px-3 py-2 text-[11px] text-[var(--muted)] shadow-xl">
+        <div id="map-editor-transform-help" className="flex min-w-0 flex-1 items-center gap-2" role="status" aria-live="polite">
+          <strong className="shrink-0 font-semibold text-[var(--paper)]">{selectionLabel}</strong>
+          <span aria-hidden="true">·</span>
+          <span className="truncate">{helpText}</span>
+        </div>
+        {status && <div className="pointer-events-auto flex shrink-0 items-center gap-3">{status}</div>}
       </div>
       {hover && selecting && !transform && !marquee?.moved && <StructureTooltip hover={hover} viewportSize={viewportSize} />}
       {contextMenu && <EditorContextMenu
         x={contextMenu.x}
         y={contextMenu.y}
-        actions={contextActions}
+        label={contextMenu.target === "selection" ? "Structure actions" : "Map actions"}
+        actions={contextMenu.target === "selection" ? contextActions : mapContextActions}
         onClose={closeContextMenu}
         onAction={(id) => {
           closeContextMenu();
@@ -593,40 +695,22 @@ export function MapEditorCanvas({
   );
 }
 
-function drawStructure(ctx: CanvasRenderingContext2D, structure: MapStructure, selected: boolean) {
-  if (structure.geometry.length === 0) return;
-  const color = structure.kind === "terrain" ? "#d9ffb5" : structure.kind === "door" ? "#ffb887" : structure.kind === "window" ? "#ebc7ff" : structure.kind === "cover" ? "#ffa9a9" : "#be8cff";
-  ctx.strokeStyle = selected ? "#f6effa" : color;
-  ctx.lineWidth = selected ? 4 : structure.blocks_vision ? 4 : 2;
-  ctx.setLineDash([]);
-  ctx.beginPath();
-  structure.geometry.forEach((point, index) => {
-    const canvasPoint = toCanvas(point);
-    if (index === 0) ctx.moveTo(canvasPoint.x, canvasPoint.y);
-    else ctx.lineTo(canvasPoint.x, canvasPoint.y);
-  });
-  if (structure.kind === "terrain" && structure.geometry.length > 2) {
-    ctx.fillStyle = selected ? "rgba(217,255,181,0.28)" : "rgba(217,255,181,0.16)";
+/** The Draw tool's shape so far, the rubber band to the pointer, and a marker where the next corner snaps. */
+function drawDraft(ctx: CanvasRenderingContext2D, kind: string, points: Point[], cursor: Snapped | null, zoom: number) {
+  const path = cursor ? [...points, cursor.point] : points;
+  if (path.length > 1) drawStructureShape(ctx, kind, isAreaKind(kind) && path.length > 2 ? [...path, path[0]] : path, { scale, ghost: true });
+  ctx.fillStyle = structureColor(kind);
+  for (const point of points) {
+    ctx.beginPath();
+    ctx.arc(point.x * scale, point.y * scale, 3.5 / zoom, 0, Math.PI * 2);
     ctx.fill();
   }
-  ctx.stroke();
-  ctx.setLineDash([]);
-}
-
-/** The Place tool's stamp preview under the pointer. */
-function drawGhost(ctx: CanvasRenderingContext2D, geometry: Point[]) {
-  if (geometry.length === 0) return;
-  ctx.strokeStyle = "#ffb887";
-  ctx.lineWidth = 3;
-  ctx.setLineDash([8, 5]);
+  if (!cursor) return;
+  ctx.strokeStyle = cursor.kind === "point" ? "#ffb887" : "#f6effa";
+  ctx.lineWidth = 2 / zoom;
   ctx.beginPath();
-  geometry.forEach((point, index) => {
-    const canvasPoint = toCanvas(point);
-    if (index === 0) ctx.moveTo(canvasPoint.x, canvasPoint.y);
-    else ctx.lineTo(canvasPoint.x, canvasPoint.y);
-  });
+  ctx.arc(cursor.point.x * scale, cursor.point.y * scale, (cursor.kind === "point" ? 8 : 5) / zoom, 0, Math.PI * 2);
   ctx.stroke();
-  ctx.setLineDash([]);
 }
 
 /** Draws the dashed frame, square resize handles and the round rotation handle, turned by `degrees` around the frame center. */
@@ -739,10 +823,12 @@ function hitSelectionHandle(targets: MapStructure[], frame: GeometryFrame, point
   for (const handle of resizeHandles(frame)) {
     if (Math.hypot(point.x - handle.point.x, point.y - handle.point.y) > radius) continue;
     const endpointIndex = endpoints ? endpoints.findIndex((endpoint) => endpoint.x === handle.point.x && endpoint.y === handle.point.y) : -1;
+    const onEndpoint = endpoints && endpointIndex !== -1;
     return {
       kind: "resize",
       handle: handle.handle,
-      anchor: endpoints && endpointIndex !== -1 ? endpoints[endpointIndex === 0 ? 1 : 0] : handle.anchor,
+      point: onEndpoint ? endpoints[endpointIndex] : handle.point,
+      anchor: onEndpoint ? endpoints[endpointIndex === 0 ? 1 : 0] : handle.anchor,
     };
   }
   return null;

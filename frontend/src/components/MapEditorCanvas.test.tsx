@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MapEditorCanvas } from "./MapEditorCanvas";
 import type { GameMap, MapStructure } from "../api/types";
@@ -61,7 +61,10 @@ describe("MapEditorCanvas", () => {
     globalThis.__canvasContext.fillRect.mockClear();
     globalThis.__canvasContext.setLineDash.mockClear();
   });
-  afterEach(cleanup);
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+  });
 
   it("shows structure attributes on hover", () => {
     render(<MapEditorCanvas map={map} structures={[wall]} />);
@@ -256,20 +259,129 @@ describe("MapEditorCanvas", () => {
     expect(transform).not.toHaveBeenCalled();
   });
 
-  it("cancels a transform when disabled", () => {
+  it("snaps moves so the grabbed corner lands on the grid, and moves freely with Alt", () => {
     const transform = vi.fn();
-    const props = { map, structures: [wall], selectedStructureIds: ["wall"], onTransformStructures: transform };
-    const { rerender } = render(<MapEditorCanvas {...props} />);
+    render(<MapEditorCanvas map={map} structures={[wall]} selectedStructureIds={["wall"]} onTransformStructures={transform} />);
     const canvas = screen.getByTestId("map-editor-canvas");
-    fireEvent.pointerDown(canvas, { ...rotateHandle(7, 4), button: 0 });
-    fireEvent.pointerMove(canvas, screenPoint(10, 4));
-    rerender(<MapEditorCanvas {...props} disabled />);
-    fireEvent.pointerUp(canvas, screenPoint(10, 4));
+
+    drag(canvas, screenPoint(5, 4), screenPoint(6.35, 6.3));
+    expect(transform).toHaveBeenLastCalledWith([{ id: "wall", geometry: [{ x: 5, y: 6 }, { x: 11, y: 6 }] }], "move");
+
+    fireEvent.pointerDown(canvas, { ...screenPoint(5, 4), button: 0 });
+    fireEvent.pointerMove(canvas, { ...screenPoint(6.35, 6.3), altKey: true });
+    fireEvent.pointerUp(canvas, screenPoint(6.35, 6.3));
+    const [[changes]] = transform.mock.calls.slice(-1);
+    expect(changes[0].geometry[0].x).toBeCloseTo(5.35, 1);
+    expect(changes[0].geometry[0].y).toBeCloseTo(6.3, 1);
+  });
+
+  it("snaps a moved wall's end onto a nearby corner of another structure before the grid", () => {
+    const transform = vi.fn();
+    const corner: MapStructure = { ...other, id: "corner", geometry: [{ x: 2.3, y: 8.4 }, { x: 2.3, y: 12 }] };
+    render(<MapEditorCanvas map={map} structures={[wall, corner]} selectedStructureIds={["wall"]} onTransformStructures={transform} />);
+
+    // The wall's start (4,4) is dragged to just beside the other wall's end (2.3, 8.4), off the grid.
+    drag(screen.getByTestId("map-editor-canvas"), screenPoint(5, 4), screenPoint(3.5, 8.5));
+    expect(transform).toHaveBeenCalledWith([{ id: "wall", geometry: [{ x: 2.3, y: 8.4 }, { x: 8.3, y: 8.4 }] }], "move");
+  });
+
+  it("draws a closed four-wall room point by point, with corners snapped to the grid", () => {
+    const drawn = vi.fn();
+    render(<MapEditorCanvas map={map} structures={[]} tool="draw" stamp={{ kind: "wall", rotationDeg: 0, scalePercent: 100 }} onDrawShape={drawn} />);
+    const canvas = screen.getByTestId("map-editor-canvas");
+    const click = (x: number, y: number) => {
+      fireEvent.pointerDown(canvas, { ...screenPoint(x, y), button: 0 });
+      fireEvent.pointerUp(canvas, screenPoint(x, y));
+    };
+
+    click(2.2, 1.9);
+    click(7.8, 2.1);
+    click(8.1, 6.2);
+    click(1.9, 5.8);
+    expect(screen.getByText("Drawing wall · 4 points")).toBeInTheDocument();
+    // Clicking near the first corner closes the room.
+    click(2.1, 2.1);
+
+    expect(drawn).toHaveBeenCalledExactlyOnceWith([{ x: 2, y: 2 }, { x: 8, y: 2 }, { x: 8, y: 6 }, { x: 2, y: 6 }, { x: 2, y: 2 }]);
+    expect(screen.getByText("Drawing wall")).toBeInTheDocument();
+  });
+
+  it("finishes an open wall with Enter or a double-click, closes areas, and cancels with Escape", () => {
+    const drawn = vi.fn();
+    const { rerender } = render(<MapEditorCanvas map={map} structures={[]} tool="draw" stamp={{ kind: "wall", rotationDeg: 0, scalePercent: 100 }} onDrawShape={drawn} />);
+    const canvas = screen.getByTestId("map-editor-canvas");
+    const click = (x: number, y: number) => {
+      fireEvent.pointerDown(canvas, { ...screenPoint(x, y), button: 0 });
+      fireEvent.pointerUp(canvas, screenPoint(x, y));
+    };
+
+    click(1, 1);
+    click(4, 1);
+    fireEvent.keyDown(window, { key: "Escape" });
+    fireEvent.keyDown(window, { key: "Enter" });
+    expect(drawn).not.toHaveBeenCalled();
+
+    click(1, 1);
+    click(4, 1);
+    fireEvent.keyDown(window, { key: "Enter" });
+    expect(drawn).toHaveBeenLastCalledWith([{ x: 1, y: 1 }, { x: 4, y: 1 }]);
+
+    click(1, 3);
+    click(5, 3);
+    fireEvent.doubleClick(canvas, screenPoint(5, 3));
+    expect(drawn).toHaveBeenLastCalledWith([{ x: 1, y: 3 }, { x: 5, y: 3 }]);
+
+    rerender(<MapEditorCanvas map={map} structures={[]} tool="draw" stamp={{ kind: "terrain", rotationDeg: 0, scalePercent: 100 }} onDrawShape={drawn} />);
+    click(1, 1);
+    click(3, 1);
+    click(3, 3);
+    fireEvent.keyDown(window, { key: "Enter" });
+    expect(drawn).toHaveBeenLastCalledWith([{ x: 1, y: 1 }, { x: 3, y: 1 }, { x: 3, y: 3 }, { x: 1, y: 1 }]);
+    expect(drawn).toHaveBeenCalledTimes(3);
+  });
+
+  it("keeps locked structures from being selected or moved, and hidden ones off the canvas", () => {
+    const select = vi.fn();
+    const transform = vi.fn();
+    const { rerender } = render(<MapEditorCanvas map={map} structures={[wall]} lockedIds={new Set(["wall"])} onSelectStructures={select} onTransformStructures={transform} />);
+    const canvas = screen.getByTestId("map-editor-canvas");
+
+    drag(canvas, screenPoint(5, 4), screenPoint(6, 6));
+    drag(canvas, screenPoint(2, 2), screenPoint(12, 6));
+    expect(select).not.toHaveBeenCalled();
     expect(transform).not.toHaveBeenCalled();
 
-    rerender(<MapEditorCanvas {...props} />);
-    drag(canvas, rotateHandle(7, 4), screenPoint(10, 4));
-    expect(transform).toHaveBeenCalledWith([{ id: "wall", geometry: [{ x: 7, y: 1 }, { x: 7, y: 7 }] }], "rotate");
+    rerender(<MapEditorCanvas map={map} structures={[wall]} hiddenIds={new Set(["wall"])} onSelectStructures={select} />);
+    fireEvent.pointerMove(canvas, screenPoint(5, 4));
+    expect(screen.queryByText("Vision")).not.toBeInTheDocument();
+  });
+
+  it("offers map actions when right-clicking empty space", () => {
+    const action = vi.fn();
+    const mapActions = [{ id: "paste", label: "Paste" }, { id: "select-all", label: "Select all" }];
+    render(<MapEditorCanvas map={map} structures={[wall]} contextActions={[{ id: "delete", label: "Delete" }]} mapContextActions={mapActions} onContextAction={action} />);
+    const canvas = screen.getByTestId("map-editor-canvas");
+
+    fireEvent.pointerDown(canvas, { ...screenPoint(1, 8), button: 2 });
+    fireEvent.pointerUp(canvas, { ...screenPoint(1, 8), button: 2 });
+    screen.getByRole("menu", { name: "Map actions" });
+    expect(screen.getAllByRole("menuitem").map((item) => item.textContent)).toEqual(["Paste", "Select all"]);
+    fireEvent.click(screen.getByRole("menuitem", { name: "Select all" }));
+    expect(action).toHaveBeenCalledWith("select-all");
+  });
+
+  it("draws the background image stretched over the whole map", () => {
+    const images: { src: string; onload: (() => void) | null }[] = [];
+    vi.stubGlobal("Image", class {
+      src = "";
+      onload: (() => void) | null = null;
+      constructor() { images.push(this); }
+    });
+    globalThis.__canvasContext.drawImage.mockClear();
+    render(<MapEditorCanvas map={{ ...map, background_asset_id: "bg-1" }} structures={[]} />);
+    expect(images[0].src).toBe("/api/assets/bg-1");
+    act(() => images[0].onload?.());
+    expect(globalThis.__canvasContext.drawImage).toHaveBeenCalledWith(images[0], 0, 0, 10 * 24, 10 * 24);
   });
 
   it("pans with a right-button drag, while a left drag on empty space selects instead", () => {

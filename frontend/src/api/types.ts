@@ -164,6 +164,16 @@ export type GameMap = {
   grid_size_m: number | string;
   background_asset_id?: string | null;
   structures?: MapStructure[];
+  /** Outlines of the map's structures, sent by `GET /api/maps` for thumbnails. */
+  preview_structures?: Pick<MapStructure, "kind" | "geometry">[];
+};
+/** A room the signed-in game master runs, from `GET /api/maps/{mapID}/rooms`. */
+export type MapRoomChoice = {
+  id: string;
+  name: string;
+  /** True when this map is already the room's active map. */
+  is_active: boolean;
+  active_map_name: string | null;
 };
 export type TokenAttack = {
   id: string;

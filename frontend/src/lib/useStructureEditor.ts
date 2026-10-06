@@ -1,42 +1,65 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { apiFetch, deleteJSON, patchJSON, postJSON } from "../api/client";
 import type { GameMap, MapStructure } from "../api/types";
+import { shortcutLabel } from "./platform";
 import { expandToGroups, sortByZ } from "./structureGroups";
 
 export type StructureFields = Partial<Pick<MapStructure, "geometry" | "kind" | "blocks_vision" | "blocks_movement" | "blocks_attacks" | "z_index" | "group_id">>;
 export type StructureUpdate = { id: string; fields: StructureFields };
-/** A structure to create. Without `z_index` the server puts it on top. */
-export type NewStructure = Omit<MapStructure, "id" | "map_id" | "z_index" | "group_id"> & Partial<Pick<MapStructure, "z_index" | "group_id">>;
+/** A structure to create. Without `id` it gets a fresh one; without `z_index` it goes on top. */
+export type NewStructure = Omit<MapStructure, "id" | "map_id" | "z_index" | "group_id"> & Partial<Pick<MapStructure, "id" | "z_index" | "group_id">>;
+/** Map settings that edits (and undo) can change. */
+export type MapFields = Partial<Pick<GameMap, "name" | "width_m" | "height_m" | "grid_size_m" | "background_asset_id">>;
+/** "saving" while edits are on their way to the server; "failed" when one of the last ones was refused. */
+export type SaveState = "idle" | "saving" | "saved" | "failed";
+export type EditorNotice = { text: string; key: number };
 
 type FieldChange = { id: string; before: StructureFields; after: StructureFields };
 type HistoryEntry =
   | { type: "update"; changes: FieldChange[] }
   | { type: "create"; structures: MapStructure[] }
-  | { type: "delete"; structures: MapStructure[] };
+  | { type: "delete"; structures: MapStructure[] }
+  | { type: "map"; before: MapFields; after: MapFields };
+/** The saves of one opened map. Opening another map starts a new session; the old one's results are ignored. */
+type SaveSession = { mapPath: string; queue: Promise<void>; pending: number; resync: boolean; failed: boolean };
 
 const historyLimit = 100;
+const newSession = (mapId: string | undefined): SaveSession => ({ mapPath: `/api/maps/${mapId}`, queue: Promise.resolve(), pending: 0, resync: false, failed: false });
+const errorMessage = (err: unknown, fallback: string) => err instanceof Error && err.message ? err.message : fallback;
 
 /**
- * Map, selection and undo/redo history for the map editor. Every edit is applied locally first and
- * persisted structure by structure; history entries are only kept for edits the server accepted.
+ * Map, selection and undo/redo history for the map editor. Every edit applies locally and to the history
+ * at once, then saves in the background: saves run one after another in the order they were made, so
+ * input is never blocked or dropped. When the server refuses a save, `onError` reports it, the refused part
+ * leaves the history, and the map reloads from the server once the remaining saves have finished.
  */
-export function useStructureEditor(mapId: string | undefined) {
-  const [map, setMap] = useState<GameMap | null>(null);
+export function useStructureEditor(mapId: string | undefined, onError: (message: string) => void) {
+  const [map, setMapState] = useState<GameMap | null>(null);
   const [loading, setLoading] = useState(true);
-  const [busy, setBusyState] = useState(false);
-  const [error, setError] = useState("");
-  const [notice, setNotice] = useState("");
+  const [loadError, setLoadError] = useState("");
+  const [notice, setNoticeState] = useState<EditorNotice | null>(null);
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
+  const [saveState, setSaveState] = useState<SaveState>("idle");
   const [, setHistoryVersion] = useState(0);
-  const busyRef = useRef(false);
+  const mapRef = useRef<GameMap | null>(null);
+  const session = useRef<SaveSession>(newSession(mapId));
   const undoStack = useRef<HistoryEntry[]>([]);
   const redoStack = useRef<HistoryEntry[]>([]);
+  const noticeKey = useRef(0);
+  const onErrorRef = useRef(onError);
+  onErrorRef.current = onError;
   const structures = useMemo(() => sortByZ(map?.structures ?? []), [map?.structures]);
 
-  const setBusy = (next: boolean) => {
-    busyRef.current = next;
-    setBusyState(next);
+  /** Keeps a synchronous copy, so edits made in one event see each other. */
+  const commitMap = (next: GameMap | null) => {
+    mapRef.current = next;
+    setMapState(next);
   };
+  const changeMap = (change: (current: GameMap) => GameMap) => {
+    if (mapRef.current) commitMap(change(mapRef.current));
+  };
+  const currentStructures = () => mapRef.current?.structures ?? [];
+
   const historyChanged = () => setHistoryVersion((version) => version + 1);
   const push = (stack: HistoryEntry[], entry: HistoryEntry) => {
     stack.push(entry);
@@ -47,103 +70,137 @@ export function useStructureEditor(mapId: string | undefined) {
     push(undoStack.current, entry);
     redoStack.current = [];
   };
+  /** Shrinks an entry to the structures whose save went through; an entry with nothing left leaves the history. */
+  const keepSaved = (entry: HistoryEntry, failedIds: ReadonlySet<string>) => {
+    if (entry.type === "update") entry.changes = entry.changes.filter((change) => !failedIds.has(change.id));
+    else if (entry.type !== "map") entry.structures = entry.structures.filter((structure) => !failedIds.has(structure.id));
+    const empty = entry.type === "map" || (entry.type === "update" ? entry.changes.length === 0 : entry.structures.length === 0);
+    if (empty) {
+      undoStack.current = undoStack.current.filter((candidate) => candidate !== entry);
+      redoStack.current = redoStack.current.filter((candidate) => candidate !== entry);
+    }
+    historyChanged();
+  };
 
-  const load = async () => setMap(await apiFetch<GameMap>(`/api/maps/${mapId}`));
-  const resync = () => load().catch(() => undefined);
+  function setNotice(text: string) {
+    noticeKey.current += 1;
+    setNoticeState(text ? { text, key: noticeKey.current } : null);
+  }
 
   useEffect(() => {
+    const opened = newSession(mapId);
+    session.current = opened;
     undoStack.current = [];
     redoStack.current = [];
     historyChanged();
+    commitMap(null);
     setSelectedIds([]);
+    setSaveState("idle");
     setLoading(true);
-    setError("");
-    load().catch((err: Error) => setError(err.message)).finally(() => setLoading(false));
+    setLoadError("");
+    apiFetch<GameMap>(opened.mapPath)
+      .then((loaded) => {
+        if (session.current === opened) commitMap(loaded);
+      })
+      .catch((err: Error) => {
+        if (session.current === opened) setLoadError(err.message);
+      })
+      .finally(() => {
+        if (session.current === opened) setLoading(false);
+      });
   }, [mapId]);
 
-  const select = (ids: string[]) => setSelectedIds(expandToGroups(ids, structures));
-
-  async function runSaving(action: () => Promise<unknown>, message: string) {
-    setBusy(true);
-    setError("");
-    setNotice("");
-    try {
-      await action();
-      await load();
-      setNotice(message);
-    } catch (err) {
-      setError(err instanceof SyntaxError ? "Geometry must be valid JSON: an array of points with x and y coordinates." : err instanceof Error ? err.message : "Could not save the map.");
-    } finally {
-      setBusy(false);
-    }
+  /** Queues a save behind every earlier one. A thrown error is reported and makes the map reload afterwards. */
+  function enqueue(task: (mapPath: string) => Promise<void>, fallback: string) {
+    const current = session.current;
+    const live = () => session.current === current;
+    current.pending += 1;
+    setSaveState("saving");
+    current.queue = current.queue
+      .then(() => task(current.mapPath))
+      .catch((err: unknown) => {
+        current.failed = true;
+        current.resync = true;
+        if (live()) onErrorRef.current(errorMessage(err, fallback));
+      })
+      .finally(() => {
+        current.pending -= 1;
+        if (live() && current.pending === 0) settle(current);
+      });
   }
+
+  function settle(current: SaveSession) {
+    if (current.resync) {
+      current.resync = false;
+      enqueue(async (mapPath) => {
+        let fresh: GameMap;
+        try {
+          fresh = await apiFetch<GameMap>(mapPath);
+        } catch (err) {
+          current.failed = true;
+          if (session.current === current) onErrorRef.current(`Could not reload the map: ${errorMessage(err, "network error")}`);
+          return;
+        }
+        // Edits made while this reload ran are queued behind it; showing the reload would hide them.
+        if (current.pending > 1) {
+          current.resync = true;
+          return;
+        }
+        if (session.current !== current) return;
+        commitMap(fresh);
+        const kept = new Set((fresh.structures ?? []).map((structure) => structure.id));
+        setSelectedIds((selected) => selected.filter((id) => kept.has(id)));
+      }, "Could not reload the map.");
+      return;
+    }
+    setSaveState(current.failed ? "failed" : "saved");
+    current.failed = false;
+  }
+
+  /** Resolves once every queued save has finished. */
+  async function flush() {
+    const current = session.current;
+    while (current.pending > 0) await current.queue;
+  }
+
+  const select = (ids: string[], allowed?: (id: string) => boolean) => {
+    const expanded = expandToGroups(ids, structures);
+    setSelectedIds(allowed ? expanded.filter(allowed) : expanded);
+  };
 
   const applyFields = (changes: { id: string; fields: StructureFields }[]) => {
     const next = new Map(changes.map((change) => [change.id, change.fields]));
-    setMap((current) => current ? {
+    changeMap((current) => ({
       ...current,
       structures: current.structures?.map((structure) => {
         const fields = next.get(structure.id);
         return fields ? { ...structure, ...fields } : structure;
       }),
-    } : current);
+    }));
   };
-  /** PATCHes every change and waits for all of them, so a reload after a failure sees every write that landed. */
-  async function patchAll(changes: { id: string; fields: StructureFields }[]) {
-    const results = await Promise.allSettled(changes.map((change) => patchJSON(`/api/maps/${mapId}/structures/${change.id}`, change.fields)));
-    const failedIds = new Set(changes.filter((_, index) => results[index].status === "rejected").map((change) => change.id));
-    const failure = results.find((result): result is PromiseRejectedResult => result.status === "rejected")?.reason;
-    return { failedIds, failure };
-  }
   const addLocal = (created: MapStructure[]) =>
-    setMap((current) => current ? { ...current, structures: [...(current.structures ?? []), ...created] } : current);
-  const removeLocal = (ids: Set<string>) => {
-    setMap((current) => current ? { ...current, structures: current.structures?.filter((structure) => !ids.has(structure.id)) } : current);
+    changeMap((current) => ({ ...current, structures: [...(current.structures ?? []), ...created] }));
+  const removeLocal = (ids: ReadonlySet<string>) => {
+    changeMap((current) => ({ ...current, structures: current.structures?.filter((structure) => !ids.has(structure.id)) }));
     setSelectedIds((current) => current.filter((id) => !ids.has(id)));
   };
 
-  /** POSTs each structure; returns the server copies paired with their source and the ones that failed. */
-  async function postAll<T>(sources: T[], payload: (source: T) => NewStructure) {
-    const results = await Promise.allSettled(sources.map((source) => postJSON<MapStructure>(`/api/maps/${mapId}/structures`, payload(source))));
-    const created: { source: T; structure: MapStructure }[] = [];
-    const failed: T[] = [];
-    let failure: unknown;
-    results.forEach((result, index) => {
-      if (result.status === "fulfilled") created.push({ source: sources[index], structure: result.value });
-      else {
-        failed.push(sources[index]);
-        failure ??= result.reason;
-      }
-    });
-    if (created.length > 0) addLocal(created.map(({ structure }) => structure));
-    return { created, failed, failure };
+  /** PATCHes every change and waits for all of them, so a reload after a failure sees every write that landed. */
+  async function patchAll(mapPath: string, changes: { id: string; fields: StructureFields }[]) {
+    const results = await Promise.allSettled(changes.map((change) => patchJSON(`${mapPath}/structures/${change.id}`, change.fields)));
+    return settledFailures(changes.map((change) => change.id), results);
+  }
+  async function postAll(mapPath: string, created: MapStructure[]) {
+    const results = await Promise.allSettled(created.map((structure) => postJSON<MapStructure>(`${mapPath}/structures`, createPayload(structure))));
+    return settledFailures(created.map((structure) => structure.id), results);
+  }
+  async function deleteAll(mapPath: string, doomed: MapStructure[]) {
+    const results = await Promise.allSettled(doomed.map((structure) => deleteJSON(`${mapPath}/structures/${structure.id}`)));
+    return settledFailures(doomed.map((structure) => structure.id), results);
   }
 
-  async function deleteAll(doomed: MapStructure[]) {
-    const results = await Promise.allSettled(doomed.map((structure) => deleteJSON(`/api/maps/${mapId}/structures/${structure.id}`)));
-    const deleted = doomed.filter((_, index) => results[index].status === "fulfilled");
-    const failed = doomed.filter((_, index) => results[index].status === "rejected");
-    const failure = results.find((result): result is PromiseRejectedResult => result.status === "rejected")?.reason;
-    if (deleted.length > 0) removeLocal(new Set(deleted.map((structure) => structure.id)));
-    return { deleted, failed, failure };
-  }
-
-  /** Recreated structures get new ids; every history step must follow them. */
-  const remapIds = (ids: Map<string, string>) => {
-    if (ids.size === 0) return;
-    const remap = (id: string) => ids.get(id) ?? id;
-    const rewrite = (entry: HistoryEntry): HistoryEntry => entry.type === "update"
-      ? { ...entry, changes: entry.changes.map((change) => ({ ...change, id: remap(change.id) })) }
-      : { ...entry, structures: entry.structures.map((structure) => ({ ...structure, id: remap(structure.id) })) };
-    undoStack.current = undoStack.current.map(rewrite);
-    redoStack.current = redoStack.current.map(rewrite);
-  };
-
-  const errorMessage = (err: unknown, fallback: string) => err instanceof Error ? err.message : fallback;
-
-  async function update(updates: StructureUpdate[], message?: string) {
-    if (busyRef.current || updates.length === 0) return;
-    const current = new Map(structures.map((structure) => [structure.id, structure]));
+  function update(updates: StructureUpdate[], message?: string) {
+    const current = new Map(currentStructures().map((structure) => [structure.id, structure]));
     const changes = updates.flatMap(({ id, fields }) => {
       const structure = current.get(id);
       if (!structure) return [];
@@ -154,143 +211,150 @@ export function useStructureEditor(mapId: string | undefined) {
     const entry: HistoryEntry = { type: "update", changes };
     startEdit(entry);
     applyFields(changes.map((change) => ({ id: change.id, fields: change.after })));
-    setBusy(true);
-    setError("");
-    try {
-      const { failedIds, failure } = await patchAll(changes.map((change) => ({ id: change.id, fields: change.after })));
-      if (failedIds.size === 0) {
-        if (message) setNotice(message);
-        return;
-      }
-      // Keep undo for the changes the server accepted; put the rejected ones back.
-      const saved = changes.filter((change) => !failedIds.has(change.id));
-      const index = undoStack.current.indexOf(entry);
-      if (index !== -1) {
-        if (saved.length > 0) undoStack.current[index] = { type: "update", changes: saved };
-        else undoStack.current.splice(index, 1);
-      }
-      historyChanged();
-      applyFields(changes.filter((change) => failedIds.has(change.id)).map((change) => ({ id: change.id, fields: change.before })));
-      setError(errorMessage(failure, "Could not update the structure."));
-      await resync();
-    } finally {
-      setBusy(false);
-    }
+    if (message) setNotice(message);
+    enqueue(async (mapPath) => {
+      const { failedIds, failure } = await patchAll(mapPath, changes.map((change) => ({ id: change.id, fields: change.after })));
+      if (failedIds.size === 0) return;
+      keepSaved(entry, failedIds);
+      throw failure;
+    }, "Could not update the structure.");
   }
 
-  async function create(payloads: NewStructure[], message?: string): Promise<MapStructure[]> {
-    if (busyRef.current || payloads.length === 0) return [];
-    setBusy(true);
-    setError("");
-    try {
-      const { created, failure } = await postAll(payloads, (payload) => payload);
-      const structuresCreated = created.map(({ structure }) => structure);
-      if (structuresCreated.length > 0) startEdit({ type: "create", structures: structuresCreated });
-      if (failure) setError(errorMessage(failure, "Could not add the structure."));
-      if (message && structuresCreated.length > 0) setNotice(message);
-      return structuresCreated;
-    } finally {
-      setBusy(false);
-    }
+  /** Adds the structures at once and saves them in the background. Returns them with their ids. */
+  function create(payloads: NewStructure[], message?: string): MapStructure[] {
+    if (payloads.length === 0 || !mapRef.current) return [];
+    const top = Math.max(0, ...currentStructures().map((structure) => structure.z_index ?? 0));
+    const created: MapStructure[] = payloads.map((payload, index) => ({
+      ...payload,
+      id: payload.id ?? crypto.randomUUID(),
+      map_id: mapRef.current?.id,
+      z_index: payload.z_index ?? top + index + 1,
+    }));
+    const entry: HistoryEntry = { type: "create", structures: created };
+    startEdit(entry);
+    addLocal(created);
+    if (message) setNotice(message);
+    enqueue(async (mapPath) => {
+      const { failedIds, failure } = await postAll(mapPath, created);
+      if (failedIds.size === 0) return;
+      keepSaved(entry, failedIds);
+      throw failure;
+    }, "Could not add the structure.");
+    return created;
   }
 
-  async function remove(ids: string[]) {
+  function remove(ids: string[]) {
     const wanted = new Set(ids);
-    const doomed = structures.filter((structure) => wanted.has(structure.id));
-    if (doomed.length === 0 || busyRef.current) return;
-    setBusy(true);
-    setError("");
-    setNotice("");
-    try {
-      const { deleted, failure } = await deleteAll(doomed);
-      if (deleted.length > 0) {
-        startEdit({ type: "delete", structures: deleted });
-        setNotice(deleted.length === 1 ? "Structure deleted. Press Ctrl/Cmd+Z to restore it." : `${deleted.length} structures deleted. Press Ctrl/Cmd+Z to restore them.`);
+    const doomed = currentStructures().filter((structure) => wanted.has(structure.id));
+    if (doomed.length === 0) return;
+    const entry: HistoryEntry = { type: "delete", structures: doomed };
+    startEdit(entry);
+    removeLocal(wanted);
+    const undo = shortcutLabel("mod+z");
+    setNotice(doomed.length === 1 ? `Structure deleted. Press ${undo} to restore it.` : `${doomed.length} structures deleted. Press ${undo} to restore them.`);
+    enqueue(async (mapPath) => {
+      const { failedIds, failure } = await deleteAll(mapPath, doomed);
+      if (failedIds.size === 0) return;
+      keepSaved(entry, failedIds);
+      throw failure;
+    }, "Could not delete the structure.");
+  }
+
+  /** Changes map settings (name, size, grid, background) as one undoable step. */
+  function updateMap(fields: MapFields, message?: string) {
+    const current = mapRef.current;
+    if (!current) return;
+    const keys = (Object.keys(fields) as (keyof MapFields)[]).filter((key) => String(fields[key] ?? "") !== String(current[key] ?? ""));
+    if (keys.length === 0) return;
+    const before = Object.fromEntries(keys.map((key) => [key, current[key] ?? null])) as MapFields;
+    const after = Object.fromEntries(keys.map((key) => [key, fields[key] ?? null])) as MapFields;
+    const entry: HistoryEntry = { type: "map", before, after };
+    startEdit(entry);
+    changeMap((map) => ({ ...map, ...after }));
+    if (message) setNotice(message);
+    enqueue(async (mapPath) => {
+      try {
+        await patchJSON(mapPath, after);
+      } catch (err) {
+        keepSaved(entry, new Set());
+        throw err;
       }
-      if (failure) setError(errorMessage(failure, "Could not delete the structure."));
-    } finally {
-      setBusy(false);
-    }
+    }, "Could not save the map settings.");
   }
 
   /**
-   * Replays one history entry in the given direction. On success the entry moves to the opposite stack
-   * (with recreated ids); whatever failed goes back onto the stack it came from.
+   * Replays one history entry in the given direction. The entry moves to the opposite stack at once;
+   * whatever the server refuses goes back onto the stack it came from.
    */
-  async function replay(direction: "undo" | "redo") {
-    const from = direction === "undo" ? undoStack : redoStack;
-    const to = direction === "undo" ? redoStack : undoStack;
-    if (busyRef.current || from.current.length === 0) return;
-    const entry = from.current.pop()!;
-    historyChanged();
-    setBusy(true);
-    setError("");
-    setNotice("");
-    const done = direction === "undo" ? "Last map edit undone." : "Map edit redone.";
-    try {
-      if (entry.type === "update") {
-        const fields = entry.changes.map((change) => ({ id: change.id, fields: direction === "undo" ? change.before : change.after }));
-        applyFields(fields);
-        const { failedIds, failure } = await patchAll(fields);
-        const applied = entry.changes.filter((change) => !failedIds.has(change.id));
+  function replay(direction: "undo" | "redo") {
+    const undoing = direction === "undo";
+    const from = undoing ? undoStack : redoStack;
+    const to = undoing ? redoStack : undoStack;
+    const entry = from.current.pop();
+    if (!entry) return;
+    push(to.current, entry);
+    setNotice(undoing ? "Last map edit undone." : "Map edit redone.");
+    if (entry.type === "update") {
+      const fields = entry.changes.map((change) => ({ id: change.id, fields: undoing ? change.before : change.after }));
+      applyFields(fields);
+      enqueue(async (mapPath) => {
+        const { failedIds, failure } = await patchAll(mapPath, fields);
+        if (failedIds.size === 0) return;
         const failed = entry.changes.filter((change) => failedIds.has(change.id));
-        if (applied.length > 0) push(to.current, { type: "update", changes: applied });
-        if (failed.length > 0) {
-          push(from.current, { type: "update", changes: failed });
-          setError(errorMessage(failure, direction === "undo" ? "Could not undo the structure change." : "Could not redo the structure change."));
-          await resync();
-          return;
-        }
-        setNotice(done);
-        return;
-      }
-      // Undoing a creation or redoing a deletion removes structures; the opposite recreates them.
-      const recreate = (entry.type === "delete") === (direction === "undo");
-      if (recreate) {
-        const { created, failed, failure } = await postAll(entry.structures, restorePayload);
-        remapIds(new Map(created.map(({ source, structure }) => [source.id, structure.id])));
-        if (created.length > 0) push(to.current, { type: entry.type, structures: created.map(({ structure }) => structure) });
-        setSelectedIds(created.map(({ structure }) => structure.id));
-        if (failed.length > 0) {
-          push(from.current, { type: entry.type, structures: failed });
-          setError(errorMessage(failure, "Could not restore the structures."));
-          await resync();
-          return;
-        }
-      } else {
-        const { deleted, failed, failure } = await deleteAll(entry.structures);
-        if (deleted.length > 0) push(to.current, { type: entry.type, structures: deleted });
-        if (failed.length > 0) {
-          push(from.current, { type: entry.type, structures: failed });
-          setError(errorMessage(failure, "Could not remove the structures."));
-          await resync();
-          return;
-        }
-      }
-      setNotice(done);
-    } finally {
-      setBusy(false);
+        keepSaved(entry, failedIds);
+        push(from.current, { type: "update", changes: failed });
+        throw failure;
+      }, undoing ? "Could not undo the structure change." : "Could not redo the structure change.");
+      return;
     }
+    if (entry.type === "map") {
+      const fields = undoing ? entry.before : entry.after;
+      changeMap((map) => ({ ...map, ...fields }));
+      enqueue(async (mapPath) => {
+        try {
+          await patchJSON(mapPath, fields);
+        } catch (err) {
+          keepSaved(entry, new Set());
+          push(from.current, entry);
+          throw err;
+        }
+      }, undoing ? "Could not undo the map settings change." : "Could not redo the map settings change.");
+      return;
+    }
+    // Undoing a creation or redoing a deletion removes structures; the opposite recreates them with their ids.
+    const recreate = (entry.type === "delete") === undoing;
+    const affected = entry.structures;
+    if (recreate) {
+      addLocal(affected);
+      setSelectedIds(affected.map((structure) => structure.id));
+    } else {
+      removeLocal(new Set(affected.map((structure) => structure.id)));
+    }
+    enqueue(async (mapPath) => {
+      const { failedIds, failure } = recreate ? await postAll(mapPath, affected) : await deleteAll(mapPath, affected);
+      if (failedIds.size === 0) return;
+      const failed = affected.filter((structure) => failedIds.has(structure.id));
+      keepSaved(entry, failedIds);
+      push(from.current, { type: entry.type, structures: failed });
+      throw failure;
+    }, recreate ? "Could not restore the structures." : "Could not remove the structures.");
   }
 
   return {
     map,
-    setMap,
     structures,
     loading,
-    busy,
-    error,
+    loadError,
     notice,
-    setError,
     setNotice,
-    setBusy,
+    saveState,
     selectedIds,
     select,
-    load,
-    runSaving,
     update,
     create,
     remove,
+    updateMap,
+    flush,
     undo: () => replay("undo"),
     redo: () => replay("redo"),
     canUndo: undoStack.current.length > 0,
@@ -298,7 +362,14 @@ export function useStructureEditor(mapId: string | undefined) {
   };
 }
 
-function restorePayload(structure: MapStructure): NewStructure {
-  const { kind, geometry, blocks_vision, blocks_movement, blocks_attacks, cover_bonus, pass_rules, z_index, group_id } = structure;
-  return { kind, geometry, blocks_vision, blocks_movement, blocks_attacks, cover_bonus, pass_rules, z_index, group_id };
+function settledFailures(ids: string[], results: PromiseSettledResult<unknown>[]) {
+  const failedIds = new Set(ids.filter((_, index) => results[index].status === "rejected"));
+  const failure = results.find((result): result is PromiseRejectedResult => result.status === "rejected")?.reason;
+  return { failedIds, failure };
+}
+
+/** The POST body that saves a structure under its own id, draw order and group. */
+function createPayload(structure: MapStructure): NewStructure {
+  const { id, kind, geometry, blocks_vision, blocks_movement, blocks_attacks, cover_bonus, pass_rules, z_index, group_id } = structure;
+  return { id, kind, geometry, blocks_vision, blocks_movement, blocks_attacks, cover_bonus, pass_rules, z_index, ...(group_id ? { group_id } : {}) };
 }
