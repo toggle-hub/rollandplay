@@ -287,6 +287,9 @@ func (c *client) actionResolve(msg clientEnvelope) {
 		return
 	}
 	defer tx.Rollback(ctx)
+	if !c.spendTurn(ctx, tx, msg.RequestID, turnSpend{tokens: []game.Token{source}, action: true}) {
+		return
+	}
 	keys := []statsKey{tokenStatsKey(source)}
 	for _, t := range targets {
 		keys = append(keys, tokenStatsKey(t))

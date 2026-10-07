@@ -358,6 +358,8 @@ func (c *client) handle(msg clientEnvelope) {
 		c.combatRemove(msg)
 	case "combat.move":
 		c.combatMove(msg)
+	case "combat.extra_action":
+		c.combatExtraAction(msg)
 	case "combat.end":
 		c.combatEnd(msg)
 	case "ruler.measure":
@@ -380,7 +382,8 @@ func (c *client) tokenMove(msg clientEnvelope) {
 		c.error(msg.RequestID, "bad_json", "invalid body")
 		return
 	}
-	token, err := c.hub.loadToken(context.Background(), c.roomID, req.TokenID)
+	ctx := context.Background()
+	token, err := c.hub.loadToken(ctx, c.roomID, req.TokenID)
 	if err != nil {
 		c.error(msg.RequestID, "not_found", "token not found")
 		return
@@ -389,12 +392,25 @@ func (c *client) tokenMove(msg clientEnvelope) {
 		c.error(msg.RequestID, "forbidden", "you cannot move this token")
 		return
 	}
-	structures, _ := c.hub.loadStructures(context.Background(), c.roomID)
-	if !game.CanMove(walkedPath(token, req.Path, req.To), structures, token) {
+	structures, _ := c.hub.loadStructures(ctx, c.roomID)
+	path := walkedPath(token, req.Path, req.To)
+	if !game.CanMove(path, structures, token) {
 		c.error(msg.RequestID, "blocked_movement", "movement is blocked")
 		return
 	}
-	_, err = c.hub.pool.Exec(context.Background(), `update room_tokens set x_m=$1,y_m=$2,updated_at=now() where id=$3`, req.To.X, req.To.Y, req.TokenID)
+	tx, err := c.hub.pool.Begin(ctx)
+	if err != nil {
+		c.error(msg.RequestID, "db", err.Error())
+		return
+	}
+	defer tx.Rollback(ctx)
+	if !c.spendTurn(ctx, tx, msg.RequestID, turnSpend{tokens: []game.Token{token}, walked: map[string]float64{token.ID: game.PathLengthMeters(path)}}) {
+		return
+	}
+	_, err = tx.Exec(ctx, `update room_tokens set x_m=$1,y_m=$2,updated_at=now() where id=$3`, req.To.X, req.To.Y, req.TokenID)
+	if err == nil {
+		err = tx.Commit(ctx)
+	}
 	if err != nil {
 		c.error(msg.RequestID, "db", err.Error())
 		return
@@ -443,6 +459,8 @@ func (c *client) tokensMove(msg clientEnvelope) {
 	ctx := context.Background()
 	structures, _ := c.hub.loadStructures(ctx, c.roomID)
 	ids := make([]string, 0, len(req.Moves))
+	tokens := make([]game.Token, 0, len(req.Moves))
+	walked := make(map[string]float64, len(req.Moves))
 	for _, m := range req.Moves {
 		token, err := c.hub.loadToken(ctx, c.roomID, m.TokenID)
 		if err != nil {
@@ -453,11 +471,14 @@ func (c *client) tokensMove(msg clientEnvelope) {
 			c.error(msg.RequestID, "forbidden", "you cannot move this token")
 			return
 		}
-		if !game.CanMove(walkedPath(token, m.Path, m.To), structures, token) {
+		path := walkedPath(token, m.Path, m.To)
+		if !game.CanMove(path, structures, token) {
 			c.error(msg.RequestID, "blocked_movement", "movement is blocked")
 			return
 		}
 		ids = append(ids, m.TokenID)
+		tokens = append(tokens, token)
+		walked[token.ID] = game.PathLengthMeters(path)
 	}
 	tx, err := c.hub.pool.Begin(ctx)
 	if err != nil {
@@ -465,6 +486,9 @@ func (c *client) tokensMove(msg clientEnvelope) {
 		return
 	}
 	defer tx.Rollback(ctx)
+	if !c.spendTurn(ctx, tx, msg.RequestID, turnSpend{tokens: tokens, walked: walked}) {
+		return
+	}
 	for _, m := range req.Moves {
 		if _, err = tx.Exec(ctx, `update room_tokens set x_m=$1,y_m=$2,updated_at=now() where id=$3`, m.To.X, m.To.Y, m.TokenID); err != nil {
 			break

@@ -93,6 +93,24 @@ export function drawToken(
   }
 }
 
+/** The dashed ring around the token whose turn it is: a dark halo under lavender, outside the selection ring. */
+export function drawTurnRing(ctx: CanvasRenderingContext2D, t: RoomToken, center: Point, scale: number) {
+  const cx = center.x * scale;
+  const cy = center.y * scale;
+  const r = ((typeof t.size_m === "number" ? t.size_m : Number(t.size_m) || 1) * scale) / 2;
+  ctx.save();
+  ctx.setLineDash([6, 4]);
+  ctx.beginPath();
+  ctx.arc(cx, cy, r + 9, 0, Math.PI * 2);
+  ctx.lineWidth = 6;
+  ctx.strokeStyle = "#18151e";
+  ctx.stroke();
+  ctx.lineWidth = 3;
+  ctx.strokeStyle = "#ebc7ff";
+  ctx.stroke();
+  ctx.restore();
+}
+
 /**
  * Draws a token's health bar, name pill, Down/Stable/Dead tag and condition badges. Called after
  * every token is drawn, so neighbouring tokens never cover a label.

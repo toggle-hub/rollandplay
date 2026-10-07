@@ -14,8 +14,9 @@ import { stampGeometry, structureLabel, templateGeometry } from "../lib/structur
 import { drawDoor, drawMapBackground, structureColors } from "../lib/roomMapDrawing";
 import { extendPath, movementBarriers, walkToken } from "../lib/movement";
 import { clampTokenCenter, snapTokenCenter } from "../lib/tokenGrid";
-import { drawToken, drawTokenLabels } from "../lib/tokenDrawing";
+import { drawToken, drawTokenLabels, drawTurnRing } from "../lib/tokenDrawing";
 import { placementSpot } from "../lib/tokenPlacement";
+import { currentTurnTokenId, turnLeft } from "../lib/turns";
 import { castVision } from "../lib/vision";
 import { ActionConfirmCard } from "./ActionConfirmCard";
 import { TokenActionWheel } from "./TokenActionWheel";
@@ -45,6 +46,8 @@ type Props = {
   onEditActions?: (tokenId: string) => void;
   /** The action wheel's Checks, built from the room rule book; D&D checks when absent. */
   checkGroups?: QuickCheckGroup[];
+  /** Why the viewer cannot attack, cast or use an item with a token this turn, else undefined. */
+  turnBlockReason?: (tokenId: string) => string | undefined;
   floatingResults?: readonly FloatingResult[];
   /** The structure the next click places, turned by `rotationDeg` and sized by `scalePercent` (100 when unset). */
   placingStructure?: { kind: string; rotationDeg?: number; scalePercent?: number } | null;
@@ -127,6 +130,7 @@ export function MapCanvas({
   onAction,
   onEditActions,
   checkGroups,
+  turnBlockReason,
   floatingResults,
   placingStructure,
   onPlaceStructure,
@@ -372,9 +376,11 @@ export function MapCanvas({
       ctx.drawImage(layer, 0, 0);
       ctx.setTransform(dpr, 0, 0, dpr, camera.x * dpr, camera.y * dpr);
     }
+    const turnTokenId = currentTurnTokenId(state.combat);
     state.visibleTokens.forEach((t) => {
       const image = t.image_asset_id ? images.current.get(t.image_asset_id) : undefined;
       drawToken(ctx, t, livePosition(t), scale, !!selectedTokenIds?.includes(t.id), image);
+      if (t.id === turnTokenId) drawTurnRing(ctx, t, livePosition(t), scale);
     });
     state.visibleTokens.forEach((t) => drawTokenLabels(ctx, t, livePosition(t), scale, !!selectedTokenIds?.includes(t.id)));
     const framed = canMoveStructures ? structureDrag?.structure ?? selectedStructure : undefined;
@@ -506,14 +512,18 @@ export function MapCanvas({
       drawLabel(ctx, distanceLabel(Math.hypot(ruler.to.x - ruler.from.x, ruler.to.y - ruler.from.y), gridSize), b.x + 8, b.y - 12);
     }
     if (drag?.moved) {
-      // How far the grabbed token walked, around walls, against its speed when the sheet has one.
+      // How far the grabbed token walked, around walls, against its speed when the sheet has one;
+      // on its turn in a fight, against what is left of that speed.
       const at = drag.at.get(drag.grabbed.id)!;
       const walked = pathLength(drag.paths.get(drag.grabbed.id)!);
       const speed = drag.grabbed.speed_m;
-      const tooFar = speed !== undefined && walked > speed + 1e-9;
+      const left = turnLeft(state.combat, drag.grabbed.id);
+      const budget = speed === undefined ? undefined : left ? Math.max(0, speed - left.movedM) : speed;
+      const tooFar = budget !== undefined && walked > budget + 1e-9;
+      const suffix = speed === undefined || budget === undefined ? "" : left ? ` · ${formatMeters(Math.max(0, budget - walked))} m left` : tooFar ? ` · speed ${formatMeters(speed)} m` : "";
       const center = toCanvas(at);
       const radius = (n(drag.grabbed.size_m, 1) * scale) / 2;
-      drawLabel(ctx, `${distanceLabel(walked, gridSize)}${tooFar ? ` · speed ${formatMeters(speed)} m` : ""}`, center.x + radius + 6, center.y - radius, tooFar ? "#ffb887" : "#f6effa");
+      drawLabel(ctx, `${distanceLabel(walked, gridSize)}${suffix}`, center.x + radius + 6, center.y - radius, tooFar ? "#ffb887" : "#f6effa");
     }
     if (floatingResults?.length) {
       const font = ctx.font;
@@ -1186,6 +1196,7 @@ export function MapCanvas({
         y={actionWheel.y}
         token={wheelToken}
         checkGroups={checkGroups}
+        turnBlocked={turnBlockReason?.(wheelToken.id)}
         onPreview={(rangeM) => setRangePreview(rangeM === null ? null : { tokenId: wheelToken.id, rangeM })}
         onChoose={chooseAction}
         onEdit={wheelToken.actions_editable && onEditActions ? () => {

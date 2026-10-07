@@ -17,6 +17,15 @@ type Polygon struct {
 func DistanceMeters(a, b Point) float64        { return math.Hypot(a.X-b.X, a.Y-b.Y) }
 func MeasureDistanceMeters(a, b Point) float64 { return math.Round(DistanceMeters(a, b)*100) / 100 }
 
+// PathLengthMeters is the length of a walked route, corner to corner.
+func PathLengthMeters(path []Point) float64 {
+	total := 0.0
+	for i := 1; i < len(path); i++ {
+		total += DistanceMeters(path[i-1], path[i])
+	}
+	return total
+}
+
 func SegmentIntersects(a, b Segment) bool {
 	const eps = 1e-9
 	d1 := orient(a.A, a.B, b.A)

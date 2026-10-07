@@ -15,6 +15,8 @@ import { TokenSettingsPanel } from "../components/TokenSettingsPanel";
 import { CharacterStatusCard } from "../components/CharacterStatusCard";
 import { RoomInvitePanel } from "../components/RoomInvitePanel";
 import { TurnOrderStrip } from "../components/TurnOrderStrip";
+import { MapHints } from "../components/MapHints";
+import { RoomSetupChecklist, useSetupHidden } from "../components/RoomSetupChecklist";
 import { RoomHeader, type RoomConnection } from "../components/RoomHeader";
 import { RoomTabs } from "../components/RoomTabs";
 import { Dialog } from "../components/Dialog";
@@ -32,6 +34,7 @@ import { allRoomParts, partsToReload, type RoomPart } from "../lib/roomEvents";
 import { useViewportFill } from "../lib/useViewportFill";
 import { quickCheckGroups } from "../lib/checks";
 import { useRuleBook } from "../lib/useRuleBook";
+import { offTurnTokenIds, turnBlockReason } from "../lib/turns";
 
 type Point = { x: number; y: number };
 
@@ -93,10 +96,13 @@ export function RoomPage() {
   // Characters usable at this table: the room's rule book, and for players only their own sheets.
   const roomSheets = sheets.filter((item) => item.rule_book_id === state?.room.rule_book.id && (isDM || item.user_id === user?.id));
   const currentMapId = state ? activeMapId(state) : "";
+  // In a fight, a player's tokens wait for their turn: off-turn ones cannot be picked up.
+  const offTurn = useMemo(() => offTurnTokenIds(state?.combat, isDM), [state?.combat, isDM]);
   const movableTokenIds = useMemo(
-    () => new Set(state?.visibleTokens.filter((token) => token.can_move).map((token) => token.id)),
-    [state?.visibleTokens],
+    () => new Set(state?.visibleTokens.filter((token) => token.can_move && !offTurn.has(token.id)).map((token) => token.id)),
+    [state?.visibleTokens, offTurn],
   );
+  const [setupHidden, hideSetup] = useSetupHidden(roomId ?? "");
   const rulerList = useMemo(() => remoteRulers(sharedRulers, members), [sharedRulers, members]);
   const selectedTokens = mapSelection?.kind === "tokens" ? state?.visibleTokens.filter((token) => mapSelection.ids.includes(token.id)) ?? [] : [];
   const removableTokens = selectedTokens.filter((token) => isDM || token.owner_user_id === user?.id);
@@ -421,6 +427,8 @@ export function RoomPage() {
 
   const openCheckCount = (state.checks ?? []).filter((check) => !check.closed_at).length;
   const myPendingChecks = (state.checks ?? []).filter((check) => isPendingFor(check, user?.id));
+  const hasPlayers = members.some((member) => !member.is_dm);
+  const showSetup = isDM && !setupHidden && !(!!state.activeMap && state.visibleTokens.length > 0 && hasPlayers);
   const closeTools = () => {
     setToolsOpen(false);
     toolsToggleRef.current?.focus();
@@ -503,6 +511,20 @@ export function RoomPage() {
         ]} /> : <div className="min-h-0 flex-1 space-y-3 overflow-y-auto overscroll-contain">{tokenCards}</div>}
       </aside>
       <section className="flex h-[var(--room-fill)] min-h-0 min-w-0 flex-col gap-2 lg:h-full" aria-label="Tabletop">
+        {showSetup && <RoomSetupChecklist hasMap={!!state.activeMap} hasTokens={state.visibleTokens.length > 0} hasPlayers={hasPlayers}
+          onOpenMapTools={() => {
+            setToolsTab("map");
+            setToolsOpen(true);
+          }}
+          onOpenTokenTools={() => {
+            setToolsTab("tokens");
+            setToolsOpen(true);
+          }}
+          onOpenPlayers={() => {
+            setSideTab("players");
+            sideRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+          }}
+          onHide={hideSetup} />}
         {myPendingChecks.length > 0 && <div className="max-h-40 shrink-0 overflow-y-auto overscroll-contain">
           <RoomChecks pinned checks={myPendingChecks} members={members} currentUserId={user?.id} isDM={false}
             onRoll={(checkId, userId, options) => sendMap("check.roll", { checkId, userId, ...options })}
@@ -570,6 +592,7 @@ export function RoomPage() {
             remoteRulers={rulerList}
             onAction={(request) => sendMap(request.type, request.body)}
             checkGroups={quickCheckGroups(ruleBook?.attributes)}
+            turnBlockReason={(tokenId) => turnBlockReason(state.combat, isDM, tokenId)}
             onEditActions={(tokenId) => {
               setActionEditorTokenId(tokenId);
             }}
@@ -581,8 +604,15 @@ export function RoomPage() {
             onPlaceToken={placeToken}
             onCancelTokenPlacement={() => setPlacingToken(null)}
           />
+          {state.activeMap && <MapHints />}
         </div>
-        {!state.activeMap && <p className="text-muted text-sm">{isDM ? "No map is active. Choose or start one in the Map & tokens controls, or use Place structure to start a blank map." : "No map is active. Ask your game master to choose a room map."}</p>}
+        {!state.activeMap && (isDM
+          ? !showSetup && <p className="text-muted text-sm">No map is active. Choose or start one in the Map & tokens controls, or use Place structure to start a blank map.</p>
+          : <div className="empty-state py-10">
+            <MapTrifold size={40} weight="thin" className="mx-auto mb-4 text-[var(--accent)]" aria-hidden="true" />
+            <h3 className="text-lg">Waiting for a map</h3>
+            <p className="text-muted mx-auto max-w-sm text-sm">Your game master hasn't chosen a map yet. This page updates by itself.</p>
+          </div>)}
       </section>
       <aside ref={sideRef} className="flex h-[min(85dvh,720px)] min-h-0 min-w-0 scroll-mt-3 flex-col md:col-span-2 lg:col-span-1 lg:h-full [&_.card]:p-4!" aria-label="Chat, checks and players">
         <RoomTabs label="Table" idPrefix="room-side" active={sideTab} onChange={setSideTab} className="min-h-0 flex-1" panelClassName="min-h-0 flex-1 overflow-y-auto overscroll-contain" tabs={[

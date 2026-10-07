@@ -11,6 +11,8 @@ type Props = {
   token: RoomToken;
   /** The Checks menu, built from the room's rule book; D&D saving throws, skills and ability checks when absent. */
   checkGroups?: QuickCheckGroup[];
+  /** Why attacks, spells and items are off this turn; checks and death saves stay available. */
+  turnBlocked?: string;
   onPreview: (rangeM: number | null) => void;
   onChoose: (choice: WheelChoice) => void;
   onEdit?: () => void;
@@ -48,7 +50,7 @@ function cycleFocus(container: HTMLElement | null, event: KeyboardEvent, keys: s
   return true;
 }
 
-export function TokenActionWheel({ x, y, token, checkGroups = quickCheckGroups(), onPreview, onChoose, onEdit, onClose }: Props) {
+export function TokenActionWheel({ x, y, token, checkGroups = quickCheckGroups(), turnBlocked, onPreview, onChoose, onEdit, onClose }: Props) {
   const wheel = useRef<HTMLDivElement>(null);
   const list = useRef<HTMLDivElement>(null);
   const closeButton = useRef<HTMLButtonElement>(null);
@@ -59,11 +61,12 @@ export function TokenActionWheel({ x, y, token, checkGroups = quickCheckGroups()
   const dead = !!token.death_saves?.dead;
   const down = isDown(token);
   const blocked = dead ? "This character is dead" : down ? "This character is down" : undefined;
+  const actBlocked = blocked ?? turnBlocked;
 
   const categories: Category[] = [
-    { key: "attacks", label: "Attacks", icon: Sword, disabled: !!blocked || attacks.length === 0, title: blocked ?? (attacks.length === 0 ? "No attacks yet" : undefined) },
-    { key: "actions", label: "Spells & abilities", icon: MagicWand, disabled: !!blocked || actions.length === 0, title: blocked ?? (actions.length === 0 ? "No spells or abilities yet" : undefined) },
-    { key: "items", label: "Items", icon: Flask, disabled: !!blocked || items.length === 0, title: blocked ?? (items.length === 0 ? "No items" : undefined) },
+    { key: "attacks", label: "Attacks", icon: Sword, disabled: !!actBlocked || attacks.length === 0, title: actBlocked ?? (attacks.length === 0 ? "No attacks yet" : undefined) },
+    { key: "actions", label: "Spells & abilities", icon: MagicWand, disabled: !!actBlocked || actions.length === 0, title: actBlocked ?? (actions.length === 0 ? "No spells or abilities yet" : undefined) },
+    { key: "items", label: "Items", icon: Flask, disabled: !!actBlocked || items.length === 0, title: actBlocked ?? (items.length === 0 ? "No items" : undefined) },
     { key: "checks", label: "Checks", icon: DiceFive, disabled: !!blocked || checkGroups.length === 0, title: blocked ?? (checkGroups.length === 0 ? "This rule book has no numbers to roll checks with" : undefined) },
   ];
   if (canDeathSave(token)) categories.push({ key: "death_save", label: "Death save", icon: Heartbeat, disabled: dead });

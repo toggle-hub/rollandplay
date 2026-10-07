@@ -25,7 +25,12 @@ type Combat struct {
 	// hidden token acts.
 	CurrentCombatantID *string     `json:"current_combatant_id"`
 	Combatants         []Combatant `json:"combatants"`
-	current            int         // index into Combatants of whose turn it is
+	// What the current combatant has spent this turn: actions used of those allowed (1 plus any the
+	// game master granted) and meters walked.
+	ActionsUsed    int     `json:"actions_used"`
+	ActionsAllowed int     `json:"actions_allowed"`
+	MovedM         float64 `json:"moved_m"`
+	current        int     // index into Combatants of whose turn it is
 }
 
 type Combatant struct {
@@ -59,6 +64,13 @@ func (c *Combat) syncCurrentID() {
 	}
 }
 
+// resetTurn clears what the turn spent when the turn passes to someone.
+func (c *Combat) resetTurn() { c.ActionsUsed, c.ActionsAllowed, c.MovedM = 0, 1, 0 }
+
+func (c *Combat) hasToken(tokenID string) bool {
+	return slices.ContainsFunc(c.Combatants, func(cb Combatant) bool { return cb.TokenID == tokenID })
+}
+
 // ForViewer is the fight as one viewer may see it: game masters see everything, players never
 // see hidden tokens, nor whose turn it is while a hidden token acts.
 func (c *Combat) ForViewer(isDM bool) *Combat {
@@ -73,6 +85,7 @@ func (c *Combat) ForViewer(isDM bool) *Combat {
 	}
 	if cur := c.Current(); cur != nil && !cur.IsHidden {
 		out.CurrentCombatantID = c.CurrentCombatantID
+		out.ActionsUsed, out.ActionsAllowed, out.MovedM = c.ActionsUsed, c.ActionsAllowed, c.MovedM
 	}
 	return out
 }
@@ -86,13 +99,15 @@ type combatQueryer interface {
 // the first combatant at or after the stored position, so a token deleted mid-turn passes the
 // turn on. forUpdate locks the fight so changes to it apply one at a time.
 func LoadCombat(ctx context.Context, q combatQueryer, roomID string, forUpdate bool) (*Combat, error) {
-	query := `select rc.round,rc.current_position from room_combats rc join room_maps rm on rm.id=rc.room_map_id and rm.is_active where rc.room_id=$1`
+	query := `select rc.round,rc.current_position,coalesce(rc.turn_combatant_id::text,''),rc.turn_round,rc.turn_actions_used,rc.turn_extra_actions,rc.turn_moved_m from room_combats rc join room_maps rm on rm.id=rc.room_map_id and rm.is_active where rc.room_id=$1`
 	if forUpdate {
 		query += ` for update of rc`
 	}
 	combat := &Combat{Combatants: []Combatant{}}
-	var currentPosition int
-	err := q.QueryRow(ctx, query, roomID).Scan(&combat.Round, &currentPosition)
+	var currentPosition, turnRound, used, extra int
+	var turnCombatantID string
+	var moved float64
+	err := q.QueryRow(ctx, query, roomID).Scan(&combat.Round, &currentPosition, &turnCombatantID, &turnRound, &used, &extra, &moved)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
 	}
@@ -123,6 +138,10 @@ func LoadCombat(ctx context.Context, q combatQueryer, roomID string, forUpdate b
 		combat.current = 0
 	}
 	combat.syncCurrentID()
+	combat.ActionsAllowed = 1
+	if cur := combat.Current(); cur != nil && cur.ID == turnCombatantID && turnRound == combat.Round {
+		combat.ActionsUsed, combat.ActionsAllowed, combat.MovedM = used, 1+extra, moved
+	}
 	return combat, nil
 }
 
@@ -136,6 +155,16 @@ func saveCombat(ctx context.Context, tx pgx.Tx, roomID string, combat *Combat) e
 		return err
 	}
 	_, err := tx.Exec(ctx, `update room_combats set round=$2,current_position=$3,updated_at=now() where room_id=$1`, roomID, combat.Round, combat.current)
+	return err
+}
+
+// saveTurnUsage stores what the current combatant has spent this turn.
+func saveTurnUsage(ctx context.Context, tx pgx.Tx, roomID string, combat *Combat) error {
+	var id *string
+	if cur := combat.Current(); cur != nil {
+		id = &cur.ID
+	}
+	_, err := tx.Exec(ctx, `update room_combats set turn_combatant_id=$2,turn_round=$3,turn_actions_used=$4,turn_extra_actions=$5,turn_moved_m=$6,updated_at=now() where room_id=$1`, roomID, id, combat.Round, combat.ActionsUsed, combat.ActionsAllowed-1, combat.MovedM)
 	return err
 }
 
@@ -362,7 +391,12 @@ func (c *client) combatNext(msg clientEnvelope) {
 	}
 	round := combat.Round
 	combat.current, combat.Round = game.NextTurn(len(combat.Combatants), combat.current, combat.Round)
+	combat.resetTurn()
 	if err := saveCombat(ctx, tx, c.roomID, combat); err != nil {
+		c.error(msg.RequestID, "db", err.Error())
+		return
+	}
+	if err := saveTurnUsage(ctx, tx, c.roomID, combat); err != nil {
 		c.error(msg.RequestID, "db", err.Error())
 		return
 	}
@@ -485,6 +519,11 @@ func (c *client) combatRemove(msg clientEnvelope) {
 	}
 	announcement := ""
 	if wasCurrent {
+		combat.resetTurn()
+		if err := saveTurnUsage(ctx, tx, c.roomID, combat); err != nil {
+			c.error(msg.RequestID, "db", err.Error())
+			return
+		}
 		announcement = turnLine(combat, combat.Round != round)
 	}
 	c.finishCombat(ctx, tx, msg.RequestID, announcement)
@@ -525,6 +564,47 @@ func (c *client) combatMove(msg clientEnvelope) {
 		return
 	}
 	c.finishCombat(ctx, tx, msg.RequestID, "")
+}
+
+// combatExtraAction (game masters only) lets the current combatant take one more action this
+// turn, e.g. for Extra Attack or a bonus action. Body: {combatantId}.
+func (c *client) combatExtraAction(msg clientEnvelope) {
+	var req struct {
+		CombatantID string `json:"combatantId"`
+	}
+	if json.Unmarshal(msg.Body, &req) != nil {
+		c.error(msg.RequestID, "bad_json", "invalid body")
+		return
+	}
+	ctx := context.Background()
+	tx, combat, ok := c.beginCombatChange(ctx, msg.RequestID)
+	if !ok {
+		return
+	}
+	defer tx.Rollback(ctx)
+	cur := combat.Current()
+	if cur == nil {
+		c.error(msg.RequestID, "no_combat", "nobody is in the turn order")
+		return
+	}
+	if cur.ID != req.CombatantID {
+		c.error(msg.RequestID, "stale_turn", "the turn has already moved on")
+		return
+	}
+	if combat.ActionsAllowed >= maxTurnActions {
+		c.error(msg.RequestID, "invalid_combat", fmt.Sprintf("a turn allows at most %d actions", maxTurnActions))
+		return
+	}
+	combat.ActionsAllowed++
+	if err := saveTurnUsage(ctx, tx, c.roomID, combat); err != nil {
+		c.error(msg.RequestID, "db", err.Error())
+		return
+	}
+	announcement := ""
+	if !cur.IsHidden {
+		announcement = cur.Name + " may take another action."
+	}
+	c.finishCombat(ctx, tx, msg.RequestID, announcement)
 }
 
 // combatEnd (game masters only) ends the running fight. Body: {}.

@@ -1080,6 +1080,21 @@ describe("MapCanvas", () => {
     fireEvent.pointerUp(canvas, { clientX: 288, clientY: 72 });
   });
 
+  it("shows the movement left this turn while the dragged token takes its turn", () => {
+    const fillText = globalThis.__canvasContext.fillText;
+    const token = { ...tokenBase, id: "token", name: "Hero", x_m: 1, y_m: 1, speed_m: 3 };
+    const combat = {
+      round: 1, current_combatant_id: "c1", actions_used: 0, actions_allowed: 1, moved_m: 1,
+      combatants: [{ id: "c1", token_id: "token", name: "Hero", initiative: 12, player_user_id: "player", is_hidden: false }],
+    };
+    const { container } = render(<MapCanvas state={{ ...state, visibleTokens: [token], combat }} onMoveToken={vi.fn()} />);
+    const canvas = container.querySelector("canvas")!;
+    fireEvent.pointerDown(canvas, { clientX: 72, clientY: 72, button: 0 });
+    fireEvent.pointerMove(canvas, { clientX: 144, clientY: 72 });
+    expect(fillText).toHaveBeenCalledWith("1 m · 1 square · 1 m left", expect.any(Number), expect.any(Number));
+    fireEvent.pointerUp(canvas, { clientX: 144, clientY: 72 });
+  });
+
   it("places the stamp turned and sized like the ghost shows it", () => {
     const place = vi.fn();
     const { container } = render(<MapCanvas state={state} placingStructure={{ kind: "wall", rotationDeg: 90, scalePercent: 50 }} onPlaceStructure={place} />);

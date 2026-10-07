@@ -21,12 +21,12 @@ const gameMasterControls: Control[] = [
   ["Ask for a roll", "In Checks, pick the check, the DC and who rolls."],
 ];
 
-/** The '?' button in the room header: a short list of tabletop controls for this player's role. */
+/** The Controls button in the room header: a short list of tabletop controls for this player's role. */
 export function RoomControlsHelp({ isDM }: { isDM: boolean }) {
   const [open, setOpen] = useState(false);
   return <>
-    <button className="btn-secondary size-9 min-h-0 shrink-0 p-0" type="button" aria-label="Map controls" title="Map controls" aria-haspopup="dialog" onClick={() => setOpen(true)}>
-      <Question size={18} aria-hidden="true" />
+    <button className="btn-secondary min-h-9 shrink-0 gap-1.5 px-3 py-1.5 text-xs" type="button" aria-label="Controls" aria-haspopup="dialog" onClick={() => setOpen(true)}>
+      <Question size={16} aria-hidden="true" /><span className="hidden sm:inline">Controls</span>
     </button>
     {open && <Dialog name={{ labelledBy: "room-controls-heading" }} onClose={() => setOpen(false)}>
       <div className="space-y-5 p-5 sm:p-6">

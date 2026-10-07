@@ -211,6 +211,80 @@ func TestRoomCombatTurnOrder(t *testing.T) {
 	tbl.fail(t, tbl.dmWS, "combat.end", "end-again", "no_combat", map[string]any{})
 }
 
+func TestRoomCombatTurnRules(t *testing.T) {
+	tbl := newCombatTable(t, "turns")
+	// Sheet PATCH replaces data, so the hero's speed joins the data it already has.
+	sheetPath := "/api/sheets/" + tbl.heroSheetID
+	data := get[map[string]any](t, tbl.player, tbl.a.server.URL, sheetPath)["data"].(map[string]any)
+	data["speed_m"] = 6
+	patch[map[string]any](t, tbl.player, tbl.a.server.URL, sheetPath, map[string]any{"data": data})
+	patch[map[string]any](t, tbl.player, tbl.a.server.URL, "/api/rooms/"+tbl.roomID+"/tokens/"+tbl.heroID+"/actions", map[string]any{
+		"attacks": []map[string]any{{"id": "sword", "name": "Sword", "range_m": 3, "ability": "strength", "proficient": false, "attack_bonus": 0, "damage": "1d8", "damage_bonus": 0}},
+		"actions": []any{},
+		"items":   []any{},
+	})
+	tbl.send(t, tbl.dmWS, "combat.start", "start", map[string]any{"tokenIds": []string{tbl.heroID, tbl.goblinID, tbl.hiddenID}}, true)
+	heroCombatant := tbl.combatantID(t, tbl.heroID)
+	sword := map[string]any{"sourceTokenId": tbl.heroID, "source": "attack", "actionId": "sword", "targetTokenId": tbl.goblinID}
+	attack := func(id string) {
+		t.Helper()
+		sendWS(t, tbl.pWS, "action.resolve", id, sword)
+		if ev := readType(t, tbl.pWS, "roll.result"); ev["requestId"] != id {
+			t.Fatalf("%s: unexpected roll %s", id, fmtBody(ev))
+		}
+	}
+	move := func(conn *websocket.Conn, id string, x, y float64) {
+		t.Helper()
+		sendWS(t, conn, "token.move", id, map[string]any{"tokenId": tbl.heroID, "to": map[string]float64{"x": x, "y": y}})
+		if ev := readType(t, conn, "token.moved"); ev["requestId"] != id {
+			t.Fatalf("%s: unexpected move %s", id, fmtBody(ev))
+		}
+	}
+	rejected := func(conn *websocket.Conn, typ, id, code, message string, body map[string]any) {
+		t.Helper()
+		sendWS(t, conn, typ, id, body)
+		ev := readType(t, conn, "error")
+		if got := ev["body"].(map[string]any); ev["requestId"] != id || got["code"] != code || message != "" && got["message"] != message {
+			t.Fatalf("%s: want %s %q, got %s", id, code, message, fmtBody(ev))
+		}
+	}
+
+	// One action per turn; the game master can allow one more.
+	attack("first")
+	rejected(tbl.pWS, "action.resolve", "second", "no_action_left", "Hero has already used its action this turn.", sword)
+	if line := tbl.send(t, tbl.dmWS, "combat.extra_action", "extra", map[string]any{"combatantId": heroCombatant}, true); line != "Hero may take another action." {
+		t.Fatalf("extra action announcement: %q", line)
+	}
+	attack("third")
+	tbl.fail(t, tbl.pWS, "action.resolve", "fourth", "no_action_left", sword)
+
+	// Movement is capped by speed and may be split across moves.
+	move(tbl.pWS, "walk", 1, 5)
+	rejected(tbl.pWS, "token.move", "too-far", "too_far", "Hero can move 2 m more this turn.", map[string]any{"tokenId": tbl.heroID, "to": map[string]float64{"x": 1, "y": 8}})
+	move(tbl.pWS, "walk-rest", 1, 7)
+	if combat, _ := tbl.combat(t, tbl.player); combat["actions_used"] != float64(2) || combat["actions_allowed"] != float64(2) || combat["moved_m"] != float64(6) {
+		t.Fatalf("turn usage: %+v", combat)
+	}
+
+	// Off-turn, the player's token in the fight is locked; the game master is never limited and
+	// brings the hero back within sword reach.
+	_, order := tbl.combat(t, tbl.dm)
+	tbl.send(t, tbl.pWS, "combat.next", "hero-done", map[string]any{"combatantId": heroCombatant}, order[1] == tbl.goblinID)
+	rejected(tbl.pWS, "token.move", "off-turn-move", "not_your_turn", "It is not Hero's turn.", map[string]any{"tokenId": tbl.heroID, "to": map[string]float64{"x": 1, "y": 6}})
+	move(tbl.dmWS, "dm-move", 1, 3)
+	tbl.fail(t, tbl.pWS, "action.resolve", "off-turn-attack", "not_your_turn", sword)
+
+	// The hero's next turn starts fresh.
+	second, _ := tbl.currentToken(t)
+	tbl.send(t, tbl.dmWS, "combat.next", "second-done", map[string]any{"combatantId": second}, order[2] == tbl.goblinID)
+	third, _ := tbl.currentToken(t)
+	tbl.send(t, tbl.dmWS, "combat.next", "third-done", map[string]any{"combatantId": third}, true)
+	if combat, _ := tbl.combat(t, tbl.player); combat["current_combatant_id"] != heroCombatant || combat["actions_used"] != float64(0) || combat["actions_allowed"] != float64(1) || combat["moved_m"] != float64(0) {
+		t.Fatalf("a new turn should start fresh: %+v", combat)
+	}
+	tbl.fail(t, tbl.dmWS, "combat.extra_action", "stale-extra", "stale_turn", map[string]any{"combatantId": third})
+}
+
 func TestRoomRollsWithAdvantage(t *testing.T) {
 	tbl := newCombatTable(t, "advantage")
 	roll := func(conn *websocket.Conn, typ, id string, body map[string]any) map[string]any {

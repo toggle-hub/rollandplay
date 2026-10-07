@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import { CaretLeft, CaretRight, EyeSlash, Plus, SkipForward, StopCircle, Sword, X } from "@phosphor-icons/react";
 import type { Combat, RoomToken } from "../api/types";
+import { formatMeters } from "../lib/distance";
+import { turnLeft } from "../lib/turns";
 import { useToast } from "./Toast";
 
 type Props = {
@@ -28,6 +30,7 @@ export function TurnOrderStrip({ combat, tokens, isDM, currentUserId, onSend }: 
   const current = combat?.combatants.find((combatant) => combatant.id === combat.current_combatant_id);
   const myTurn = !!current && !isDM && current.player_user_id === currentUserId;
   const announced = useRef("");
+  const currentItem = useRef<HTMLLIElement>(null);
 
   useEffect(() => {
     if (!myTurn || !combat || !current) return;
@@ -42,6 +45,11 @@ export function TurnOrderStrip({ combat, tokens, isDM, currentUserId, onSend }: 
     if (!combat) setPicking((mode) => (mode === "add" ? null : mode));
     else setPicking((mode) => (mode === "start" ? null : mode));
   }, [!!combat]);
+
+  // Keep whoever is up in view when the order is longer than the strip.
+  useEffect(() => {
+    currentItem.current?.scrollIntoView?.({ block: "nearest", inline: "center", behavior: "smooth" });
+  }, [current?.id, combat?.round]);
 
   if (!combat && !isDM) return null;
 
@@ -94,6 +102,7 @@ export function TurnOrderStrip({ combat, tokens, isDM, currentUserId, onSend }: 
         {myTurn && <button className={`btn ${smallButton}`} type="button" onClick={() => onSend("combat.next", { combatantId: current.id })}><SkipForward size={16} aria-hidden="true" />End my turn</button>}
         {isDM && <>
           <button className={`btn ${smallButton}`} type="button" disabled={!current} onClick={() => current && onSend("combat.next", { combatantId: current.id })}><SkipForward size={16} aria-hidden="true" />Next turn</button>
+          <button className={`btn-secondary ${smallButton}`} type="button" aria-label="Allow another action this turn" disabled={!current} onClick={() => current && onSend("combat.extra_action", { combatantId: current.id })}>+1 action</button>
           <button className={`btn-secondary ${smallButton}`} type="button" onClick={() => openPicker("add")}><Plus size={16} aria-hidden="true" />Add</button>
           <button className={`btn-secondary ${smallButton}`} type="button" onClick={() => {
             if (!confirmEnd) {
@@ -105,13 +114,14 @@ export function TurnOrderStrip({ combat, tokens, isDM, currentUserId, onSend }: 
         </>}
       </div>
     </div>
+    {current && <p className="mb-0 text-xs text-[var(--muted)]" aria-live="polite">{turnLeftText(combat, current.token_id, tokens)}</p>}
     {combat.combatants.length === 0
       ? <p className="mb-0 text-xs text-[var(--muted)]">Nobody is in the turn order.{isDM ? " Add tokens to continue." : ""}</p>
       : <ol className="m-0 flex list-none gap-2 overflow-x-auto p-0 pb-1" aria-label="Initiative order">
         {combat.combatants.map((combatant, index) => {
           const isCurrent = combatant.id === current?.id;
           const mine = !isDM && combatant.player_user_id === currentUserId;
-          return <li key={combatant.id} aria-current={isCurrent ? "step" : undefined}
+          return <li key={combatant.id} ref={isCurrent ? currentItem : undefined} aria-current={isCurrent ? "step" : undefined}
             className={`flex shrink-0 items-center gap-2 rounded-md border px-2 py-1 text-xs ${isCurrent ? "border-[var(--accent)] bg-[var(--accent)]/20 font-medium text-[var(--paper)] ring-1 ring-[var(--accent)]" : "border-[var(--paper)]/10 text-[var(--muted)]"}`}>
             <span className="tabular-nums rounded bg-[var(--paper)]/10 px-1.5 py-0.5" title="Initiative">{combatant.initiative}</span>
             <span className={mine ? "text-[var(--lavender)]" : ""}>{combatant.name}{mine ? " (you)" : ""}</span>
@@ -126,4 +136,13 @@ export function TurnOrderStrip({ combat, tokens, isDM, currentUserId, onSend }: 
       </ol>}
     {picker}
   </section>;
+}
+
+/** "1 action left · 4 m of movement left"; movement only when the viewer knows the token's speed. */
+function turnLeftText(combat: Combat, tokenId: string, tokens: RoomToken[]) {
+  const left = turnLeft(combat, tokenId);
+  if (!left) return "";
+  const speed = tokens.find((token) => token.id === tokenId)?.speed_m;
+  const actions = `${left.actions} ${left.actions === 1 ? "action" : "actions"} left`;
+  return speed === undefined ? actions : `${actions} · ${formatMeters(Math.max(0, speed - left.movedM))} m of movement left`;
 }

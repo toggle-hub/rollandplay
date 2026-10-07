@@ -403,8 +403,18 @@ export type VisibleRoomState = {
 };
 /** A token in the turn order. player_user_id plays it (sheet owner, else token owner) and may end its turn. */
 export type Combatant = { id: string; token_id: string; name: string; initiative: number; player_user_id: string; is_hidden: boolean };
-/** current_combatant_id is null for players while a hidden token acts. */
-export type Combat = { round: number; current_combatant_id: string | null; combatants: Combatant[] };
+/**
+ * current_combatant_id is null for players while a hidden token acts. actions_used, actions_allowed
+ * and moved_m are what the current combatant has spent this turn; read only while current_combatant_id is set.
+ */
+export type Combat = {
+  round: number;
+  current_combatant_id: string | null;
+  combatants: Combatant[];
+  actions_used: number;
+  actions_allowed: number;
+  moved_m: number;
+};
 /** A live drag by someone else at the table: where their dragged tokens are right now. */
 export type TokenDragFrame = { room_id: string; moves: { token_id: string; x: number; y: number }[] };
 export type ClientEnvelope = { type: string; requestId: string; body: unknown };
